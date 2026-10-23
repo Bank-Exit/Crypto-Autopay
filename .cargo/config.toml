@@ -1,0 +1,11 @@
+# Reduce debug build size without impacting recompilation speed
+[profile.dev]
+# Line tables only (not full DWARF) → saves ~30-40% on debug size
+debug = 1
+# Less aggressive incremental compilation cache → saves ~20%
+incremental = false
+
+[profile.dev.package."*"]
+# Dependencies: optimize slightly so runtime isn't too slow
+opt-level = 1
+debug = false

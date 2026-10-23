@@ -1,0 +1,18 @@
+[package]
+name = "autopay-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Payment adapter trait and Monero wallet-rpc implementation"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+autopay-crypto = { path = "../autopay-crypto" }

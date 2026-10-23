@@ -1,0 +1,189 @@
+<script>
+  import { createEventDispatcher } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { t, currentLang, LANGUAGES } from "./i18n.js";
+  import { theme, toggleTheme } from "./theme.js";
+
+  const dispatch = createEventDispatcher();
+
+  let password = "";
+  let error = "";
+  let loading = false;
+
+  async function unlock() {
+    if (!password) return;
+    loading = true;
+    error = "";
+    try {
+      await invoke("unlock_wallet", { password });
+      dispatch("unlocked");
+    } catch (e) {
+      error = typeof e === "string" ? e : "Mot de passe incorrect.";
+      loading = false;
+    }
+  }
+
+  function onKey(e) {
+    if (e.key === "Enter") unlock();
+  }
+</script>
+
+<div class="unlock-screen">
+  <div class="top-controls">
+    <div class="lang-wrapper">
+      <svg class="globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="2" y1="12" x2="22" y2="12"/>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+      </svg>
+      <select bind:value={$currentLang} class="lang-select">
+        {#each LANGUAGES as lang}
+          <option value={lang.code}>{lang.label}</option>
+        {/each}
+      </select>
+    </div>
+    <button class="theme-btn" on:click={toggleTheme}>
+      {#if $theme === "light"}🌙{:else}☀️{/if}
+    </button>
+  </div>
+
+  <div class="unlock-card card">
+    <!-- Logo -->
+    <div class="lock-logo">
+      <svg width="36" height="36" viewBox="0 0 72 72" fill="none">
+        <path d="M36 8 A28 28 0 1 1 8 36" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" fill="none"/>
+        <polyline points="6,24 8,36 20,34" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <circle cx="24" cy="36" r="5" fill="var(--accent)" opacity="0.9"/>
+        <circle cx="48" cy="36" r="5" fill="var(--accent)" opacity="0.5"/>
+        <line x1="31" y1="36" x2="41" y2="36" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
+        <polyline points="38,32 42,36 38,40" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      </svg>
+      <div>
+        <div class="app-name">Crypto AutoPay</div>
+        <div class="lock-hint">{$t.unlockHint || "Entrez votre mot de passe pour déverrouiller"}</div>
+      </div>
+    </div>
+
+    <div class="lock-icon-row">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+
+    <label>
+      {$t.masterPassword || "Mot de passe"}
+      <input
+        type="password"
+        bind:value={password}
+        on:keydown={onKey}
+        placeholder="••••••••••••"
+        autocomplete="current-password"
+        autofocus
+      />
+    </label>
+
+    {#if error}
+      <div class="error-msg">{error}</div>
+    {/if}
+
+    <button
+      class="btn-primary btn-full"
+      on:click={unlock}
+      disabled={!password || loading}
+    >
+      {#if loading}
+        <span class="spinner"></span> Déverrouillage…
+      {:else}
+        {$t.unlock || "Déverrouiller"} →
+      {/if}
+    </button>
+
+    <button class="btn-link" on:click={() => dispatch("reset")}>
+      {$t.resetWallet || "Réinitialiser le wallet (seed perdu)"}
+    </button>
+  </div>
+</div>
+
+<style>
+  .unlock-screen {
+    width: 100vw; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg);
+    position: relative;
+  }
+
+  .top-controls {
+    position: fixed; top: 12px; right: 16px;
+    display: flex; align-items: center; gap: 8px; z-index: 20;
+  }
+  .lang-wrapper {
+    display: flex; align-items: center; gap: 5px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 9px;
+  }
+  .globe { width: 13px; height: 13px; color: var(--text-muted); flex-shrink: 0; }
+  .lang-select {
+    border: none; background: transparent; color: var(--text);
+    font-size: 12px; cursor: pointer; outline: none;
+    -webkit-appearance: none; appearance: none;
+  }
+  .theme-btn {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 9px; font-size: 15px; cursor: pointer;
+  }
+
+  .unlock-card {
+    width: 100%; max-width: 380px;
+    padding: 32px 28px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .lock-logo {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 4px;
+  }
+  .app-name { font-size: 16px; font-weight: 700; }
+  .lock-hint { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+  .lock-icon-row {
+    display: flex; justify-content: center;
+    padding: 8px 0 4px;
+  }
+
+  label {
+    display: flex; flex-direction: column; gap: 6px;
+    font-size: 12.5px; color: var(--text-muted);
+  }
+
+  .error-msg {
+    background: var(--red-bg); color: var(--red);
+    padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px;
+  }
+
+  .btn-full { width: 100%; padding: 13px; font-size: 14px; }
+
+  .btn-link {
+    background: none; border: none;
+    color: var(--text-muted); font-size: 11px;
+    cursor: pointer; text-align: center;
+    padding: 4px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .btn-link:hover { color: var(--red); }
+
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .spinner {
+    width: 13px; height: 13px;
+    border: 2px solid var(--border);
+    border-top-color: white;
+    border-radius: 50%;
+    display: inline-block;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>

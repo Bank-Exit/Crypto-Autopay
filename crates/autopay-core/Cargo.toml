@@ -1,0 +1,21 @@
+[package]
+name = "autopay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Subscription engine, scheduler, and domain models for Monero AutoPay"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio-cron-scheduler.workspace = true
+rusqlite.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+autopay-crypto = { path = "../autopay-crypto" }
+autopay-rpc = { path = "../autopay-rpc" }

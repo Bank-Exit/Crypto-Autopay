@@ -1,0 +1,22 @@
+[package]
+name = "autopay-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Seed vault, encryption, and signature primitives for Monero AutoPay"
+
+[dependencies]
+aes-gcm.workspace = true
+argon2.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+flate2 = "1"
+chrono = { version = "0.4", features = ["serde"] }

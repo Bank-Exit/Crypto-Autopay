@@ -1,0 +1,9 @@
+target/
+/src-frontend/node_modules
+/src-frontend/dist
+/web/node_modules
+/web/dist
+*.seed.enc
+*.seed
+.env
+.DS_Store
