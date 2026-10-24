@@ -2,10 +2,14 @@
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
+  import { paymentMode } from "./paymentMode.js";
   import SubscriptionList from "./SubscriptionList.svelte";
   import PaymentAnimation from "./PaymentAnimation.svelte";
   import SubscriptionCodeEditor from "./SubscriptionCodeEditor.svelte";
   import { scheduleToHuman } from "./autopay-encode.js";
+
+  // External code pre-fill (from deep link)
+  export let externalCode = null;
 
   // ---- Subscriptions list (mock data + live additions) ----
   let subscriptions = [
@@ -85,6 +89,13 @@
 
   // ---- New-subscription modal ----
   let showNewSubModal = false;
+  let modalInitialCode = null; // pre-filled code from deep link
+
+  // React to external code (deep link)
+  $: if (externalCode) {
+    modalInitialCode = externalCode;
+    showNewSubModal = true;
+  }
 
   function onSubGenerated({ detail }) {
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
@@ -427,6 +438,32 @@
         </div>
       </div>
 
+      <!-- Payment mode section -->
+      <h2 class="section-title">{$t.paymentModeTitle}</h2>
+      <div class="settings-section card">
+        <div class="setting-row mode-row">
+          <div class="mode-switcher">
+            <button
+              class="mode-btn"
+              class:mode-active={$paymentMode === "semi-auto"}
+              on:click={() => paymentMode.set("semi-auto")}
+            >
+              {$t.paymentModeSemiAuto}
+            </button>
+            <button
+              class="mode-btn"
+              class:mode-active={$paymentMode === "auto"}
+              on:click={() => paymentMode.set("auto")}
+            >
+              {$t.paymentModeAuto}
+            </button>
+          </div>
+        </div>
+        <p class="mode-desc">
+          {$paymentMode === "semi-auto" ? $t.paymentModeSemiAutoDesc : $t.paymentModeAutoDesc}
+        </p>
+      </div>
+
       <!-- Notifications section -->
       <h2 class="section-title">{$t.notifTitle}</h2>
       <div class="settings-section card">
@@ -497,6 +534,7 @@
       </div>
       <div class="modal-body">
         <SubscriptionCodeEditor
+          initialCode={modalInitialCode}
           compact={true}
           lang={$currentLang}
           on:generated={onSubGenerated}
@@ -698,6 +736,40 @@
 
   .theme-switcher { display: flex; gap: 6px; flex-wrap: wrap; }
   .active-theme { border-color: var(--accent) !important; color: var(--accent) !important; background: var(--accent-light) !important; }
+
+  /* Payment mode switcher */
+  .mode-row { justify-content: center; padding: 1rem 1.5rem; }
+  .mode-switcher {
+    display: flex;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    width: 100%;
+    max-width: 360px;
+  }
+  .mode-btn {
+    flex: 1;
+    padding: 0.55rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text-muted);
+    transition: background 0.18s, color 0.18s;
+  }
+  .mode-btn:first-child { border-right: 2px solid var(--border); }
+  .mode-btn.mode-active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .mode-desc {
+    margin: 0;
+    padding: 0 1.5rem 1rem;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
 
   .tz-display { font-size: 12px; }
 

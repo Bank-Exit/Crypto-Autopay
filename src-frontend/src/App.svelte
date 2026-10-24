@@ -10,8 +10,25 @@
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
   let appState = "checking";
+  let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
   onMount(async () => {
+    // Deep link listener (Tauri only)
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      listen("autopay://open-subscription", (event) => {
+        const url = event.payload; // e.g. "crypto-autopay:1:H4sI..."
+        if (appState === "dashboard") {
+          // Already unlocked → forward directly to Dashboard
+          pendingDeepLinkCode = url;
+        } else {
+          // App is locked or not ready → store for later
+          pendingDeepLinkCode = url;
+          if (appState === "welcome") appState = "unlock";
+        }
+      });
+    } catch {}
+
     document.documentElement.setAttribute("data-theme", $theme);
     document.documentElement.setAttribute("data-network", $selectedNetwork);
 
@@ -88,7 +105,7 @@
     />
 
   {:else}
-    <Dashboard />
+    <Dashboard externalCode={pendingDeepLinkCode} />
   {/if}
 </div>
 

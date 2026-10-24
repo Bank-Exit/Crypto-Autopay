@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto AutoPay — Test deeplink / intent</title>
+<style>
+  :root { --accent: #f97316; --bg: #0f0f0f; --card: #1a1a1a; --border: #2e2e2e; --text: #e5e5e5; --text-muted: #888; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; padding: 2rem 1rem; }
+  h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.25rem; }
+  h2 { font-size: 1rem; font-weight: 600; color: var(--text-muted); margin-bottom: 1.5rem; }
+  .container { max-width: 700px; margin: 0 auto; }
+
+  .badge { display: inline-block; font-size: 0.7rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: var(--accent); color: #fff; vertical-align: middle; margin-left: 6px; }
+  .badge.green { background: #22c55e; }
+  .badge.blue  { background: #3b82f6; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); margin-bottom: 1rem; }
+
+  /* Subscription preview */
+  .sub-preview { display: flex; gap: 1rem; align-items: flex-start; }
+  .sub-icon { width: 44px; height: 44px; border-radius: 8px; background: #ff6b0020; border: 1px solid #ff6b0040; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; flex-shrink: 0; }
+  .sub-info .label { font-size: 1rem; font-weight: 700; }
+  .sub-info .amount { font-size: 1.4rem; font-weight: 800; color: var(--accent); margin: 2px 0; }
+  .sub-info .meta { font-size: 0.8rem; color: var(--text-muted); }
+
+  /* Code box */
+  .code-box { font-family: monospace; font-size: 0.72rem; background: #111; border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; word-break: break-all; color: #a3e635; margin: 0.75rem 0; position: relative; }
+  .code-label { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .08em; }
+
+  /* Buttons */
+  .btn { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.65rem 1.25rem; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; border: none; text-decoration: none; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-outline { background: transparent; border: 1.5px solid var(--border); color: var(--text); }
+  .btn-green { background: #22c55e; color: #fff; }
+  .btn-blue  { background: #3b82f6; color: #fff; }
+
+  .actions { display: flex; flex-direction: column; gap: 0.75rem; }
+  .action-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+  .action-info { font-size: 0.8rem; color: var(--text-muted); }
+
+  .sep { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+
+  .format-table { width: 100%; border-collapse: collapse; }
+  .format-table th, .format-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.82rem; }
+  .format-table th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: .06em; }
+  .format-table td:first-child { font-weight: 600; white-space: nowrap; }
+  .format-table td:last-child { color: var(--text-muted); }
+  .format-table tr:last-child td { border-bottom: none; }
+
+  .notice { font-size: 0.82rem; color: var(--text-muted); padding: 0.75rem 1rem; background: #1c2a1c; border: 1px solid #2d4a2d; border-radius: 6px; line-height: 1.5; }
+  .notice strong { color: #86efac; }
+
+  #status { display: none; padding: 0.6rem 1rem; border-radius: 6px; font-size: 0.85rem; margin-top: 0.75rem; }
+  #status.ok  { display: block; background: #1c2a1c; border: 1px solid #2d4a2d; color: #86efac; }
+  #status.err { display: block; background: #2a1c1c; border: 1px solid #4a2d2d; color: #fca5a5; }
+
+  footer { margin-top: 2rem; text-align: center; font-size: 0.75rem; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Crypto AutoPay <span class="badge">Test deeplink</span></h1>
+  <h2>Vérifier que l'app s'ouvre et propose d'ajouter l'abonnement ci-dessous</h2>
+
+  <!-- Subscription preview -->
+  <div class="card">
+    <h3>Abonnement d'exemple</h3>
+    <div class="sub-preview">
+      <div class="sub-icon">📰</div>
+      <div class="sub-info">
+        <div class="label">Le Média Libre</div>
+        <div class="amount"><span id="amount-display">0.05</span> XMR</div>
+        <div class="meta">Mensuel — le 1er du mois à minuit UTC · <span id="addr-short">47CL…xkMQ</span></div>
+      </div>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="code-label">Code AutoPay <span class="badge green">crypto-autopay:1:</span></div>
+    <div class="code-box" id="code-display">Génération du code…</div>
+    <button class="btn btn-outline" onclick="copyCode()">📋 Copier le code</button>
+  </div>
+
+  <!-- Format 1: Direct URI scheme -->
+  <div class="card">
+    <h3>Format 1 — URI scheme directe <span class="badge">Recommandé</span></h3>
+    <p style="font-size:.85rem;color:var(--text-muted);margin-bottom:1rem;">
+      Le navigateur ou l'OS délègue directement à l'app enregistrée comme handler <code>crypto-autopay://</code>.
+      Nécessite que l'app ait été lancée au moins une fois avec <code>cargo tauri dev</code>.
+    </p>
+    <div class="actions">
+      <div class="action-row">
+        <a id="link-scheme" href="#" class="btn btn-primary" onclick="return openScheme(event)">
+          🚀 Ouvrir l'app (URI scheme)
+        </a>
+        <span class="action-info">→ ouvre <code>crypto-autopay:1:…</code></span>
+      </div>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <!-- Format 2: HTTPS redirect -->
+  <div class="card">
+    <h3>Format 2 — Lien HTTPS avec redirection <span class="badge blue">Fallback web</span></h3>
+    <p style="font-size:.85rem;color:var(--text-muted);margin-bottom:1rem;">
+      Passe par <code>autopay.libre-market.com/add?code=…</code> qui tente d'ouvrir l'app via JS,
+      sinon affiche la page d'installation. Idéal pour les emails et réseaux sociaux.
+    </p>
+    <div class="actions">
+      <div class="action-row">
+        <a id="link-https" href="#" class="btn btn-blue" onclick="return openHttps(event)">
+          🔗 Ouvrir via HTTPS
+        </a>
+        <span class="action-info">→ redirige vers <code>autopay.libre-market.com/add?code=…</code></span>
+      </div>
+      <div class="action-row">
+        <a id="link-direct-https" href="#" class="btn btn-outline">
+          🌐 Voir l'URL de redirection
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Format comparison table -->
+  <div class="card">
+    <h3>Comparaison des formats</h3>
+    <table class="format-table">
+      <thead>
+        <tr><th>Format</th><th>URL</th><th>Cas d'usage</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>URI scheme</td>
+          <td><code>crypto-autopay:1:&lt;payload&gt;</code></td>
+          <td>Pages web de marchands, QR codes, apps</td>
+        </tr>
+        <tr>
+          <td>HTTPS redirect</td>
+          <td><code>autopay.libre-market.com/add?code=…</code></td>
+          <td>Emails, réseaux sociaux, SMS</td>
+        </tr>
+        <tr>
+          <td>Code brut</td>
+          <td><code>crypto-autopay:1:&lt;payload&gt;</code></td>
+          <td>Import manuel dans l'app, QR scanner</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="notice">
+    <strong>Pour que le deeplink fonctionne :</strong><br>
+    1. Lancer l'app au moins une fois avec <code>cargo tauri dev</code> (enregistre le scheme <code>crypto-autopay</code> via xdg-mime sur Linux).<br>
+    2. Cliquer sur le lien ci-dessus — l'OS délègue à l'app qui affiche la fenêtre "Ajouter cet abonnement ?".<br>
+    3. Le mode <strong>Semi-auto</strong> (défaut) affiche une confirmation avant chaque paiement automatique.
+  </div>
+
+  <footer>Crypto AutoPay · Protocole <code>crypto-autopay:1:</code> · Test interne</footer>
+</div>
+
+<script type="module">
+  // ---- Import encoder ----
+  // Inline lightweight encoder (copy of autopay-encode.js, no deps)
+  async function compress(str) {
+    const bytes = new TextEncoder().encode(str);
+    const cs = new CompressionStream("gzip");
+    const writer = cs.writable.getWriter();
+    writer.write(bytes);
+    writer.close();
+    const chunks = [];
+    const reader = cs.readable.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    let total = 0;
+    chunks.forEach(c => total += c.length);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    chunks.forEach(c => { result.set(c, offset); offset += c.length; });
+    return btoa(String.fromCharCode(...result))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function encodeAutopay(payload) {
+    const json = JSON.stringify(payload);
+    const b64 = await compress(json);
+    return "crypto-autopay:1:" + b64;
+  }
+
+  // ---- Example subscription payload ----
+  const EXAMPLE_PAYLOAD = {
+    version: 1,
+    network: "monero",
+    address: "47CLHbpFMi4y7oK8EBqDHsAvV1gJHBF5u84mFpGMFXZ9vDAFmR5dEyTDnArz7a6ybTpQoVCAmVqzxkMQ",
+    amount: "0.05",
+    currency: "XMR",
+    schedule: "0 0 0 1 * *",
+    custom_label: "Le Média Libre",
+    merchant_note: "Abonnement mensuel — soutien presse libre",
+    canary_url: "https://lemedialib.fr/.well-known/autopay-canary.json",
+  };
+
+  let generatedCode = "";
+
+  async function init() {
+    try {
+      generatedCode = await encodeAutopay(EXAMPLE_PAYLOAD);
+
+      document.getElementById("code-display").textContent = generatedCode;
+      document.getElementById("addr-short").textContent =
+        EXAMPLE_PAYLOAD.address.slice(0, 4) + "…" + EXAMPLE_PAYLOAD.address.slice(-4);
+      document.getElementById("amount-display").textContent = EXAMPLE_PAYLOAD.amount;
+
+      // Format 1: direct URI scheme
+      document.getElementById("link-scheme").href = generatedCode;
+
+      // Format 2: HTTPS redirect  
+      const webUrl = "https://autopay.libre-market.com/add?code=" + encodeURIComponent(generatedCode);
+      document.getElementById("link-https").href = webUrl;
+      document.getElementById("link-direct-https").href = webUrl;
+      document.getElementById("link-direct-https").target = "_blank";
+
+    } catch (e) {
+      document.getElementById("code-display").textContent = "Erreur: " + e.message;
+    }
+  }
+
+  init();
+
+  // ---- Copy to clipboard ----
+  window.copyCode = async function() {
+    try {
+      await navigator.clipboard.writeText(generatedCode);
+      const btn = event.target;
+      const orig = btn.textContent;
+      btn.textContent = "✅ Copié !";
+      setTimeout(() => btn.textContent = orig, 1500);
+    } catch { alert(generatedCode); }
+  };
+
+  // ---- Open URI scheme with feedback ----
+  window.openScheme = function(e) {
+    e.preventDefault();
+    const status = document.getElementById("status");
+    try {
+      window.location.href = generatedCode;
+      status.className = "ok";
+      status.textContent = "✅ Signal envoyé au système — l'app devrait s'ouvrir. "
+        + "Si rien ne se passe, vérifiez que cargo tauri dev a été lancé au moins une fois.";
+    } catch(err) {
+      status.className = "err";
+      status.textContent = "Erreur : " + err.message;
+    }
+    return false;
+  };
+
+  // ---- Open HTTPS redirect ----
+  window.openHttps = function(e) {
+    e.preventDefault();
+    const webUrl = "https://autopay.libre-market.com/add?code=" + encodeURIComponent(generatedCode);
+    // Try deeplink first via JS, then redirect to web
+    try {
+      window.location.href = generatedCode;
+      setTimeout(() => {
+        window.open(webUrl, "_blank");
+      }, 600);
+    } catch {
+      window.open(webUrl, "_blank");
+    }
+    return false;
+  };
+</script>
+</body>
+</html>

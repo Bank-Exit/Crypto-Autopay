@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-deep-link": "^2.6.2",
     "svelte-preprocess": "^6.0.5"
   },
   "devDependencies": {

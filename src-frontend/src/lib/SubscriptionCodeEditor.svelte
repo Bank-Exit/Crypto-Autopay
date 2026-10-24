@@ -22,6 +22,8 @@
   export let mode = "create";   // "create" | "import"
   export let compact = false;
   export let lang = "fr";
+  /** Optional: pre-fill the import field with a code (from deep link) */
+  export let initialCode = null;
 
   // In the app only Monero & Bitcoin are supported (no Ethereum RPC planned)
   const APP_NETWORKS = NETWORKS_EXTENDED.filter(n => ["monero", "bitcoin"].includes(n.id));
@@ -82,6 +84,15 @@
   let importResult = null;
   let importError = "";
   let importLoading = false;
+
+  // When a deep-link code is provided, switch to import mode and pre-fill
+  import { onMount } from "svelte";
+  onMount(() => {
+    if (initialCode) {
+      mode = "import";
+      importInput = initialCode;
+    }
+  });
 
   // ---- Reactive: network → currency default + token list ----
   $: selectedNetworkObj = NETWORKS_EXTENDED.find(n => n.id === payload.network) || NETWORKS_EXTENDED[0];

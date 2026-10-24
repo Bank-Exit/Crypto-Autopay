@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Manager, Emitter, Listener};
 
 use autopay_crypto::{
     SeedVault, EncryptedSeed,
@@ -157,6 +157,7 @@ struct BalanceResponse {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             // Resolve vault path in app data directory
             let data_dir = app.path().app_data_dir()
@@ -175,6 +176,19 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Deep link handler — listen for scheme events and re-emit to frontend
+            let handle = app.handle().clone();
+            app.handle().listen("deep-link://new-url", move |event| {
+                // Payload is a JSON array of URL strings: ["crypto-autopay:1:..."]
+                if let Some(urls) = event.payload().strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                    // parse simple JSON string array without serde
+                    let url = urls.trim().trim_matches('"');
+                    log::info!("Deep link received: {}", url);
+                    handle.emit("autopay://open-subscription", url.to_string()).ok();
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

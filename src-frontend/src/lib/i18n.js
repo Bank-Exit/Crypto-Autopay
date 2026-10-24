@@ -167,6 +167,14 @@ const T = {
     notifBeforePayment: "Rappel avant paiement",
     notifBeforePaymentDays: "jours avant",
 
+    paymentModeTitle: "Mode de paiement",
+    paymentModeSemiAuto: "◀ Semi-auto",
+    paymentModeAuto: "Auto ▶",
+    paymentModeSemiAutoDesc: "Confirmation manuelle requise avant chaque paiement automatique.",
+    paymentModeAutoDesc: "Paiements envoyés automatiquement à l'échéance, sans confirmation.",
+    addSubscriptionTitle: "Ajouter un abonnement",
+    addSubscriptionConfirm: "Ajouter à mes abonnements",
+
     // Wallet refill estimate
     walletRefillIn: "À recharger dans ~",
     walletMonthlyOut: "dépenses/mois",
@@ -317,6 +325,14 @@ const T = {
     notifBeforePayment: "Reminder before payment",
     notifBeforePaymentDays: "days before",
 
+    paymentModeTitle: "Payment mode",
+    paymentModeSemiAuto: "◀ Semi-auto",
+    paymentModeAuto: "Auto ▶",
+    paymentModeSemiAutoDesc: "Manual confirmation required before each scheduled payment.",
+    paymentModeAutoDesc: "Payments sent automatically at due date, no confirmation needed.",
+    addSubscriptionTitle: "Add a subscription",
+    addSubscriptionConfirm: "Add to my subscriptions",
+
     walletRefillIn: "Top up in ~",
     walletMonthlyOut: "spend/month",
   },
@@ -367,6 +383,8 @@ const T = {
     dayMinus: "T-", myWallet: "Mein Wallet", vpnLabel: "VPN", animSuffix: "/Monat",
     nextRefillLabel: "Nächste Wallet-Aufladung", refillIn: "in ca.", refillYears: "Jahr(e)", refillMonths: "Monat(e)", refillWeeks: "Woche(n)", refillDays: "Tag(e)", refillHours: "Stunde(n)",
     notifTitle: "Benachrichtigungen", notifCanary: "Canary abgelaufen", notifLowBalance: "Niedriges Guthaben", notifPaymentSent: "Zahlung gesendet", notifPaymentFailed: "Zahlung fehlgeschlagen", notifBeforePayment: "Erinnerung vor Zahlung", notifBeforePaymentDays: "Tage vorher",
+    paymentModeTitle: "Zahlungsmodus", paymentModeSemiAuto: "◀ Halbautomatisch", paymentModeAuto: "Automatisch ▶", paymentModeSemiAutoDesc: "Manuelle Bestätigung vor jeder Zahlung.", paymentModeAutoDesc: "Zahlungen automatisch ohne Bestätigung.",
+    addSubscriptionTitle: "Abonnement hinzufügen", addSubscriptionConfirm: "Hinzufügen",
     walletRefillIn: "Aufladen in ~", walletMonthlyOut: "Ausgaben/Monat",
   },
 
@@ -416,6 +434,8 @@ const T = {
     dayMinus: "D-", myWallet: "Mi wallet", vpnLabel: "VPN", animSuffix: "/mes",
     nextRefillLabel: "Próxima recarga de cartera", refillIn: "en aprox.", refillYears: "año(s)", refillMonths: "mes(es)", refillWeeks: "semana(s)", refillDays: "día(s)", refillHours: "hora(s)",
     notifTitle: "Notificaciones y alertas", notifCanary: "Canary expirado", notifLowBalance: "Saldo bajo", notifPaymentSent: "Pago enviado", notifPaymentFailed: "Pago fallido", notifBeforePayment: "Recordatorio antes del pago", notifBeforePaymentDays: "días antes",
+    paymentModeTitle: "Modo de pago", paymentModeSemiAuto: "◀ Semi-auto", paymentModeAuto: "Auto ▶", paymentModeSemiAutoDesc: "Confirmación manual antes de cada pago.", paymentModeAutoDesc: "Pagos automáticos sin confirmación.",
+    addSubscriptionTitle: "Añadir suscripción", addSubscriptionConfirm: "Añadir",
     walletRefillIn: "Recargar en ~", walletMonthlyOut: "gasto/mes",
   },
 };
