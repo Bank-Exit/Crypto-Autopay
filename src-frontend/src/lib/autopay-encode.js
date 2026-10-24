@@ -78,26 +78,38 @@ export async function decodeAutopay(code) {
  */
 export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
   const labels = SCHEDULE_LABELS[lang] || SCHEDULE_LABELS.en;
-  const n = repeatEvery || 1;
-
-  // Match both 5-field (legacy) and 6-field (current) cron expressions
+  const n = parseInt(repeatEvery, 10) || 1;
+  if (!schedule) return "";
   const s = schedule.trim();
-  if (s === "0 0 9 1 * *"  || s === "0 9 1 * *")  return n === 1 ? labels.monthly   : `${labels.every} ${n} ${labels.months}`;
-  if (s === "0 0 9 * * 1"  || s === "0 9 * * 1")  return n === 1 ? labels.weekly    : `${labels.every} ${n} ${labels.weeks}`;
-  if (s === "0 0 9 1 */3 *"|| s === "0 9 1 */3 *")return n === 1 ? labels.quarterly : `${labels.every} ${n * 3} ${labels.months}`;
-  if (s === "0 0 9 1 1 *"  || s === "0 9 1 1 *")  return n === 1 ? labels.yearly    : `${labels.every} ${n} ${labels.years}`;
-  if (s === "0 0 9 * * *"  || s === "0 9 * * *")  return labels.daily;
+
+  // Normalise cron to structural fields only (dom, month, dow), ignoring sec/min/hour.
+  // Supports both 6-field Quartz "sec min hour dom month dow"
+  //             and 5-field standard "min hour dom month dow".
+  const parts = s.split(/\s+/);
+  let dom, month, dow;
+  if (parts.length === 6) { [,,,dom, month, dow] = parts; }
+  else if (parts.length === 5) { [,,dom, month, dow] = parts; }
+  else { return schedule + (n > 1 ? ` (×${n})` : ""); }
+
+  // Match on structural pattern
+  if (dom === "1" && month === "*" && dow === "*")  return n === 1 ? labels.monthly   : `${labels.every} ${n} ${labels.months}`;
+  if (dom === "*" && month === "*" && dow === "1")  return n === 1 ? labels.weekly    : `${labels.every} ${n} ${labels.weeks}`;
+  if (dom === "1" && month === "*/3" && dow === "*")return n === 1 ? labels.quarterly : `${labels.every} ${n * 3} ${labels.months}`;
+  if (dom === "1" && month === "1"  && dow === "*") return n === 1 ? labels.yearly    : `${labels.every} ${n} ${labels.years}`;
+  if (dom === "*" && month === "*"  && dow === "*") return labels.daily;
+  // Biweekly / every-N-days
+  if (dom === "*/14" || dom === "1,15") return n === 1 ? labels.biweekly || "Bimensuel" : `${labels.every} 2 ${labels.weeks}`;
   return schedule + (n > 1 ? ` (×${n})` : "");
 }
 
 const SCHEDULE_LABELS = {
-  fr: { daily: "Quotidien", weekly: "Hebdomadaire", monthly: "Mensuel", quarterly: "Trimestriel",
+  fr: { daily: "Quotidien", weekly: "Hebdomadaire", biweekly: "Bimensuel", monthly: "Mensuel", quarterly: "Trimestriel",
         yearly: "Annuel", every: "Tous les", months: "mois", weeks: "semaines", years: "ans" },
-  en: { daily: "Daily", weekly: "Weekly", monthly: "Monthly", quarterly: "Quarterly",
+  en: { daily: "Daily", weekly: "Weekly", biweekly: "Biweekly", monthly: "Monthly", quarterly: "Quarterly",
         yearly: "Yearly", every: "Every", months: "months", weeks: "weeks", years: "years" },
-  de: { daily: "Täglich", weekly: "Wöchentlich", monthly: "Monatlich", quarterly: "Vierteljährlich",
+  de: { daily: "Täglich", weekly: "Wöchentlich", biweekly: "Zweiwöchentlich", monthly: "Monatlich", quarterly: "Vierteljährlich",
         yearly: "Jährlich", every: "Alle", months: "Monate", weeks: "Wochen", years: "Jahre" },
-  es: { daily: "Diario", weekly: "Semanal", monthly: "Mensual", quarterly: "Trimestral",
+  es: { daily: "Diario", weekly: "Semanal", biweekly: "Quincenal", monthly: "Mensual", quarterly: "Trimestral",
         yearly: "Anual", every: "Cada", months: "meses", weeks: "semanas", years: "años" },
 };
 

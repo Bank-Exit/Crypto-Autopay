@@ -1,5 +1,5 @@
 <script>
-  import { tick } from "svelte";
+  import { tick, onMount } from "svelte";
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
@@ -8,6 +8,17 @@
   import PaymentAnimation from "./PaymentAnimation.svelte";
   import SubscriptionCodeEditor from "./SubscriptionCodeEditor.svelte";
   import { scheduleToHuman } from "./autopay-encode.js";
+
+  // Tauri invoke helper (safe in browser dev too)
+  async function tauriInvoke(cmd, args = {}) {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return await invoke(cmd, args);
+    } catch (e) {
+      logWarn("Tauri", `invoke(${cmd}) unavailable or failed: ${e}`);
+      return null;
+    }
+  }
   import { logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
            setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
 
@@ -214,11 +225,22 @@
   }
 
   /** Import tab dispatches this after "Ajouter cet abonnement" */
-  function onSubImported({ detail }) {
+  async function onSubImported({ detail }) {
     logInfo("Dashboard", "onSubImported fired");
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
     addOrConfirmDuplicate(sub);
     showImportModal = false;
+    // Persist to SQLite
+    if (detail.code) {
+      const result = await tauriInvoke("add_subscription", { code: detail.code });
+      if (result) {
+        logInfo("Dashboard", `Subscription persisted to DB: ${result.id}`);
+        // Update local sub with real DB id
+        subscriptions = subscriptions.map(s =>
+          s._code === detail.code ? { ...s, _db_id: result.id, id: result.id } : s
+        );
+      }
+    }
   }
 
   /** "Créer un code" sharing mode — does NOT add to subscriptions */
@@ -228,6 +250,45 @@
   }
 
   let trayStatus = "green";
+
+  // ---- Load persisted subscriptions from SQLite on mount ----
+  onMount(async () => {
+    logInfo("Dashboard", "Loading subscriptions from DB");
+    const dbSubs = await tauriInvoke("get_subscriptions");
+    if (dbSubs && dbSubs.length > 0) {
+      const mapped = dbSubs.map(s => dbSubToUi(s));
+      // Merge: add DB subs not already in mock list (by address+schedule)
+      const existingKeys = new Set(subscriptions.map(duplicateKey).filter(Boolean));
+      const newOnes = mapped.filter(s => {
+        const k = duplicateKey(s);
+        return k && !existingKeys.has(k);
+      });
+      if (newOnes.length > 0) {
+        subscriptions = [...subscriptions, ...newOnes];
+        logInfo("Dashboard", `Loaded ${newOnes.length} subscription(s) from DB`);
+      }
+    }
+  });
+
+  /** Map a DB Subscription JSON to the UI subscription shape */
+  function dbSubToUi(s) {
+    return {
+      id: s.id,
+      label: s.label || "—",
+      description: s.description || "",
+      amount: String(s.amount || "0"),
+      currency: s.currency || "XMR",
+      schedule: scheduleToHuman(s.schedule, s.repeat_every || 1, $currentLang),
+      next_payment_at: s.next_payment_at ? s.next_payment_at.slice(0, 10) : null,
+      status: s.status === "active" ? "Active" : s.status === "paused" ? "Paused" : (s.status || "Active"),
+      canary_status: s.canary_url ? (s.last_canary_status || "Ok") : "NotConfigured",
+      payments_sent: s.payments_sent || 0,
+      wallet_id: wallets[0]?.id || 1,
+      address: s.destination_address || null,
+      _raw_schedule: s.schedule || null,
+      _db_id: s.id,   // keep original UUID for DB ops
+    };
+  }
 
   // ---- Logs panel state ----
   import { writable } from "svelte/store";
@@ -378,7 +439,7 @@
     {#if page === "subscriptions"}
       <div class="page-header">
         <div>
-          <h1>Mes abonnements en {$currentNetwork.label}</h1>
+          <h1>Mes abonnements récurrents en {$currentNetwork.label}</h1>
           <p class="subs-subtitle">
             {subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length} abonnement{subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length !== 1 ? "s" : ""}
             {#if duplicateCount > 0}
@@ -416,39 +477,55 @@
       <SubscriptionList
         {wallets}
         {subscriptions}
-        on:delete-sub={e => { subscriptions = subscriptions.filter(s => s.id !== e.detail.id); }}
-        on:toggle-pause={e => {
+        on:delete-sub={async e => {
+          const sub = subscriptions.find(s => s.id === e.detail.id);
+          subscriptions = subscriptions.filter(s => s.id !== e.detail.id);
+          if (sub?._db_id) await tauriInvoke("delete_subscription", { id: sub._db_id });
+        }}
+        on:toggle-pause={async e => {
           subscriptions = subscriptions.map(s => s.id === e.detail.id
             ? { ...s, status: s.status === "Paused" ? "Active" : "Paused" }
             : s);
+          const sub = subscriptions.find(s => s.id === e.detail.id);
+          if (sub?._db_id) {
+            await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: sub.status === "Paused" });
+          }
         }}
       />
       <!-- Footer marketing + bottom spacer -->
       <div class="sub-footer">
         <div class="sub-footer-grid">
           <div class="sub-footer-item">
-            <span class="sub-footer-icon">🔒</span>
+            <svg class="sub-footer-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
             <div>
               <strong>Vie privée maximale</strong>
               <p>Aucune donnée envoyée à l'extérieur par défaut. Zéro tracking, zéro analytics.</p>
             </div>
           </div>
           <div class="sub-footer-item">
-            <span class="sub-footer-icon">🪙</span>
+            <svg class="sub-footer-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
+            </svg>
             <div>
               <strong>Anonymat Monero</strong>
               <p>Transactions confidentielles par protocole. Montants et identités masqués.</p>
             </div>
           </div>
           <div class="sub-footer-item">
-            <span class="sub-footer-icon">🛡</span>
+            <svg class="sub-footer-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
             <div>
               <strong>Seed chiffrée post-quantique</strong>
               <p>Argon2id + AES-256-GCM. Résistant aux attaques quantiques futures.</p>
             </div>
           </div>
           <div class="sub-footer-item">
-            <span class="sub-footer-icon">🌐</span>
+            <svg class="sub-footer-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+            </svg>
             <div>
               <strong>Open source</strong>
               <p>Code auditable. Pas de tiers de confiance. Vous contrôlez vos clés.</p>
@@ -1059,7 +1136,7 @@
     display: flex; gap: 10px; align-items: flex-start;
     font-size: 11.5px; line-height: 1.5;
   }
-  .sub-footer-icon { font-size: 18px; flex-shrink: 0; margin-top: 1px; }
+  .sub-footer-icon { width: 20px; height: 20px; flex-shrink: 0; margin-top: 1px; color: var(--accent); }
   .sub-footer-item strong { font-size: 12px; display: block; margin-bottom: 2px; }
   .sub-footer-item p { margin: 0; color: var(--text-muted); }
   .sub-footer-version {

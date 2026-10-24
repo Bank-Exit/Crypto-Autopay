@@ -8,6 +8,8 @@ use autopay_crypto::{
     generate_seed as crypto_generate_seed,
     mnemonic_to_bytes,
 };
+use autopay_core::db::Database;
+use autopay_core::models::{Subscription, SubscriptionStatus};
 
 // ============================================================
 //  Application state
@@ -133,23 +135,92 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
 
 /// Get all subscriptions from the local SQLite database.
 #[tauri::command]
-async fn get_subscriptions() -> Result<Vec<serde_json::Value>, String> {
-    // TODO: connect to DB and return real subscriptions
-    Ok(vec![])
+async fn get_subscriptions(
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    let subs = db.list_subscriptions().map_err(|e| e.to_string())?;
+    // Serialize to JSON values for the frontend
+    let json_subs = subs.iter()
+        .map(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json_subs)
 }
 
-/// Parse and add a subscription from a monero-autopay code.
+/// Parse and persist a subscription from a crypto-autopay: or monero-request: code.
 #[tauri::command]
-async fn add_subscription(code: String) -> Result<String, String> {
-    use autopay_crypto::parse_code;
+async fn add_subscription(
+    code: String,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<serde_json::Value, String> {
+    use autopay_crypto::{parse_code, AutoPayCode};
+    use chrono::Utc;
+    use uuid::Uuid;
+
     let parsed = parse_code(&code).map_err(|e| format!("Invalid code: {e:?}"))?;
-    // TODO: insert into SQLite DB
-    // Return parsed code as JSON for the frontend
-    match parsed {
-        autopay_crypto::AutoPayCode::V1(v1) => {
-            Ok(format!("Subscription '{}' added", v1.custom_label))
-        }
+    let AutoPayCode::V1(v1) = parsed;
+
+    let now = Utc::now();
+    // Parse start_date from code if present, otherwise use now
+    let next_payment_at = chrono::DateTime::parse_from_rfc3339(&v1.start_date)
+        .ok()
+        .map(|d| d.with_timezone(&Utc));
+
+    let sub = Subscription {
+        id: Uuid::new_v4().to_string(),
+        wallet_id: "default".to_string(),
+        label: v1.custom_label.clone(),
+        description: v1.description.clone(),
+        destination_address: v1.sellers_wallet.clone(),
+        payment_network: v1.payment_network.clone(),
+        amount: v1.amount.clone(),
+        currency: v1.currency.clone(),
+        schedule: v1.schedule.clone(),
+        number_of_payments: v1.number_of_payments,
+        payments_sent: 0,
+        next_payment_at,
+        status: SubscriptionStatus::Active,
+        grace_period_hours: v1.grace_period_hours.unwrap_or(24),
+        canary_url: v1.canary_url.clone(),
+        merchant_pubkey: None,
+        last_canary_status: None,
+        canary_last_ok: None,
+        webhook_url: None,
+        created_at: now,
+        updated_at: now,
+        raw_code: Some(code),
+        notes: None,
+    };
+
+    {
+        let db = db_state.lock().map_err(|e| e.to_string())?;
+        db.insert_subscription(&sub).map_err(|e| e.to_string())?;
     }
+
+    log::info!("Subscription '{}' added (id={})", sub.label, sub.id);
+    serde_json::to_value(&sub).map_err(|e| e.to_string())
+}
+
+/// Delete a subscription by id.
+#[tauri::command]
+async fn delete_subscription(
+    id: String,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<(), String> {
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    db.delete_subscription(&id).map_err(|e| e.to_string())
+}
+
+/// Pause or resume a subscription.
+#[tauri::command]
+async fn set_subscription_status(
+    id: String,
+    paused: bool,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<(), String> {
+    let status = if paused { SubscriptionStatus::Paused } else { SubscriptionStatus::Active };
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    db.update_subscription_status(&id, &status).map_err(|e| e.to_string())
 }
 
 // ============================================================
@@ -194,10 +265,18 @@ pub fn run() {
             })
         )
         .setup(|app| {
-            // Resolve vault path in app data directory
+            // Resolve app data directory
             let data_dir = app.path().app_data_dir()
                 .expect("Failed to resolve app data dir");
+            std::fs::create_dir_all(&data_dir).ok();
+
             let vault_path = data_dir.join("seed.vault");
+            let db_path   = data_dir.join("subscriptions.db");
+
+            // Open the subscriptions SQLite database
+            let db = Database::open(db_path.to_str().unwrap())
+                .expect("Failed to open subscriptions DB");
+            app.manage(Mutex::new(db));
 
             app.manage(Mutex::new(AppState {
                 vault_path,
@@ -249,6 +328,8 @@ pub fn run() {
             get_balance,
             get_subscriptions,
             add_subscription,
+            delete_subscription,
+            set_subscription_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");
