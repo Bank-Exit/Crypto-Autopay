@@ -306,13 +306,37 @@
   }
 
   // ---- Load persisted subscriptions from SQLite on mount ----
+  // Balance display (refreshed at unlock + every 5min)
+  let balanceXmr = null; // null = not loaded, 0 = loaded but empty
+  let balanceLoading = false;
+
+  async function loadBalance() {
+    balanceLoading = true;
+    try {
+      const b = await tauriInvoke("get_balance");
+      if (b) balanceXmr = b.xmr;
+    } catch (_) {}
+    balanceLoading = false;
+  }
+
+  async function refreshBalance() {
+    balanceLoading = true;
+    try {
+      const b = await tauriInvoke("refresh_balance");
+      if (b) balanceXmr = b.xmr;
+      logInfo("Dashboard", "Balance refreshed");
+    } catch (e) {
+      logWarn("Dashboard", "Balance refresh failed (offline?)");
+    }
+    balanceLoading = false;
+  }
+
   onMount(async () => {
     await loadRpcState();
     logInfo("Dashboard", "Loading subscriptions from DB");
     const dbSubs = await tauriInvoke("get_subscriptions");
     if (dbSubs && dbSubs.length > 0) {
       const mapped = dbSubs.map(s => dbSubToUi(s));
-      // Merge: add DB subs not already in mock list (by address+schedule)
       const existingKeys = new Set(subscriptions.map(duplicateKey).filter(Boolean));
       const newOnes = mapped.filter(s => {
         const k = duplicateKey(s);
@@ -323,6 +347,11 @@
         logInfo("Dashboard", `Loaded ${newOnes.length} subscription(s) from DB`);
       }
     }
+
+    // Load cached balance, then schedule refresh every 5 min
+    await loadBalance();
+    const balanceTimer = setInterval(refreshBalance, 5 * 60 * 1000);
+    return () => clearInterval(balanceTimer);
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */
@@ -471,19 +500,29 @@
       </button>
     </nav>
 
-    <!-- Total balance (all wallets) -->
+    <!-- Total balance (real from RPC, refreshed every 5min) -->
     <div class="sidebar-balance card">
-      <div class="balance-label">{$t.balance}</div>
-      <div class="balance-amount text-accent">{totalBalance} {$currentNetwork.symbol}</div>
-      <div class="balance-wallets">
-        {#each wallets as w}
-          <div class="balance-sub">
-            <span class="w-dot" style="background:{w.color}"></span>
-            <span class="w-name">{w.name}</span>
-            <span class="w-val">{w.balance}</span>
-          </div>
-        {/each}
+      <div class="balance-label">
+        {$t.balance}
+        <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title="Actualiser le solde">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+               stroke-linecap="round" stroke-linejoin="round"
+               style={balanceLoading ? "animation: spin 1s linear infinite" : ""}>
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+        </button>
       </div>
+      {#if balanceXmr === null}
+        <div class="balance-amount text-muted" style="font-size:14px">Chargement…</div>
+      {:else}
+        <div class="balance-amount text-accent">
+          {balanceXmr.toFixed(4)} {$currentNetwork.symbol}
+        </div>
+        {#if balanceXmr === 0}
+          <div class="balance-hint">Solde nul ou RPC indisponible</div>
+        {/if}
+      {/if}
     </div>
   </aside>
 
@@ -1115,8 +1154,13 @@
 
   /* Balance card at bottom */
   .sidebar-balance { padding: 10px; margin-top: auto; }
-  .balance-label { font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 3px; }
-  .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 8px; }
+  .balance-label { font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 3px; display: flex; align-items: center; gap: 4px; }
+  .refresh-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 0; display: flex; align-items: center; }
+  .refresh-btn:hover { color: var(--accent); }
+  .refresh-btn:disabled { opacity: 0.4; cursor: default; }
+  .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
+  .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .balance-wallets { display: flex; flex-direction: column; gap: 3px; }
   .balance-sub { display: flex; align-items: center; gap: 5px; font-size: 10.5px; }
   .w-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }

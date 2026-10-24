@@ -7,10 +7,23 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
+  import { subscribeToLogs } from "./lib/AppLogger.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
   let appState = "checking";
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
+
+  // Logs drawer
+  let showLogs = false;
+  let liveLogs = [];
+  let logFilter = "all"; // "all" | "warn" | "error"
+  $: filteredLogs = logFilter === "all" ? liveLogs
+    : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"));
+
+  onMount(() => {
+    const unsub = subscribeToLogs(entries => { liveLogs = [...entries].reverse(); });
+    return unsub;
+  });
 
   /** Poll Rust state for any deep link that arrived before the frontend was ready */
   async function checkPendingDeepLink() {
@@ -114,7 +127,7 @@
   {:else if appState === "unlock"}
     <Unlock
       on:unlocked={async (e) => {
-        const { address, rpcError } = e.detail || {};
+        const { address, balance, rpcError } = e.detail || {};
         if (rpcError) console.warn("[Unlock] RPC unavailable (offline mode):", rpcError);
         if (address) console.log("[Unlock] Wallet address:", address.slice(0, 12) + "…");
         appState = "dashboard";
@@ -125,6 +138,59 @@
 
   {:else}
     <Dashboard externalCode={pendingDeepLinkCode} />
+  {/if}
+
+  <!-- Floating Logs button (always visible, bottom-right) -->
+  {#if appState !== "checking"}
+    <button class="logs-fab" on:click={() => showLogs = !showLogs} title="Logs techniques">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+        <polyline points="10 9 9 9 8 9"/>
+      </svg>
+      Logs
+      {#if liveLogs.filter(l => l.level === "error").length > 0}
+        <span class="logs-badge">{liveLogs.filter(l => l.level === "error").length}</span>
+      {/if}
+    </button>
+  {/if}
+
+  <!-- Logs drawer -->
+  {#if showLogs}
+    <div class="logs-overlay" on:click={() => showLogs = false}></div>
+    <div class="logs-drawer">
+      <div class="logs-header">
+        <span>📋 Logs techniques</span>
+        <div class="logs-filters">
+          <button class:active={logFilter==="all"} on:click={() => logFilter="all"}>Tous</button>
+          <button class:active={logFilter==="warn"} on:click={() => logFilter="warn"}>⚠️ Warnings</button>
+          <button class:active={logFilter==="error"} on:click={() => logFilter="error"}>🔴 Erreurs</button>
+        </div>
+        <button class="logs-close" on:click={() => showLogs = false}>✕</button>
+      </div>
+      <div class="logs-body">
+        {#if filteredLogs.length === 0}
+          <div class="logs-empty">Aucun log{logFilter !== "all" ? " de ce type" : ""}.</div>
+        {:else}
+          {#each filteredLogs as log}
+            <div class="log-line log-{log.level}">
+              <span class="log-time">{log.time}</span>
+              <span class="log-mod">[{log.module}]</span>
+              <span class="log-msg">{log.message}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+      <div class="logs-footer">
+        <button on:click={() => {
+          const txt = filteredLogs.map(l => `${l.time} [${l.level}] [${l.module}] ${l.message}`).join('\n');
+          navigator.clipboard.writeText(txt).catch(() => {});
+        }}>📋 Copier</button>
+        <span class="logs-hint">Ces logs ne contiennent ni montant ni adresse.</span>
+      </div>
+    </div>
   {/if}
 </div>
 
@@ -143,4 +209,78 @@
   }
 
   @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+  /* Floating Logs button */
+  .logs-fab {
+    position: fixed; bottom: 16px; right: 16px; z-index: 900;
+    display: flex; align-items: center; gap: 6px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 20px; padding: 7px 13px;
+    font-size: 12px; color: var(--text-muted);
+    cursor: pointer; box-shadow: 0 2px 8px #0002;
+    transition: background 0.15s, color 0.15s;
+  }
+  .logs-fab:hover { background: var(--bg-hover); color: var(--text); }
+  .logs-badge {
+    background: #ef4444; color: white; border-radius: 9px;
+    font-size: 10px; font-weight: 700; padding: 1px 5px; min-width: 16px; text-align: center;
+  }
+
+  /* Logs drawer */
+  .logs-overlay {
+    position: fixed; inset: 0; background: #0004; z-index: 901;
+  }
+  .logs-drawer {
+    position: fixed; bottom: 0; right: 0; width: min(520px, 96vw);
+    height: min(420px, 70vh);
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 12px 12px 0 0; z-index: 902;
+    display: flex; flex-direction: column;
+    box-shadow: 0 -4px 24px #0003;
+  }
+  .logs-header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+    font-size: 13px; font-weight: 600;
+  }
+  .logs-filters {
+    display: flex; gap: 4px; margin-left: auto;
+  }
+  .logs-filters button {
+    border: 1px solid var(--border); background: var(--bg);
+    border-radius: 6px; padding: 2px 8px; font-size: 11px;
+    cursor: pointer; color: var(--text-muted);
+  }
+  .logs-filters button.active {
+    background: var(--accent); color: white; border-color: var(--accent);
+  }
+  .logs-close {
+    border: none; background: none; cursor: pointer; color: var(--text-muted);
+    font-size: 14px; padding: 2px 6px; border-radius: 4px;
+  }
+  .logs-close:hover { background: var(--bg-hover); }
+  .logs-body {
+    flex: 1; overflow-y: auto; padding: 8px 12px;
+    font-family: monospace; font-size: 11px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .logs-empty { color: var(--text-muted); padding: 20px 0; text-align: center; }
+  .log-line {
+    display: flex; gap: 6px; line-height: 1.4; padding: 1px 0;
+    border-bottom: 1px solid var(--border)08;
+  }
+  .log-time { color: var(--text-muted); flex-shrink: 0; font-size: 10px; padding-top: 1px; }
+  .log-mod { color: var(--accent); flex-shrink: 0; }
+  .log-msg { color: var(--text); word-break: break-all; }
+  .log-warn .log-msg { color: #d97706; }
+  .log-error .log-msg { color: #ef4444; }
+  .logs-footer {
+    padding: 8px 14px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  }
+  .logs-footer button {
+    border: 1px solid var(--border); background: var(--bg);
+    border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+  }
+  .logs-hint { font-size: 10px; color: var(--text-muted); margin-left: auto; }
 </style>

@@ -8,6 +8,7 @@
 
   let password = "";
   let error = "";
+  let rpcWarning = null; // non-blocking warning after unlock
   let loading = false;
   let loadingMsg = "Déverrouillage…";
 
@@ -15,22 +16,39 @@
     if (!password) return;
     loading = true;
     error = "";
+    rpcWarning = null;
     loadingMsg = "Déverrouillage…";
     try {
-      const address = await invoke("unlock_wallet", { password });
-      // address is returned on success (may have taken a while if wallet was restored)
-      dispatch("unlocked", { address });
+      const result = await invoke("unlock_wallet", { password });
+      // result = { address, balance_xmr, rpc_error, seed_invalid }
+      if (result.rpc_error) {
+        if (result.seed_invalid) {
+          rpcWarning = { type: "seed_invalid", raw: result.rpc_error };
+        } else {
+          rpcWarning = { type: "network", raw: result.rpc_error };
+        }
+        loading = false;
+        // Still dispatch unlocked — user can use the app without RPC
+        dispatch("unlocked", { address: result.address, balance: result.balance_xmr, rpcError: result.rpc_error });
+      } else {
+        dispatch("unlocked", { address: result.address, balance: result.balance_xmr });
+      }
     } catch (e) {
       const msg = typeof e === "string" ? e : String(e);
-      // Show friendlier message for RPC/node errors (non-critical for daily use)
-      if (msg.includes("wallet-rpc") || msg.includes("connect") || msg.includes("node")) {
-        // Wallet decrypted OK but RPC failed — still allow app to work offline
-        dispatch("unlocked", { address: null, rpcError: msg });
-      } else {
-        error = msg.includes("Incorrect") ? "Mot de passe incorrect." : msg;
-        loading = false;
-      }
+      error = msg.includes("Incorrect") ? "Mot de passe incorrect." : msg;
+      loading = false;
     }
+  }
+
+  function friendlyRpcError(w) {
+    if (!w) return "";
+    if (w.type === "seed_invalid") {
+      return "⚠️ Votre phrase secrète semble corrompue (ancienne version de l'app). Vos abonnements sont accessibles, mais le solde Monero ne peut pas être affiché. Pour corriger : réinitialisez votre wallet (bouton ci-dessous) puis recréez-le avec les 25 mots notés.";
+    }
+    if (w.type === "network") {
+      return "⚠️ Impossible de joindre le réseau Monero. Vérifiez votre connexion internet. Vos abonnements restent accessibles, le solde sera affiché à la prochaine connexion.";
+    }
+    return "⚠️ Erreur réseau : " + w.raw;
   }
 
   function onKey(e) {
@@ -111,21 +129,35 @@
       <div class="error-msg">{error}</div>
     {/if}
 
-    <button
-      class="btn-primary btn-full"
-      on:click={unlock}
-      disabled={!password || loading}
-    >
-      {#if loading}
-        <span class="spinner"></span> {loadingMsg}
-      {:else}
-        {$t.unlock || "Déverrouiller"} →
-      {/if}
-    </button>
+    {#if rpcWarning}
+      <div class="rpc-warning">
+        <p>{friendlyRpcError(rpcWarning)}</p>
+        {#if rpcWarning.type === "seed_invalid"}
+          <button class="btn-link warn-reset" on:click={() => dispatch("reset")}>
+            → Réinitialiser mon wallet
+          </button>
+        {/if}
+        <button class="btn-link warn-close" on:click={() => dispatch("unlocked", { address: "", balance: 0 })}>
+          → Continuer quand même
+        </button>
+      </div>
+    {:else}
+      <button
+        class="btn-primary btn-full"
+        on:click={unlock}
+        disabled={!password || loading}
+      >
+        {#if loading}
+          <span class="spinner"></span> {loadingMsg}
+        {:else}
+          {$t.unlock || "Déverrouiller"} →
+        {/if}
+      </button>
 
-    <button class="btn-link" on:click={() => dispatch("reset")}>
-      {$t.resetWallet || "Réinitialiser le wallet (seed perdu)"}
-    </button>
+      <button class="btn-link" on:click={() => dispatch("reset")}>
+        {$t.resetWallet || "Réinitialiser le wallet (seed perdu)"}
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -196,6 +228,17 @@
     background: var(--red-bg); color: var(--red);
     padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px;
   }
+
+  .rpc-warning {
+    background: #fff7ed; border: 1px solid #fb923c44;
+    border-radius: 8px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .rpc-warning p {
+    margin: 0; font-size: 12.5px; color: #92400e; line-height: 1.5;
+  }
+  .warn-reset { color: var(--accent); font-weight: 600; }
+  .warn-close { color: var(--text-muted); }
 
   .btn-full { width: 100%; padding: 13px; font-size: 14px; }
 

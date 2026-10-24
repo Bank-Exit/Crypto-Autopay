@@ -26,6 +26,13 @@ pub struct AppState {
     pub wallet_file_path: PathBuf,
     /// Whether the wallet is currently unlocked (seed in memory).
     pub unlocked: bool,
+    /// Wallet address (primary, set after first unlock/restore).
+    pub wallet_address: Option<String>,
+    /// Cached XMR balance (piconero units, refreshed at unlock time).
+    pub balance_atomic: u64,
+    /// Wallet password stored in memory for this session (for balance refresh).
+    /// Cleared when the app is locked.
+    pub session_password: Option<String>,
     /// A deep-link URL waiting to be consumed by the frontend.
     /// Set when the app is launched/focused via a crypto-autopay: URI.
     pub pending_deep_link: Option<String>,
@@ -100,14 +107,15 @@ async fn create_wallet(
 }
 
 /// Unlock the wallet: verify password by decrypting the vault.
-/// If the wallet file doesn't exist yet, restore it from the seed via monero-wallet-rpc.
-/// Returns Ok(address) on success.
+/// - Returns Err ONLY if the password is wrong (or vault missing).
+/// - Returns Ok(UnlockResult) in all other cases (even if RPC fails).
+///   rpc_error / seed_invalid in the result indicate degraded mode.
 #[tauri::command]
 async fn unlock_wallet(
     password: String,
     state: tauri::State<'_, Mutex<AppState>>,
     app_handle: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<UnlockResult, String> {
     let (vault_path, wallet_file_path) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         (s.vault_path.clone(), s.wallet_file_path.clone())
@@ -119,13 +127,13 @@ async fn unlock_wallet(
     let encrypted: EncryptedSeed = serde_json::from_str(&vault_json)
         .map_err(|e| format!("Invalid vault file: {e}"))?;
 
-    // Decrypt (validates the password)
+    // Decrypt — ONLY step that can return Err (wrong password)
     let seed = SeedVault::decrypt(&encrypted, &password)
         .map_err(|_| "Incorrect password.".to_string())?;
 
     log::info!("Vault decrypted successfully.");
 
-    // Check if the wallet file exists (monero-wallet-rpc creates a .keys file)
+    let seed_str = seed.to_string();
     let keys_file = wallet_file_path.with_extension("keys");
     let wallet_exists = keys_file.exists();
     let wallet_name = wallet_file_path
@@ -135,104 +143,109 @@ async fn unlock_wallet(
         .to_string();
     let wallet_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
 
-    let address = if !wallet_exists {
-        // First unlock: restore wallet from seed via monero-wallet-rpc
-        log::info!("Wallet file not found — restoring from seed…");
+    // Try RPC session — non-fatal on failure
+    let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
+    let rpc_result: Result<(String, f64), (String, bool)> = tokio::task::spawn_blocking(move || {
+        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        mgr.start_for_dir(&wd).map_err(|e| (e, false))?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| (e, false))?;
 
-        // Start wallet-rpc in wallet-dir mode (blocking — runs in tokio task)
-        let seed_str = seed.to_string();
-        let password_clone = password.clone();
-        let wallet_name_clone = wallet_name.clone();
-        let wallet_dir_clone = wallet_dir.clone();
+        let (address, balance) = if !wallet_exists {
+            log::info!("Restoring wallet from seed…");
+            let addr = mgr.rpc_restore_wallet(&wn, &pw, &sd, 0).map_err(|e| {
+                let is_seed = e.contains("word list") || e.contains("Electrum") || e.contains("verification");
+                (e, is_seed)
+            })?;
+            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or(0.0);
+            (addr, bal)
+        } else {
+            log::info!("Opening existing wallet…");
+            rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"open","method":"open_wallet",
+                "params":{"filename":wn,"password":pw}
+            })).map_err(|e| (e, false))?;
+            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"addr","method":"get_address",
+                "params":{"account_index":0}
+            })).map_err(|e| (e, false))?;
+            let addr = resp["result"]["address"].as_str().unwrap_or("").to_string();
+            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or(0.0);
+            (addr, bal)
+        };
+        mgr.stop();
+        Ok::<(String, f64), (String, bool)>((address, balance))
+    })
+    .await
+    .unwrap_or_else(|e| Err((format!("Task spawn error: {e}"), false)));
 
-        // We need to run blocking code; tauri commands are async (tokio)
-        let result = tokio::task::spawn_blocking(move || {
-            let config = rpc_manager::RpcConfig::default();
-            let mut mgr = rpc_manager::RpcManager::new(config);
-
-            mgr.start_for_dir(&wallet_dir_clone)?;
-            mgr.wait_for_ready(std::time::Duration::from_secs(10))?;
-
-            let address = mgr.rpc_restore_wallet(
-                &wallet_name_clone,
-                &password_clone,
-                &seed_str,
-                0, // restore from genesis — safer for a new app
-            )?;
-
-            mgr.stop();
-            Ok::<String, String>(address)
-        })
-        .await
-        .map_err(|e| format!("Task error: {e}"))??;
-
-        log::info!("Wallet restored. Address: {}", result);
-        result
-    } else {
-        // Wallet exists — just open it via RPC to get the address
-        log::info!("Wallet file found at {:?}", keys_file);
-        let password_clone = password.clone();
-        let wallet_name_clone = wallet_name.clone();
-        let wallet_dir_clone = wallet_dir.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let config = rpc_manager::RpcConfig::default();
-            let mut mgr = rpc_manager::RpcManager::new(config);
-
-            // Start in wallet-dir mode then open the existing wallet
-            mgr.start_for_dir(&wallet_dir_clone)?;
-            mgr.wait_for_ready(std::time::Duration::from_secs(10))?;
-
-            // Open the existing wallet
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "open",
-                "method": "open_wallet",
-                "params": {
-                    "filename": wallet_name_clone,
-                    "password": password_clone
-                }
-            });
-            let _ = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &body)?;
-
-            // Get address
-            let addr_body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "addr",
-                "method": "get_address",
-                "params": { "account_index": 0 }
-            });
-            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &addr_body)?;
-            let address = resp["result"]["address"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-
-            mgr.stop();
-            Ok::<String, String>(address)
-        })
-        .await
-        .map_err(|e| format!("Task error: {e}"))??;
-
-        result
+    let (address, balance_xmr, rpc_error, seed_invalid) = match rpc_result {
+        Ok((addr, bal)) => {
+            let prefix = if addr.len() > 12 { &addr[..12] } else { &addr };
+            log::info!("Wallet RPC OK. Address: {}…", prefix);
+            (addr, bal, None, false)
+        }
+        Err((e, is_seed)) => {
+            log::warn!("Wallet RPC failed (non-fatal): {}", e);
+            (String::new(), 0.0, Some(e), is_seed)
+        }
     };
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
-    log::info!("Wallet unlocked. Address: {}", address);
-    Ok(address)
+    s.session_password = Some(password);
+    s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
+    s.balance_atomic = (balance_xmr * 1e12) as u64;
+
+    log::info!("Wallet unlocked (rpc_error={:?}, seed_invalid={})", rpc_error, seed_invalid);
+    Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
 }
 
-/// Get the current wallet balance.
-/// NOTE: balance requires an open RPC session (password needed) — returns 0 for now,
-/// will be extended when persistent RPC session is implemented.
+/// Get the cached wallet balance (set at unlock time, refreshed by refresh_balance).
 #[tauri::command]
 async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<BalanceResponse, String> {
-    let unlocked = state.lock().map_err(|e| e.to_string())?.unlocked;
-    if !unlocked {
-        return Err("Wallet is locked.".to_string());
+    let s = state.lock().map_err(|e| e.to_string())?;
+    if !s.unlocked { return Err("Wallet is locked.".to_string()); }
+    let atomic = s.balance_atomic;
+    Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic })
+}
+
+/// Refresh balance using the stored session password (called by frontend timer).
+/// Opens a transient wallet-rpc session, fetches unlocked balance, stores it.
+#[tauri::command]
+async fn refresh_balance(
+    state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<BalanceResponse, String> {
+    let (wallet_name, wallet_dir, password) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if !s.unlocked { return Err("Locked".into()); }
+        let wn = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let pw = s.session_password.clone().ok_or("No session")?;
+        (wn, wd, pw)
+    };
+
+    let (xmr, atomic) = tokio::task::spawn_blocking(move || {
+        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+        rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"open","method":"open_wallet",
+            "params":{"filename":wallet_name,"password":password}
+        })).map_err(|e| e.to_string())?;
+        let (unlocked, _) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));
+        let atomic = (unlocked * 1e12) as u64;
+        mgr.stop();
+        Ok::<(f64, u64), String>((unlocked, atomic))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if let Ok(mut s) = state.lock() {
+        s.balance_atomic = atomic;
     }
-    Ok(BalanceResponse { xmr: 0.0, atomic: 0 })
+    Ok(BalanceResponse { xmr, atomic })
 }
 
 /// Get all subscriptions from the local SQLite database.
@@ -391,6 +404,20 @@ struct BalanceResponse {
     atomic: u64,
 }
 
+/// Result returned by unlock_wallet — never Err on RPC failure, always Ok.
+/// Password errors return Err("Incorrect password.").
+#[derive(Serialize, Deserialize)]
+struct UnlockResult {
+    /// Monero address (empty string if RPC unavailable).
+    address: String,
+    /// XMR balance at unlock time (0.0 if RPC unavailable).
+    balance_xmr: f64,
+    /// If Some, an RPC/network error occurred but the wallet was still unlocked.
+    rpc_error: Option<String>,
+    /// True if the stored seed phrase failed checksum verification (old buggy version).
+    seed_invalid: bool,
+}
+
 // ============================================================
 //  App entry point
 // ============================================================
@@ -448,6 +475,9 @@ pub fn run() {
                 vault_path,
                 wallet_file_path,
                 unlocked: false,
+                wallet_address: None,
+                balance_atomic: 0,
+                session_password: None,
                 pending_deep_link: None,
                 rpc: RpcManager::new(rpc_config),
             }));
@@ -494,6 +524,7 @@ pub fn run() {
             create_wallet,
             unlock_wallet,
             get_balance,
+            refresh_balance,
             get_subscriptions,
             add_subscription,
             delete_subscription,
