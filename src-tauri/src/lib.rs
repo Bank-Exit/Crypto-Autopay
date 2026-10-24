@@ -11,6 +11,9 @@ use autopay_crypto::{
 use autopay_core::db::Database;
 use autopay_core::models::{Subscription, SubscriptionStatus};
 
+mod rpc_manager;
+use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
+
 // ============================================================
 //  Application state
 // ============================================================
@@ -19,11 +22,15 @@ use autopay_core::models::{Subscription, SubscriptionStatus};
 pub struct AppState {
     /// Path to the encrypted seed vault file.
     pub vault_path: PathBuf,
+    /// Path to the wallet file used with monero-wallet-rpc.
+    pub wallet_file_path: PathBuf,
     /// Whether the wallet is currently unlocked (seed in memory).
     pub unlocked: bool,
     /// A deep-link URL waiting to be consumed by the frontend.
     /// Set when the app is launched/focused via a crypto-autopay: URI.
     pub pending_deep_link: Option<String>,
+    /// RPC process manager.
+    pub rpc: RpcManager,
 }
 
 // ============================================================
@@ -201,6 +208,62 @@ async fn add_subscription(
     serde_json::to_value(&sub).map_err(|e| e.to_string())
 }
 
+/// Get the list of known public Monero nodes.
+#[tauri::command]
+fn get_public_nodes() -> Vec<String> {
+    PUBLIC_NODES.iter().map(|s| s.to_string()).collect()
+}
+
+/// Check if a monero-wallet-rpc binary can be found.
+#[tauri::command]
+fn detect_rpc_binary(state: tauri::State<'_, Mutex<AppState>>) -> Option<String> {
+    let s = state.lock().unwrap();
+    s.rpc.detect_binary().map(|p| p.to_string_lossy().to_string())
+}
+
+/// Get current RPC status.
+#[tauri::command]
+fn get_rpc_status(state: tauri::State<'_, Mutex<AppState>>) -> RpcStatus {
+    let s = state.lock().unwrap();
+    s.rpc.status.clone()
+}
+
+/// Save RPC configuration (node, binary path, tolerance).
+#[tauri::command]
+fn save_rpc_config(
+    config: RpcConfig,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let path = data_dir.join("rpc_config.json");
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // Update live config (takes effect on next start)
+    let mut s = state.lock().unwrap();
+    s.rpc = RpcManager::new(config);
+    Ok(())
+}
+
+/// Start wallet-rpc (only called when a payment is due or user explicitly requests it).
+#[tauri::command]
+fn start_wallet_rpc(
+    wallet_password: String,
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let wallet_path = s.wallet_file_path.clone();
+    s.rpc.start(&wallet_path, &wallet_password)?;
+    Ok(s.rpc.rpc_url())
+}
+
+/// Stop wallet-rpc.
+#[tauri::command]
+fn stop_wallet_rpc(state: tauri::State<'_, Mutex<AppState>>) {
+    let mut s = state.lock().unwrap();
+    s.rpc.stop();
+}
+
 /// Delete a subscription by id.
 #[tauri::command]
 async fn delete_subscription(
@@ -270,18 +333,28 @@ pub fn run() {
                 .expect("Failed to resolve app data dir");
             std::fs::create_dir_all(&data_dir).ok();
 
-            let vault_path = data_dir.join("seed.vault");
-            let db_path   = data_dir.join("subscriptions.db");
+            let vault_path      = data_dir.join("seed.vault");
+            let wallet_file_path = data_dir.join("autopay_wallet");
+            let db_path          = data_dir.join("subscriptions.db");
 
             // Open the subscriptions SQLite database
             let db = Database::open(db_path.to_str().unwrap())
                 .expect("Failed to open subscriptions DB");
             app.manage(Mutex::new(db));
 
+            // Load RPC config from settings (or use defaults)
+            let rpc_config_path = data_dir.join("rpc_config.json");
+            let rpc_config: RpcConfig = std::fs::read_to_string(&rpc_config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
             app.manage(Mutex::new(AppState {
                 vault_path,
+                wallet_file_path,
                 unlocked: false,
                 pending_deep_link: None,
+                rpc: RpcManager::new(rpc_config),
             }));
 
             if cfg!(debug_assertions) {
@@ -330,6 +403,12 @@ pub fn run() {
             add_subscription,
             delete_subscription,
             set_subscription_status,
+            get_public_nodes,
+            detect_rpc_binary,
+            get_rpc_status,
+            save_rpc_config,
+            start_wallet_rpc,
+            stop_wallet_rpc,
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

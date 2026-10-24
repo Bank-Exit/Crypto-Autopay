@@ -224,6 +224,34 @@
     showNewSubModal = false;
   }
 
+  /**
+   * Duplicate checker passed to SubscriptionCodeEditor.
+   * Returns "exact" | "soft" | null.
+   * Called BEFORE the import result is shown.
+   */
+  function checkImportDuplicate(payload) {
+    const addr = payload.destination_address || payload.sellers_wallet || payload.address;
+    const sched = payload.schedule;
+    const label = (payload.custom_label || "").toLowerCase().trim();
+    const amount = String(payload.amount || "").trim();
+    const currency = (payload.currency || "XMR").toUpperCase();
+    // Exact: same address + schedule
+    if (addr) {
+      const exactMatch = subscriptions.some(s =>
+        s.address && s.address === addr && (s._raw_schedule || s.schedule) === sched
+      );
+      if (exactMatch) return "exact";
+    }
+    // Soft: same label + amount + currency (catches mock-data duplicates)
+    const softMatch = subscriptions.some(s =>
+      s.label.toLowerCase().trim() === label &&
+      String(s.amount).trim() === amount &&
+      (s.currency || "XMR").toUpperCase() === currency
+    );
+    if (softMatch) return "soft";
+    return null;
+  }
+
   /** Import tab dispatches this after "Ajouter cet abonnement" */
   async function onSubImported({ detail }) {
     logInfo("Dashboard", "onSubImported fired");
@@ -251,8 +279,35 @@
 
   let trayStatus = "green";
 
+  // ---- RPC settings state ----
+  let rpcStatus = "stopped";
+  let rpcStatusLabel = "Arrêté";
+  let rpcBinaryPath = null;
+  let publicNodes = [];
+  let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20, send_logs_enabled: false };
+
+  async function loadRpcState() {
+    const [status, binary, nodes] = await Promise.all([
+      tauriInvoke("get_rpc_status"),
+      tauriInvoke("detect_rpc_binary"),
+      tauriInvoke("get_public_nodes"),
+    ]);
+    rpcStatus = status?.toLowerCase?.() ?? "stopped";
+    rpcStatusLabel = status === "Running" ? "En marche" : status === "Starting" ? "Démarrage…" : status === "Stopped" ? "Arrêté" : "Erreur";
+    rpcBinaryPath = binary;
+    publicNodes = nodes ?? [];
+    logInfo("RPC", `Status: ${status}, binary: ${binary ?? "not found"}`);
+  }
+
+  async function saveRpcConfig() {
+    const result = await tauriInvoke("save_rpc_config", { config: rpcConfig });
+    if (result === null) logInfo("RPC", "Config saved"); // null = Ok(())
+    await loadRpcState();
+  }
+
   // ---- Load persisted subscriptions from SQLite on mount ----
   onMount(async () => {
+    await loadRpcState();
     logInfo("Dashboard", "Loading subscriptions from DB");
     const dbSubs = await tauriInvoke("get_subscriptions");
     if (dbSubs && dbSubs.length > 0) {
@@ -532,7 +587,7 @@
             </div>
           </div>
         </div>
-        <p class="sub-footer-version">Crypto AutoPay v0.1 · 2026 · open source · <span class="sub-footer-tagline">Vos paiements, vos règles.</span></p>
+        <p class="sub-footer-version">Crypto AutoPay v0.2 · 2026 · open source · <span class="sub-footer-tagline">Vos paiements, vos règles.</span></p>
       </div>
 
     <!-- ====== WALLETS ====== -->
@@ -755,6 +810,51 @@
         </div>
       </div>
 
+      <!-- RPC / Wallet section -->
+      <h2 class="section-title">Wallet RPC <span class="badge-v2">v0.2</span></h2>
+      <div class="settings-section card">
+        <div class="rpc-status-row">
+          <span class="setting-label">Statut wallet-rpc</span>
+          <span class="rpc-badge rpc-{rpcStatus}">{rpcStatusLabel}</span>
+        </div>
+        {#if rpcBinaryPath}
+          <p class="rpc-info">Binaire détecté : <code>{rpcBinaryPath}</code></p>
+        {:else}
+          <p class="rpc-warn">
+            ⚠ <code>monero-wallet-rpc</code> introuvable dans PATH.<br>
+            <a class="rpc-link" href="https://www.getmonero.org/downloads/" on:click|preventDefault={() => openExternal("https://www.getmonero.org/downloads/")}>
+              Télécharger Monero CLI →
+            </a>
+            ou renseigner le chemin ci-dessous.
+          </p>
+          <label class="field" style="margin-top:8px">
+            <span>Chemin du binaire (optionnel)</span>
+            <input type="text" bind:value={rpcConfig.binary_path} placeholder="/usr/bin/monero-wallet-rpc" />
+          </label>
+        {/if}
+
+        <label class="field" style="margin-top:10px">
+          <span>Nœud Monero public</span>
+          <select bind:value={rpcConfig.daemon_address} class="setting-select" style="width:100%">
+            <option value="">Automatique (premier nœud disponible)</option>
+            {#each publicNodes as node}
+              <option value={node}>{node}</option>
+            {/each}
+          </select>
+        </label>
+
+        <label class="field" style="margin-top:10px">
+          <span>Tolérance paiement <strong>{rpcConfig.tolerance_pct}%</strong>
+            <span class="text-muted" style="font-size:10px"> — ex: 20% = ±6j sur mensuel</span>
+          </span>
+          <input type="range" min="5" max="50" step="5" bind:value={rpcConfig.tolerance_pct} />
+        </label>
+
+        <button class="btn-primary btn-sm" style="margin-top:10px;width:fit-content" on:click={saveRpcConfig}>
+          Enregistrer la config RPC
+        </button>
+      </div>
+
       <!-- Logs section in Settings -->
       <h2 class="section-title">Journaux techniques</h2>
       <div class="settings-section card">
@@ -949,6 +1049,7 @@
           initialCode={importInitialCode}
           compact={true}
           lang={$currentLang}
+          duplicateChecker={checkImportDuplicate}
           on:imported={onSubImported}
           on:close={() => showImportModal = false}
         />
@@ -1118,6 +1219,19 @@
   .log-error .log-module { color: #ef4444; }
   .log-error { background: #ef444410; }
   .badge-opt { font-size: 10px; background: #f59e0b22; color: #b45309; padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
+  .badge-v2 { font-size: 10px; background: #3b82f622; color: #1d4ed8; padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
+
+  /* RPC section */
+  .rpc-status-row { display: flex; align-items: center; gap: 10px; }
+  .rpc-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .rpc-running { background: #22c55e20; color: #15803d; }
+  .rpc-stopped { background: var(--border); color: var(--text-muted); }
+  .rpc-starting { background: #f59e0b20; color: #b45309; }
+  .rpc-error { background: #ef444420; color: #dc2626; }
+  .rpc-info { font-size: 11px; color: var(--text-muted); margin: 6px 0 0; }
+  .rpc-info code { background: var(--bg-sidebar); padding: 1px 4px; border-radius: 3px; }
+  .rpc-warn { font-size: 11.5px; color: #b45309; background: #fef3c7; padding: 8px 10px; border-radius: 6px; margin: 6px 0 0; line-height: 1.5; }
+  .rpc-link { color: var(--accent); }
 
   /* Create-code full page */
   .create-code-page { padding: 0 2px; max-width: 640px; }

@@ -15,7 +15,7 @@
 -->
 <script>
   import { createEventDispatcher, onMount } from "svelte";
-  import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED } from "./autopay-encode.js";
+  import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED, scheduleToHuman } from "./autopay-encode.js";
 
   const dispatch = createEventDispatcher();
 
@@ -24,6 +24,13 @@
   export let lang = "fr";
   /** Optional: pre-fill the import field with a code (from deep link) */
   export let initialCode = null;
+  /**
+   * Optional duplicate checker injected by parent.
+   * (payload) => "exact" | "soft" | null
+   * "exact" = same address + schedule
+   * "soft"  = same label + amount + currency
+   */
+  export let duplicateChecker = null;
 
   // In the app only Monero & Bitcoin are supported (no Ethereum RPC planned)
   const APP_NETWORKS = NETWORKS_EXTENDED.filter(n => ["monero", "bitcoin"].includes(n.id));
@@ -225,6 +232,61 @@
   }
   $: if (fiatEnabled && payload.amount) { fetchFiatRate(); }
 
+  // ---- Pre-import duplicate popup ----
+  const DUP_SECONDS = 20;
+  const DUP_R = 22;
+  const DUP_CIRC = 2 * Math.PI * DUP_R;
+
+  let showImportDupPopup = false;
+  let importDupType = null;           // "exact" | "soft"
+  let pendingImportResult = null;     // decoded result held until confirmed
+  let importDupTimeLeft = DUP_SECONDS;
+  let importDupTimer = null;
+  $: importDupOffset = DUP_CIRC * (1 - importDupTimeLeft / DUP_SECONDS);
+
+  // Second confirmation state
+  let showImportCaptcha = false;
+  let captchaA = 0, captchaB = 0, captchaAnswer = "", captchaError = false;
+
+  function startImportDupTimer() {
+    clearImportDupTimer();
+    importDupTimeLeft = DUP_SECONDS;
+    importDupTimer = setInterval(() => {
+      importDupTimeLeft = Math.max(0, importDupTimeLeft - 0.05);
+      if (importDupTimeLeft <= 0) cancelDupImport();
+    }, 50);
+  }
+  function clearImportDupTimer() {
+    if (importDupTimer) { clearInterval(importDupTimer); importDupTimer = null; }
+  }
+  function cancelDupImport() {
+    clearImportDupTimer();
+    showImportDupPopup = false;
+    showImportCaptcha = false;
+    pendingImportResult = null;
+    importDupType = null;
+  }
+  function confirmDupStep1() {
+    // User clicks "Oui" on first popup → show captcha
+    clearImportDupTimer();
+    showImportDupPopup = false;
+    captchaA = Math.floor(Math.random() * 9) + 1;
+    captchaB = Math.floor(Math.random() * 9) + 1;
+    captchaAnswer = "";
+    captchaError = false;
+    showImportCaptcha = true;
+  }
+  function confirmDupStep2() {
+    const expected = captchaA + captchaB;
+    if (parseInt(captchaAnswer, 10) === expected) {
+      showImportCaptcha = false;
+      importResult = pendingImportResult;
+      pendingImportResult = null;
+    } else {
+      captchaError = true;
+    }
+  }
+
   // ---- Paste from clipboard ----
   async function pasteFromClipboard() {
     try {
@@ -261,13 +323,25 @@
   async function parseImport() {
     importError = "";
     importResult = null;
+    pendingImportResult = null;
+    showImportDupPopup = false;
+    showImportCaptcha = false;
     importLoading = true;
     console.log("[SCE] parseImport() — decoding, length:", importInput.trim().length);
     try {
       const { prefix, version, payload: parsed } = await decodeAutopay(importInput.trim());
-      importResult = { prefix, version, payload: parsed };
       console.log("[SCE] parseImport() success, prefix:", prefix, "label:", parsed.custom_label);
-      // Note: do NOT auto-dispatch "imported" here — user must click "Ajouter cet abonnement"
+
+      // Duplicate check BEFORE showing result
+      const dupType = duplicateChecker ? duplicateChecker(parsed) : null;
+      if (dupType) {
+        importDupType = dupType;
+        pendingImportResult = { prefix, version, payload: parsed };
+        showImportDupPopup = true;
+        startImportDupTimer();
+      } else {
+        importResult = { prefix, version, payload: parsed };
+      }
     } catch (e) {
       importError = String(e);
       console.warn("[SCE] parseImport() error:", e);
@@ -591,6 +665,69 @@
         <div class="error-msg">{importError}</div>
       {/if}
 
+      <!-- ===== Duplicate popup (shown BEFORE decode result) ===== -->
+      {#if showImportDupPopup && pendingImportResult}
+        <div class="import-dup-popup card">
+          <div class="dup-header">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span class="dup-title-text">
+              {importDupType === "exact"
+                ? l("Abonnement identique déjà présent", "Identical subscription already exists")
+                : l("Abonnement similaire possible", "Similar subscription may exist")}
+            </span>
+          </div>
+          <p class="dup-detail">
+            <strong>{pendingImportResult.payload.custom_label}</strong>
+            {importDupType === "exact"
+              ? l(" — même adresse et fréquence.", " — same address and schedule.")
+              : l(" — même nom, montant et devise.", " — same name, amount and currency.")}
+          </p>
+          <p class="dup-question">{l("Voulez-vous l'ajouter quand même ?", "Do you still want to add it?")}</p>
+
+          <!-- Pie countdown -->
+          <svg class="dup-pie-svg" viewBox="0 0 52 52" width="52" height="52">
+            <circle cx="26" cy="26" r="{DUP_R}" fill="none" stroke="var(--border)" stroke-width="4"/>
+            <circle cx="26" cy="26" r="{DUP_R}" fill="none" stroke="#f59e0b" stroke-width="4"
+              stroke-dasharray="{DUP_CIRC}" stroke-dashoffset="{importDupOffset}"
+              transform="rotate(-90 26 26)" style="transition:stroke-dashoffset .05s linear"/>
+            <text x="26" y="30" text-anchor="middle" font-size="11" fill="var(--text-muted)">{Math.ceil(importDupTimeLeft)}</text>
+          </svg>
+
+          <div class="dup-actions">
+            <button class="btn-primary dup-no-btn" type="button" on:click={cancelDupImport}>
+              {l("Non — fermer", "No — close")}
+            </button>
+            <button class="btn-ghost" type="button" on:click={confirmDupStep1}>
+              {l("Oui, voir quand même", "Yes, show anyway")}
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      <!-- ===== Captcha second confirmation ===== -->
+      {#if showImportCaptcha}
+        <div class="import-dup-popup card">
+          <p class="dup-title-text">⚠ {l("Êtes-vous vraiment sûr ?", "Are you really sure?")}</p>
+          <p class="dup-question" style="font-size:12px">{l("Ce doublon sera ajouté à votre liste. Résolvez ce calcul pour confirmer.", "This duplicate will be added. Solve to confirm.")}</p>
+          <div class="captcha-row">
+            <span class="captcha-num">{captchaA}</span>
+            <span class="captcha-op">+</span>
+            <span class="captcha-num">{captchaB}</span>
+            <span class="captcha-op">=</span>
+            <input class="captcha-input" type="number" bind:value={captchaAnswer}
+                   placeholder="?" min="0" max="99" on:keydown={e => e.key === "Enter" && confirmDupStep2()} />
+          </div>
+          {#if captchaError}
+            <p class="captcha-error">{l("Réponse incorrecte.", "Wrong answer.")}</p>
+          {/if}
+          <div class="dup-actions">
+            <button class="btn-ghost" type="button" on:click={cancelDupImport}>{l("Annuler", "Cancel")}</button>
+            <button class="btn-primary" type="button" on:click={confirmDupStep2}>{l("Confirmer", "Confirm")}</button>
+          </div>
+        </div>
+      {/if}
+
+      <!-- ===== Decoded result ===== -->
       {#if importResult}
         <div class="import-result card">
           <div class="import-badge">
@@ -601,7 +738,14 @@
             {#each Object.entries(importResult.payload).filter(([k]) => !k.startsWith("_")) as [key, val]}
               <div class="import-row">
                 <dt class="import-key">{key}</dt>
-                <dd class="import-val">{typeof val === "object" ? JSON.stringify(val) : val}</dd>
+                {#if key === "schedule" && typeof val === "string"}
+                  <dd class="import-val import-schedule">
+                    <span class="schedule-human">{scheduleToHuman(val, importResult.payload.repeat_every || 1, lang)}</span>
+                    <span class="schedule-cron">{val}</span>
+                  </dd>
+                {:else}
+                  <dd class="import-val">{typeof val === "object" ? JSON.stringify(val) : val}</dd>
+                {/if}
               </div>
             {/each}
           </dl>
@@ -770,6 +914,34 @@
     background: var(--accent); color: #fff; border: none; border-radius: 5px; cursor: pointer;
   }
   .share-back { margin-top: 4px; align-self: flex-start; }
+
+  /* Pre-import duplicate popup */
+  .import-dup-popup {
+    padding: 16px; display: flex; flex-direction: column; align-items: center;
+    gap: 10px; text-align: center;
+    border: 2px solid #f59e0b; background: #fffbeb;
+    animation: pop-in 0.18s cubic-bezier(.34,1.56,.64,1);
+  }
+  @keyframes pop-in { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .dup-header { display: flex; align-items: center; gap: 8px; }
+  .dup-title-text { font-weight: 700; font-size: 0.9rem; }
+  .dup-detail { font-size: 0.84rem; margin: 0; }
+  .dup-question { font-size: 0.82rem; color: var(--text-muted); margin: 0; }
+  .dup-pie-svg { display: block; margin: 0 auto; }
+  .dup-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .dup-no-btn { background: var(--accent) !important; }
+
+  /* Captcha */
+  .captcha-row { display: flex; align-items: center; gap: 8px; font-size: 1.5rem; font-weight: 700; }
+  .captcha-num { background: var(--border); border-radius: 6px; padding: 4px 14px; font-size: 1.6rem; }
+  .captcha-op { color: var(--text-muted); }
+  .captcha-input { width: 64px; font-size: 1.4rem; text-align: center; border: 2px solid var(--border); border-radius: 6px; padding: 4px; }
+  .captcha-error { color: #ef4444; font-size: 12px; margin: 0; }
+
+  /* Schedule in import result */
+  .import-schedule { flex-direction: column; gap: 2px; }
+  .schedule-human { font-weight: 600; color: var(--accent); }
+  .schedule-cron { font-size: 10px; color: var(--text-muted); font-family: monospace; text-align: right; }
 
   /* Import result */
   .import-result { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
