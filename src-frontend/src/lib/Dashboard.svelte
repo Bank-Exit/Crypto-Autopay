@@ -191,6 +191,10 @@
             <span class="status-dot {trayStatus}"></span>
             <span class="tray-label">OK</span>
           </div>
+          <div class="tray-row mode-tray">
+            <span class="mode-tray-dot" class:semi={$paymentMode === 'semi-auto'}></span>
+            <span class="tray-label">{$paymentMode === 'semi-auto' ? 'Semi-auto' : 'Auto'}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -257,7 +261,7 @@
         <span class="text-muted">{$t.nextPayment}</span>
         <strong>{nextPayment.label}</strong>
         <span>{nextPayment.amount} {$currentNetwork.symbol}</span>
-        <span class="text-muted">in {nextPayment.in_days} days</span>
+        <span class="text-muted">{$t.inPrefix} {nextPayment.in_days} {$t.inDaysSuffix}</span>
       </div>
 
       <!-- Refill estimate banner -->
@@ -442,22 +446,15 @@
       <h2 class="section-title">{$t.paymentModeTitle}</h2>
       <div class="settings-section card">
         <div class="setting-row mode-row">
-          <div class="mode-switcher">
-            <button
-              class="mode-btn"
-              class:mode-active={$paymentMode === "semi-auto"}
-              on:click={() => paymentMode.set("semi-auto")}
-            >
-              {$t.paymentModeSemiAuto}
-            </button>
-            <button
-              class="mode-btn"
-              class:mode-active={$paymentMode === "auto"}
-              on:click={() => paymentMode.set("auto")}
-            >
-              {$t.paymentModeAuto}
-            </button>
-          </div>
+          <span class="mode-side-label">{$t.paymentModeSemiAuto}</span>
+          <label class="toggle toggle-xl">
+            <input type="checkbox"
+              checked={$paymentMode === "auto"}
+              on:change={e => paymentMode.set(e.target.checked ? "auto" : "semi-auto")}
+            />
+            <span class="slider"></span>
+          </label>
+          <span class="mode-side-label">{$t.paymentModeAuto}</span>
         </div>
         <p class="mode-desc">
           {$paymentMode === "semi-auto" ? $t.paymentModeSemiAutoDesc : $t.paymentModeAutoDesc}
@@ -621,6 +618,8 @@
     gap: 14px;
     min-width: 0;
   }
+  /* All direct children keep their natural height → parent scrolls */
+  .content > * { flex-shrink: 0; }
 
   .page-header {
     display: flex;
@@ -737,32 +736,26 @@
   .theme-switcher { display: flex; gap: 6px; flex-wrap: wrap; }
   .active-theme { border-color: var(--accent) !important; color: var(--accent) !important; background: var(--accent-light) !important; }
 
-  /* Payment mode switcher */
-  .mode-row { justify-content: center; padding: 1rem 1.5rem; }
-  .mode-switcher {
-    display: flex;
-    border: 2px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    width: 100%;
-    max-width: 360px;
-  }
-  .mode-btn {
-    flex: 1;
-    padding: 0.55rem 1rem;
-    font-size: 0.9rem;
+  /* Payment mode — big toggle row */
+  .mode-row { justify-content: center; gap: 1rem; padding: 1.1rem 1.5rem; }
+  .mode-side-label {
+    font-size: 0.88rem;
     font-weight: 600;
-    border: none;
-    cursor: pointer;
-    background: transparent;
     color: var(--text-muted);
-    transition: background 0.18s, color 0.18s;
+    min-width: 80px;
   }
-  .mode-btn:first-child { border-right: 2px solid var(--border); }
-  .mode-btn.mode-active {
-    background: var(--accent);
-    color: #fff;
+  .mode-side-label:first-child { text-align: right; }
+  .mode-side-label:last-child  { text-align: left; }
+
+  /* 2× toggle */
+  .toggle-xl { width: 72px !important; height: 38px !important; }
+  .toggle-xl .slider { border-radius: 38px; }
+  .toggle-xl .slider::before {
+    width: 28px !important; height: 28px !important;
+    left: 5px !important; top: 5px !important;
   }
+  .toggle-xl input:checked + .slider::before { transform: translateX(34px) !important; }
+
   .mode-desc {
     margin: 0;
     padding: 0 1.5rem 1rem;
@@ -770,6 +763,15 @@
     color: var(--text-muted);
     line-height: 1.4;
   }
+
+  /* Sidebar mode indicator */
+  .mode-tray { margin-top: 2px; }
+  .mode-tray-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); /* auto = green/accent */
+    flex-shrink: 0;
+  }
+  .mode-tray-dot.semi { background: #f59e0b; /* amber for semi-auto */ }
 
   .tz-display { font-size: 12px; }
 

@@ -14,7 +14,7 @@
     on:close      — user clicked cancel/close
 -->
 <script>
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount } from "svelte";
   import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED } from "./autopay-encode.js";
 
   const dispatch = createEventDispatcher();
@@ -85,12 +85,12 @@
   let importError = "";
   let importLoading = false;
 
-  // When a deep-link code is provided, switch to import mode and pre-fill
-  import { onMount } from "svelte";
-  onMount(() => {
+  // When a deep-link code is provided, switch to import mode, pre-fill, and auto-decode
+  onMount(async () => {
     if (initialCode) {
       mode = "import";
       importInput = initialCode;
+      await parseImport();
     }
   });
 

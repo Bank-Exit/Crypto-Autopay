@@ -153,10 +153,16 @@
   </div>
 
   <div class="notice">
-    <strong>Pour que le deeplink fonctionne :</strong><br>
-    1. Lancer l'app au moins une fois avec <code>cargo tauri dev</code> (enregistre le scheme <code>crypto-autopay</code> via xdg-mime sur Linux).<br>
-    2. Cliquer sur le lien ci-dessus — l'OS délègue à l'app qui affiche la fenêtre "Ajouter cet abonnement ?".<br>
-    3. Le mode <strong>Semi-auto</strong> (défaut) affiche une confirmation avant chaque paiement automatique.
+    <strong>Prérequis sur Ubuntu (Brave / Firefox / Chromium) :</strong><br>
+    1. Lancer l'app <strong>au moins une fois</strong> avec <code>cargo tauri dev</code> — cela enregistre le scheme <code>crypto-autopay</code> via <code>xdg-mime</code>.<br>
+    2. Si le schéma est déjà enregistré mais que rien ne se passe, vérifier avec :<br>
+    &nbsp;&nbsp;<code>xdg-mime query default x-scheme-handler/crypto-autopay</code><br>
+    &nbsp;&nbsp;→ doit retourner <code>monero-autopay.desktop</code> (ou similaire).<br>
+    3. Si Brave affiche "xdg-open souhaite ouvrir cette application" mais ne fait rien :<br>
+    &nbsp;&nbsp;→ l'app n'est pas en cours d'exécution. Lancer <code>cargo tauri dev</code> en arrière-plan,<br>
+    &nbsp;&nbsp;puis réessayer le lien.<br>
+    4. En mode développement, l'app n'est accessible que pendant <code>cargo tauri dev</code>.<br>
+    &nbsp;&nbsp;Pour un test sans dev server : <code>cargo tauri build</code> + installer le bundle <code>.AppImage</code>.
   </div>
 
   <footer>Crypto AutoPay · Protocole <code>crypto-autopay:1:</code> · Test interne</footer>

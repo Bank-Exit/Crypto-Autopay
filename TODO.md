@@ -5,6 +5,15 @@
 
 ---
 
+## Dépendances — notes de version
+
+- **`tauri-plugin-deep-link`** : pinné à `=2.3.0` car la v2.6.2 ne compile pas (bug #upstream : `ini::ParseOption` manque les champs `enabled_indented_mutiline_value` + `enabled_preserve_key_leading_whitespace`).
+  - Surveiller les releases sur https://github.com/tauri-apps/plugins-workspace
+  - Quand le bug sera corrigé : retirer le `=` dans `Cargo.toml` et faire `cargo update -p tauri-plugin-deep-link`
+  - → Signaler sur GitHub : https://github.com/tauri-apps/plugins-workspace/issues
+
+---
+
 ## Domaine / URL officielle
 - [x] URL provisoire : `autopay.libre-market.com`
 - [ ] Héberger le canal de mise à jour signé sur ce domaine
