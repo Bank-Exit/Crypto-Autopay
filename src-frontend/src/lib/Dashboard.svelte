@@ -89,11 +89,25 @@
 
   // ---- New-subscription modal ----
   let showNewSubModal = false;
-  let modalInitialCode = null; // pre-filled code from deep link
+  let modalInitialCode = null;  // pre-filled code from deep link
+  let modalInitialMode = "create"; // "create" | "import"
+
+  function openNewSubModal() {
+    modalInitialMode = "create";
+    modalInitialCode = null;
+    showNewSubModal = true;
+  }
+
+  function openImportModal() {
+    modalInitialMode = "import";
+    modalInitialCode = null;
+    showNewSubModal = true;
+  }
 
   // React to external code (deep link)
   $: if (externalCode) {
     modalInitialCode = externalCode;
+    modalInitialMode = "import";
     showNewSubModal = true;
   }
 
@@ -251,8 +265,8 @@
         <h1>{$currentNetwork.label} AutoPay</h1>
         <div class="page-actions">
           <button class="btn-ghost" on:click={() => page = "find"}>{$t.findSubscriptions}</button>
-          <button class="btn-ghost">📥 {$t.importSubscription}</button>
-          <button class="btn-primary" on:click={() => showNewSubModal = true}>＋ {$t.newSubscription}</button>
+          <button class="btn-ghost" on:click={openImportModal}>📥 {$t.importSubscription}</button>
+          <button class="btn-primary" on:click={openNewSubModal}>＋ {$t.newSubscription}</button>
         </div>
       </div>
 
@@ -533,6 +547,7 @@
       <div class="modal-body">
         <SubscriptionCodeEditor
           initialCode={modalInitialCode}
+          mode={modalInitialMode}
           compact={true}
           lang={$currentLang}
           on:generated={onSubGenerated}

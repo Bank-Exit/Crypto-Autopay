@@ -45,11 +45,12 @@
   let checkPaperPassword = false;
   let checkLimit = false;
 
-  // Seed word challenge
+  // Seed word challenge — only shown when the seed was freshly generated (not imported/restored)
   let verifyIndex = Math.floor(Math.random() * 25) + 1;  // 1-based, random
   let verifyInput = "";
   let verifyError = false;
-  let verifyPassed = false;
+  // For import/restore mode, the user already knows their seed — skip the quiz
+  $: verifyPassed = seedMode === "import" || mode === "restore";
 
   $: activeSeed = seedMode === "generate" ? generatedSeed : importedSeed;
   $: seedWords = activeSeed.trim().split(/\s+/);
@@ -166,11 +167,14 @@
 
         <label>
           {$t.masterPassword}
-          <input type="password" bind:value={password} placeholder={$t.masterPasswordPlaceholder} autocomplete="new-password" />
+          <!-- svelte-ignore a11y-autofocus -->
+          <input type="password" bind:value={password} placeholder={$t.masterPasswordPlaceholder} autocomplete="new-password" autofocus
+            on:keydown={e => e.key === "Enter" && document.querySelector('#onb-confirm-pw')?.focus()} />
         </label>
         <label>
           {$t.confirmPassword}
-          <input type="password" bind:value={passwordConfirm} placeholder={$t.confirmPasswordPlaceholder} autocomplete="new-password" />
+          <input id="onb-confirm-pw" type="password" bind:value={passwordConfirm} placeholder={$t.confirmPasswordPlaceholder} autocomplete="new-password"
+            on:keydown={e => e.key === "Enter" && goStep2()} />
         </label>
 
         {#if passwordError}
@@ -278,37 +282,46 @@
         </div>
 
         <div class="checklist">
-          <!-- Seed paper check: requires typing the right word to verify -->
+          <!-- Seed paper check -->
           <div class="check-item-verify">
-            {#if verifyPassed}
-              <div class="verify-ok">
-                <span class="verify-check">✓</span>
-                <span>{$t.checkPaperSeed}</span>
-                <span class="verify-proof text-muted">(mot n°{verifyIndex} : « {expectedWord} » ✓)</span>
-              </div>
-            {:else}
-              <div class="verify-challenge">
-                <p class="verify-prompt">
-                  Pour confirmer que vous avez bien noté votre seed,
-                  <strong>tapez le mot n°{verifyIndex}</strong> de votre phrase seed :
-                </p>
-                <div class="verify-input-row">
-                  <input
-                    bind:value={verifyInput}
-                    placeholder="Mot #{verifyIndex}..."
-                    on:keydown={e => e.key === "Enter" && checkWord()}
-                    class:input-error={verifyError}
-                    autocomplete="off"
-                    spellcheck="false"
-                  />
-                  <button class="btn-primary" style="padding:9px 16px;font-size:13px" on:click={checkWord}>
-                    Vérifier
-                  </button>
+            {#if seedMode === "generate" && mode !== "restore"}
+              <!-- New seed: quiz to confirm user wrote it down -->
+              {#if verifyPassed}
+                <div class="verify-ok">
+                  <span class="verify-check">✓</span>
+                  <span>{$t.checkPaperSeed}</span>
+                  <span class="verify-proof text-muted">(mot n°{verifyIndex} : « {expectedWord} » ✓)</span>
                 </div>
-                {#if verifyError}
-                  <p class="error-msg">Mot incorrect — réessayez.</p>
-                {/if}
-              </div>
+              {:else}
+                <div class="verify-challenge">
+                  <p class="verify-prompt">
+                    Pour confirmer que vous avez bien noté votre seed,
+                    <strong>tapez le mot n°{verifyIndex}</strong> de votre phrase seed :
+                  </p>
+                  <div class="verify-input-row">
+                    <input
+                      bind:value={verifyInput}
+                      placeholder="Mot #{verifyIndex}..."
+                      on:keydown={e => e.key === "Enter" && checkWord()}
+                      class:input-error={verifyError}
+                      autocomplete="off"
+                      spellcheck="false"
+                    />
+                    <button class="btn-primary" style="padding:9px 16px;font-size:13px" on:click={checkWord}>
+                      Vérifier
+                    </button>
+                  </div>
+                  {#if verifyError}
+                    <p class="error-msg">Mot incorrect — réessayez.</p>
+                  {/if}
+                </div>
+              {/if}
+            {:else}
+              <!-- Import/restore: seed already known, no quiz needed -->
+              <label class="check-item">
+                <input type="checkbox" bind:checked={checkPaperSeed} />
+                <span>{$t.checkPaperSeed}</span>
+              </label>
             {/if}
           </div>
 
@@ -328,7 +341,7 @@
 
         <button
           class="btn-primary btn-full"
-          disabled={!verifyPassed || !checkPaperPassword || !checkLimit || finishLoading}
+          disabled={!verifyPassed || !checkPaperSeed || !checkPaperPassword || !checkLimit || finishLoading}
           on:click={finish}
         >
           {#if finishLoading}

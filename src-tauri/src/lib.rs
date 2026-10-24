@@ -158,6 +158,22 @@ struct BalanceResponse {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            tauri_plugin_single_instance::init(|app, args, _cwd| {
+                // A second instance was launched (e.g. from a deep link click)
+                // Forward any crypto-autopay:// URL from its args to the running instance
+                for arg in &args {
+                    if arg.starts_with("crypto-autopay:") {
+                        log::info!("Single-instance redirect: {}", arg);
+                        app.emit("autopay://open-subscription", arg.clone()).ok();
+                    }
+                }
+                // Bring the existing window to focus
+                if let Some(win) = app.get_webview_window("main") {
+                    win.set_focus().ok();
+                }
+            })
+        )
         .setup(|app| {
             // Resolve vault path in app data directory
             let data_dir = app.path().app_data_dir()
