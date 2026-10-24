@@ -75,6 +75,7 @@
 
     <label>
       {$t.masterPassword || "Mot de passe"}
+      <!-- svelte-ignore a11y-autofocus -->
       <input
         type="password"
         bind:value={password}

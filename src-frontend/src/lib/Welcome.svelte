@@ -15,7 +15,7 @@
   ];
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
 <div class="welcome" on:click={() => showNetworkPicker = false}>
   <!-- Top bar: language globe + theme -->
   <div class="topbar">
@@ -80,12 +80,13 @@
           on:keydown={e => e.key === 'Enter' && (showNetworkPicker = !showNetworkPicker)}
         >{$currentNetwork.label} ▾</span>{$t.welcomeTitle.split("{network}")[1]}
       {:else}
-        {resolveTitle($t.welcomeTitle, $currentNetwork.label)}
+        {$t.welcomeTitle}
       {/if}
     </h1>
 
     <!-- Network picker dropdown -->
     {#if showNetworkPicker}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
       <div class="network-picker card" on:click|stopPropagation>
         <div class="network-picker-title">{$t.changeNetwork}</div>
         {#each NETWORKS as net}

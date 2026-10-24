@@ -192,8 +192,7 @@
             <span class="tray-label">OK</span>
           </div>
           <div class="tray-row mode-tray">
-            <span class="mode-tray-dot" class:semi={$paymentMode === 'semi-auto'}></span>
-            <span class="tray-label">{$paymentMode === 'semi-auto' ? 'Semi-auto' : 'Auto'}</span>
+            <span class="tray-label mode-tray-label">Mode : {$paymentMode === 'semi-auto' ? 'Semi-auto' : 'Auto'}</span>
           </div>
         </div>
       </div>
@@ -523,8 +522,10 @@
 
 <!-- New subscription modal -->
 {#if showNewSubModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-backdrop" on:click={() => showNewSubModal = false} role="dialog" aria-modal="true">
-    <div class="modal-panel" on:click|stopPropagation>
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
         <h2 class="modal-title">{$t.newSubscription}</h2>
         <button class="modal-close" on:click={() => showNewSubModal = false} aria-label="Fermer">✕</button>
@@ -766,12 +767,7 @@
 
   /* Sidebar mode indicator */
   .mode-tray { margin-top: 2px; }
-  .mode-tray-dot {
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--accent); /* auto = green/accent */
-    flex-shrink: 0;
-  }
-  .mode-tray-dot.semi { background: #f59e0b; /* amber for semi-auto */ }
+  .mode-tray-label { font-size: 10px; color: var(--text-muted); }
 
   .tz-display { font-size: 12px; }
 

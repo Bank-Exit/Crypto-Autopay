@@ -3,9 +3,8 @@
 /// The wallet process is spawned and managed by the Tauri app layer.
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use super::adapter::{AdapterError, Balance, PaymentAdapter, TxId};
 

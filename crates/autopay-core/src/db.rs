@@ -4,8 +4,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use thiserror::Error;
-use uuid::Uuid;
-
 use super::models::{PaymentRecord, PaymentStatus, Subscription, SubscriptionStatus};
 
 #[derive(Debug, Error)]

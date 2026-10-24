@@ -263,7 +263,7 @@ fn sort_json_value(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn verify_checksum(code: &AutoPayCodeV1, raw_json: &str) -> Result<(), CodeError> {
+fn verify_checksum(code: &AutoPayCodeV1, _raw_json: &str) -> Result<(), CodeError> {
     let Some(expected_hex) = &code.checksum else {
         return Ok(()); // Optional: no checksum = no verification
     };
