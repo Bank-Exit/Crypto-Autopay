@@ -19,11 +19,23 @@ pub struct AppState {
     pub vault_path: PathBuf,
     /// Whether the wallet is currently unlocked (seed in memory).
     pub unlocked: bool,
+    /// A deep-link URL waiting to be consumed by the frontend.
+    /// Set when the app is launched/focused via a crypto-autopay: URI.
+    pub pending_deep_link: Option<String>,
 }
 
 // ============================================================
 //  Tauri commands
 // ============================================================
+
+/// Return and clear any pending deep-link URL.
+/// The frontend calls this after transitioning to the dashboard to catch
+/// URLs received while the wallet was locked.
+#[tauri::command]
+async fn get_pending_deep_link(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<String>, String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    Ok(s.pending_deep_link.take())
+}
 
 /// Generate a fresh 25-word Monero seed phrase.
 /// Called by the frontend during onboarding (step 2).
@@ -161,10 +173,16 @@ pub fn run() {
         .plugin(
             tauri_plugin_single_instance::init(|app, args, _cwd| {
                 // A second instance was launched (e.g. from a deep link click)
-                // Forward any crypto-autopay:// URL from its args to the running instance
+                // Forward any crypto-autopay: URL from its args to the running instance
                 for arg in &args {
                     if arg.starts_with("crypto-autopay:") {
                         log::info!("Single-instance redirect: {}", arg);
+                        // Store in state (in case frontend polls for it)
+                        if let Some(state) = app.try_state::<Mutex<AppState>>() {
+                            if let Ok(mut s) = state.lock() {
+                                s.pending_deep_link = Some(arg.clone());
+                            }
+                        }
                         app.emit("autopay://open-subscription", arg.clone()).ok();
                     }
                 }
@@ -183,6 +201,7 @@ pub fn run() {
             app.manage(Mutex::new(AppState {
                 vault_path,
                 unlocked: false,
+                pending_deep_link: None,
             }));
 
             if cfg!(debug_assertions) {
@@ -193,21 +212,35 @@ pub fn run() {
                 )?;
             }
 
-            // Deep link handler — listen for scheme events and re-emit to frontend
+            // Deep link handler — listen for scheme events, store and re-emit to frontend
             let handle = app.handle().clone();
+            let handle2 = app.handle().clone(); // second clone for state access inside closure
             app.handle().listen("deep-link://new-url", move |event| {
                 // Payload is a JSON array of URL strings: ["crypto-autopay:1:..."]
-                if let Some(urls) = event.payload().strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                    // parse simple JSON string array without serde
-                    let url = urls.trim().trim_matches('"');
+                let payload = event.payload().to_string();
+                let raw = payload.trim();
+                let url = if raw.starts_with('[') {
+                    // JSON array: strip brackets and quotes
+                    raw.trim_start_matches('[').trim_end_matches(']').trim().trim_matches('"').to_string()
+                } else {
+                    raw.to_string()
+                };
+                if url.starts_with("crypto-autopay:") {
                     log::info!("Deep link received: {}", url);
-                    handle.emit("autopay://open-subscription", url.to_string()).ok();
+                    // Store so the frontend can poll for it after unlock
+                    if let Some(state) = handle2.try_state::<Mutex<AppState>>() {
+                        if let Ok(mut s) = state.lock() {
+                            s.pending_deep_link = Some(url.clone());
+                        }
+                    }
+                    handle.emit("autopay://open-subscription", url).ok();
                 }
             });
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_pending_deep_link,
             generate_seed,
             check_wallet_exists,
             create_wallet,

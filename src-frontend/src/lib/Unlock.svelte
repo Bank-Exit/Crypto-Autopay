@@ -73,17 +73,28 @@
       </svg>
     </div>
 
-    <label>
+    <label class="pw-label">
       {$t.masterPassword || "Mot de passe"}
-      <!-- svelte-ignore a11y-autofocus -->
-      <input
-        type="password"
-        bind:value={password}
-        on:keydown={onKey}
-        placeholder="••••••••••••"
-        autocomplete="current-password"
-        autofocus
-      />
+      <div class="pw-row">
+        <!-- svelte-ignore a11y-autofocus -->
+        <input
+          type="password"
+          bind:value={password}
+          on:keydown={onKey}
+          placeholder="••••••••••••"
+          autocomplete="current-password"
+          autofocus
+        />
+        {#if import.meta.env.DEV}
+          <!-- Dev bypass: skip password check (DEV build only) -->
+          <button
+            class="dev-bypass"
+            type="button"
+            title="[DEV] bypass"
+            on:click={() => dispatch("unlocked")}
+          >▶</button>
+        {/if}
+      </div>
     </label>
 
     {#if error}
@@ -109,6 +120,18 @@
 </div>
 
 <style>
+  /* Password row with optional dev bypass */
+  .pw-row { display: flex; align-items: center; gap: 6px; }
+  .pw-row input { flex: 1; }
+  .dev-bypass {
+    width: 22px; height: 22px; min-width: 22px;
+    font-size: 9px; padding: 0;
+    background: #f59e0b22; border: 1px solid #f59e0b66;
+    color: #f59e0b; border-radius: 4px; cursor: pointer;
+    flex-shrink: 0; line-height: 1;
+  }
+  .dev-bypass:hover { background: #f59e0b44; }
+
   .unlock-screen {
     width: 100vw; min-height: 100vh;
     display: flex; align-items: center; justify-content: center;

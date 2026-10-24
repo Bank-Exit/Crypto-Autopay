@@ -99,9 +99,12 @@
   }
 
   function openImportModal() {
+    console.log("[Dashboard] openImportModal called, showNewSubModal was:", showNewSubModal);
     modalInitialMode = "import";
     modalInitialCode = null;
-    showNewSubModal = true;
+    showNewSubModal = false; // reset first in case it was already open
+    // Use tick to allow Svelte to process the reset before re-showing
+    import("svelte").then(({ tick }) => tick().then(() => { showNewSubModal = true; console.log("[Dashboard] modal shown in import mode"); }));
   }
 
   // React to external code (deep link)
@@ -284,7 +287,16 @@
         <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
       </div>
 
-      <SubscriptionList {wallets} {subscriptions} />
+      <SubscriptionList
+        {wallets}
+        {subscriptions}
+        on:delete-sub={e => { subscriptions = subscriptions.filter(s => s.id !== e.detail.id); }}
+        on:toggle-pause={e => {
+          subscriptions = subscriptions.map(s => s.id === e.detail.id
+            ? { ...s, status: s.status === "Paused" ? "Active" : "Paused" }
+            : s);
+        }}
+      />
 
     <!-- ====== WALLETS ====== -->
     {:else if page === "wallets"}

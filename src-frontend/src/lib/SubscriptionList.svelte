@@ -1,6 +1,33 @@
 <script>
+  import { createEventDispatcher } from "svelte";
   import { t } from "./i18n.js";
   import { currentNetwork } from "./network.js";
+
+  const dispatch = createEventDispatcher();
+
+  // Kebab menu state
+  let openMenuId = null;
+
+  function toggleMenu(id, event) {
+    event.stopPropagation();
+    openMenuId = openMenuId === id ? null : id;
+  }
+
+  function closeMenu() { openMenuId = null; }
+
+  function deleteSub(sub, event) {
+    event.stopPropagation();
+    if (confirm(`Supprimer « ${sub.label} » ?`)) {
+      dispatch("delete-sub", { id: sub.id });
+    }
+    openMenuId = null;
+  }
+
+  function togglePause(sub, event) {
+    event.stopPropagation();
+    dispatch("toggle-pause", { id: sub.id });
+    openMenuId = null;
+  }
 
   export let archived = false;
   export let wallets = [];
@@ -59,6 +86,9 @@
     return new Date(dateStr).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
   }
 </script>
+
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+<svelte:window on:click={closeMenu} />
 
 <div class="sub-list" class:archived-list={archived}>
   {#if subs.length === 0}
@@ -120,12 +150,29 @@
         </div>
 
         <div class="sub-actions">
+          <!-- Play / Pause -->
           {#if !isSuspended(sub)}
-            <button class="btn-ghost btn-sm">⏸</button>
-          {:else}
-            <button class="btn-ghost btn-sm">▶</button>
+            <button class="btn-ghost btn-sm" title={sub.status === "Paused" ? "Reprendre" : "Mettre en pause"}
+              on:click={e => togglePause(sub, e)}>
+              {sub.status === "Paused" ? "▶" : "⏸"}
+            </button>
           {/if}
-          <button class="btn-ghost btn-sm">⋯</button>
+
+          <!-- Kebab menu -->
+          <div class="kebab-wrap">
+            <button class="btn-ghost btn-sm" on:click={e => toggleMenu(sub.id, e)}>⋯</button>
+            {#if openMenuId === sub.id}
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <div class="kebab-menu" on:click|stopPropagation>
+                <button class="kebab-item" on:click={e => togglePause(sub, e)}>
+                  {sub.status === "Paused" ? "▶ Reprendre" : "⏸ Pause"}
+                </button>
+                <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
+                  🗑 Supprimer
+                </button>
+              </div>
+            {/if}
+          </div>
         </div>
       </div>
     {/each}
@@ -177,5 +224,31 @@
   .suspended-badge { font-size: 11px; }
 
   .sub-actions { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; }
+
+  /* Kebab menu */
+  .kebab-wrap { position: relative; }
+  .kebab-menu {
+    position: absolute;
+    right: 0; top: calc(100% + 4px);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px #0004;
+    min-width: 150px;
+    z-index: 100;
+    overflow: hidden;
+  }
+  .kebab-item {
+    display: block; width: 100%;
+    padding: 9px 14px;
+    text-align: left;
+    font-size: 0.85rem;
+    background: none; border: none; cursor: pointer;
+    color: var(--text);
+    transition: background 0.12s;
+  }
+  .kebab-item:hover { background: var(--bg-card-hover); }
+  .kebab-danger { color: #ef4444; }
+  .kebab-danger:hover { background: #ef444410; }
   .btn-sm { padding: 5px 10px; font-size: 13px; }
 </style>

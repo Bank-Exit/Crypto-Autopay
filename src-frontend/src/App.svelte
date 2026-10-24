@@ -12,20 +12,28 @@
   let appState = "checking";
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
+  /** Poll Rust state for any deep link that arrived before the frontend was ready */
+  async function checkPendingDeepLink() {
+    try {
+      const code = await invoke("get_pending_deep_link");
+      if (code) {
+        console.log("[DeepLink] Pending from Rust state:", code);
+        pendingDeepLinkCode = code;
+      }
+    } catch(e) {
+      console.warn("[DeepLink] get_pending_deep_link unavailable:", e);
+    }
+  }
+
   onMount(async () => {
-    // Deep link listener (Tauri only)
+    // Deep link real-time listener (Tauri events)
     try {
       const { listen } = await import("@tauri-apps/api/event");
       listen("autopay://open-subscription", (event) => {
-        const url = event.payload; // e.g. "crypto-autopay:1:H4sI..."
-        if (appState === "dashboard") {
-          // Already unlocked → forward directly to Dashboard
-          pendingDeepLinkCode = url;
-        } else {
-          // App is locked or not ready → store for later
-          pendingDeepLinkCode = url;
-          if (appState === "welcome") appState = "unlock";
-        }
+        const url = event.payload;
+        console.log("[DeepLink] Event received, appState=", appState, url);
+        pendingDeepLinkCode = url;
+        if (appState === "welcome") appState = "unlock";
       });
     } catch {}
 
@@ -100,7 +108,7 @@
 
   {:else if appState === "unlock"}
     <Unlock
-      on:unlocked={() => { appState = "dashboard"; }}
+      on:unlocked={async () => { appState = "dashboard"; await checkPendingDeepLink(); }}
       on:reset={onReset}
     />
 
