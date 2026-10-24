@@ -1,7 +1,7 @@
 # Crypto AutoPay — TODO & Roadmap
 
 > **Titre logiciel** : Crypto AutoPay (fenêtre OS) / Monero AutoPay (défaut, modifiable)
-> **Dernière mise à jour** : 2026-10-23
+> **Dernière mise à jour** : 2026-10-24
 
 ---
 
@@ -168,6 +168,28 @@
 - [ ] Monero wordlist à inclure : EN officielle (1626 mots) ? + FR/DE/ES ?
 
 ---
+
+## Implémenté récemment (2026-10-24)
+
+- **3 flux d'entrée distincts** : "Nouvel abonnement" (formulaire manuel → mode=new), "Importer un code" (modal mode=import), "Créer un code de partage" (pleine page, pas de modal, mode=create)
+- **Détection de doublons** : `duplicateKey(sub)` = address + raw cron. Popup SVG camembert 5s, bouton Non par défaut. Faux positifs filtrés (adresse vide = pas de comparaison).
+- **AppLogger.js** : log in-memory, AUCUN montant ni adresse. Section Logs dans Paramètres (filtre info/warn/error). Logs d'envoi opt-in (localStorage, id interne uniquement, pas de montant/destinataire).
+- **tauri-plugin-shell** : initialisé + capability `shell:allow-open` pour liens externes (lien "Comment se procurer du Monero ?").
+- **Fix deep link même URL** : `pendingDeepLinkCode = null → await tick() → set` pour forcer la réactivité Svelte sur la même chaîne.
+- **Fix parseImport** : ne dispatche plus `imported` automatiquement, seulement via bouton "Ajouter cet abonnement".
+- **Prévisualisation bouton HTML** : rendu live cliquable dans la page Créer un code (non-modal).
+- **Champ fiat opt-in** : conversion XMR→€ via LibreMonero.com API, désactivé par défaut, popup avertissement privacy.
+- **Icône Coller** (📋) dans l'import + auto-décodage.
+- **Incrément montant** : step=0.01 XMR.
+- **En-tête "Mes abonnements en {réseau}"** : sous-titre avec compteur + "Doublons : X" en orange.
+- **Padding 70px** sous la liste des abonnements.
+- **Lien refill** "Comment se procurer du Monero ?" → `https://libre-market.com/m/epicerie/tutorial`.
+
+## Notes à faire (suites)
+- [ ] Implémenter vraie API LibreMonero.com pour conversion fiat (endpoint à confirmer)
+- [ ] Logs d'envoi : brancher sur le vrai moteur de paiement quand implémenté
+- [ ] HTML preview dans Créer un code : tester deep link depuis l'aperçu (nécessite app installée)
+- [ ] `tauri-plugin-deep-link` toujours pinné à `=2.3.0` (voir note Dépendances ci-dessous)
 
 ## Notes techniques
 - Seed mock actuelle (25 mots) = placeholder, sera remplacé par vraie génération Rust

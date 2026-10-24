@@ -1,4 +1,5 @@
 <script>
+  import { tick } from "svelte";
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
@@ -7,6 +8,19 @@
   import PaymentAnimation from "./PaymentAnimation.svelte";
   import SubscriptionCodeEditor from "./SubscriptionCodeEditor.svelte";
   import { scheduleToHuman } from "./autopay-encode.js";
+  import { logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
+           setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
+
+  // Tauri shell.open for external links (safe fallback for browser dev)
+  async function openExternal(url) {
+    try {
+      const { open } = await import("@tauri-apps/plugin-shell");
+      await open(url);
+      logInfo("External", `Opened URL: ${url}`);
+    } catch {
+      window.open(url, "_blank", "noopener");
+    }
+  }
 
   // External code pre-fill (from deep link)
   export let externalCode = null;
@@ -38,6 +52,8 @@
 
   /** Convert a payload from SubscriptionCodeEditor into a subscription row */
   function payloadToSubscription(payload) {
+    // payload.destination_address is the canonical field name in autopay spec
+    const addr = payload.destination_address || payload.address || null;
     return {
       id: Date.now(),
       label: payload.custom_label || "—",
@@ -50,29 +66,30 @@
       canary_status: payload.canary_url ? "Ok" : "NotConfigured",
       payments_sent: 0,
       wallet_id: wallets[0]?.id || 1,
-      address: payload.address || null,           // stored for duplicate detection
+      address: addr,                              // stored for duplicate detection
       _raw_schedule: payload.schedule || null,    // raw cron for comparison
       _code: payload._sourceCode || null,
     };
   }
 
   // ---- Duplicate detection ----
+  // Two subscriptions are duplicates if they share address AND raw schedule.
+  // Subscriptions without an address (e.g., mock data) are never flagged.
   function duplicateKey(sub) {
-    // Two subscriptions are duplicates if they share the same address AND raw schedule
-    return `${sub.address || ""}|${sub._raw_schedule || sub.schedule}`;
+    if (!sub.address) return null; // can't determine duplicate without address
+    return `${sub.address}|${sub._raw_schedule || sub.schedule}`;
   }
 
+  let duplicateCount = 0; // must be declared BEFORE the reactive block
   $: {
-    const keys = subscriptions.map(duplicateKey);
+    const keys = subscriptions.map(duplicateKey).filter(Boolean);
     const seen = new Map();
+    for (const k of keys) seen.set(k, (seen.get(k) || 0) + 1);
     let dups = 0;
-    for (const k of keys) {
-      seen.set(k, (seen.get(k) || 0) + 1);
-    }
     for (const count of seen.values()) if (count > 1) dups += count - 1;
     duplicateCount = dups;
+    if (dups > 0) logWarn("Duplicates", `${dups} duplicate subscription(s) detected`);
   }
-  let duplicateCount = 0;
 
   // Pending duplicate subscription waiting for user confirmation
   let pendingDuplicateSub = null;
@@ -157,47 +174,70 @@
     return null;
   }
 
-  // ---- New-subscription modal ----
-  let showNewSubModal = false;
-  let modalInitialCode = null;  // pre-filled code from deep link
-  let modalInitialMode = "create"; // "create" | "import"
+  // ---- 3 separate entry points ----
+  // 1. "Nouvel abonnement" (manual form) → modal mode="new"
+  // 2. "Importer un code autopay" → modal mode="import"
+  // 3. "Créer un code de partage" → full page page="create-code" (not a modal)
+
+  let showNewSubModal  = false;   // for "Nouvel abonnement" (mode="new")
+  let showImportModal  = false;   // for "Importer un code" (mode="import")
+  let importInitialCode = null;   // pre-filled code from deep link
 
   function openNewSubModal() {
-    modalInitialMode = "create";
-    modalInitialCode = null;
+    logInfo("Dashboard", "Opening manual-add modal (mode=new)");
+    showImportModal = false;
     showNewSubModal = true;
   }
 
-  function openImportModal() {
-    console.log("[Dashboard] openImportModal called, showNewSubModal was:", showNewSubModal);
-    modalInitialMode = "import";
-    modalInitialCode = null;
-    showNewSubModal = false; // reset first in case it was already open
-    // Use tick to allow Svelte to process the reset before re-showing
-    import("svelte").then(({ tick }) => tick().then(() => { showNewSubModal = true; console.log("[Dashboard] modal shown in import mode"); }));
+  async function openImportModal(code = null) {
+    logInfo("Dashboard", `Opening import modal, hasCode=${Boolean(code)}`);
+    // Force re-mount even if already open (handles same-code re-trigger)
+    showImportModal = false;
+    importInitialCode = null;
+    await tick();
+    importInitialCode = code;
+    showImportModal = true;
   }
 
-  // React to external code (deep link)
+  // React to external code from deep link — use showImportModal
   $: if (externalCode) {
-    modalInitialCode = externalCode;
-    modalInitialMode = "import";
-    showNewSubModal = true;
+    logInfo("Dashboard", "External code received via deep link");
+    openImportModal(externalCode);
   }
 
-  function onSubGenerated({ detail }) {
-    // "Créer un code" is the merchant/sharing view — it does NOT add to subscriptions
-    // Only imports add subscriptions (see onSubImported)
-    showNewSubModal = false; // close modal, user sees the sharing result in-place
+  /** "Nouvel abonnement" mode="new" dispatches this */
+  function onSubNew({ detail }) {
+    logInfo("Dashboard", `onSubNew: label=${detail.payload?.custom_label || "?"}`);
+    const sub = payloadToSubscription({ ...detail.payload, _sourceCode: null });
+    addOrConfirmDuplicate(sub);
     showNewSubModal = false;
-    page = "subscriptions"; // ensure we're on the right tab
   }
 
+  /** Import tab dispatches this after "Ajouter cet abonnement" */
   function onSubImported({ detail }) {
+    logInfo("Dashboard", "onSubImported fired");
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
     addOrConfirmDuplicate(sub);
+    showImportModal = false;
+  }
+
+  /** "Créer un code" sharing mode — does NOT add to subscriptions */
+  function onSubGenerated() {
+    logInfo("Dashboard", "onSubGenerated: code sharing mode, no subscription added");
+    // The share view is displayed inside the create-code page — nothing to close
   }
 
   let trayStatus = "green";
+
+  // ---- Logs panel state ----
+  import { writable } from "svelte/store";
+  let showLogs = false;
+  let showSendLogs = false;
+  let logFilter = "";
+  // Reactive store backed by AppLogger
+  const liveLogs = writable([]);
+  subscribeToLogs(entries => liveLogs.set(entries));
+  const sendLogsStore = writable(isSendLogsEnabled());
 
   // Mock wallets with monthly spend estimates
   let wallets = [
@@ -307,6 +347,9 @@
       <button class="nav-item" class:active={page === "howto"} on:click={() => page = "howto"}>
         {$t.navHowItWorks}
       </button>
+      <button class="nav-item" class:active={page === "create-code"} on:click={() => page = "create-code"}>
+        🔗 Créer un code
+      </button>
       <button class="nav-item" class:active={page === "settings"} on:click={() => page = "settings"}>
         {$t.navSettings}
       </button>
@@ -345,7 +388,7 @@
         </div>
         <div class="page-actions">
           <button class="btn-ghost" on:click={() => page = "find"}>{$t.findSubscriptions}</button>
-          <button class="btn-ghost" on:click={openImportModal}>📥 {$t.importSubscription}</button>
+          <button class="btn-ghost" on:click={() => openImportModal()}>📥 {$t.importSubscription}</button>
           <button class="btn-primary" on:click={openNewSubModal}>＋ {$t.newSubscription}</button>
         </div>
       </div>
@@ -362,9 +405,12 @@
         <span class="text-muted">{$t.nextRefillLabel} :</span>
         <strong>{$t.refillIn} {totalRefillText($t)}</strong>
         <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
-        <a class="refill-help-link" href="https://libre-market.com/m/epicerie/tutorial" target="_blank" rel="noopener noreferrer">
+        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+        <span class="refill-help-link" role="link" tabindex="0"
+          on:click={() => openExternal("https://libre-market.com/m/epicerie/tutorial")}
+          on:keydown={e => e.key === "Enter" && openExternal("https://libre-market.com/m/epicerie/tutorial")}>
           Comment se procurer du Monero ?
-        </a>
+        </span>
       </div>
 
       <SubscriptionList
@@ -600,6 +646,96 @@
         </div>
       </div>
 
+      <!-- Logs section in Settings -->
+      <h2 class="section-title">Journaux techniques</h2>
+      <div class="settings-section card">
+        <p class="log-security-note">
+          ⚠ Ces journaux ne contiennent aucun montant, adresse ou donnée personnelle.
+          Ils sont stockés uniquement en RAM et effacés à chaque redémarrage.
+        </p>
+        <div class="log-toolbar">
+          <select bind:value={logFilter} class="setting-select log-filter-select">
+            <option value="">Tout</option>
+            <option value="info">Info</option>
+            <option value="warn">Avertissements</option>
+            <option value="error">Erreurs</option>
+          </select>
+          <button class="btn-ghost btn-sm" on:click={() => showLogs = !showLogs}>
+            {showLogs ? "Masquer" : "Afficher les logs"}
+          </button>
+          <button class="btn-ghost btn-sm" on:click={clearLogs}>Effacer</button>
+        </div>
+        {#if showLogs}
+          <div class="log-list">
+            {#each $liveLogs.filter(e => !logFilter || e.level === logFilter) as entry (entry.t + entry.msg)}
+              <div class="log-row log-{entry.level}">
+                <span class="log-time">{entry.t.slice(11,19)}</span>
+                <span class="log-module">[{entry.module}]</span>
+                <span class="log-msg">{entry.msg}</span>
+              </div>
+            {:else}
+              <p class="text-muted" style="font-size:12px;padding:8px">Aucun log.</p>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
+      <!-- Send logs (opt-in) -->
+      <h2 class="section-title">Journaux d'envoi <span class="badge-opt">opt-in</span></h2>
+      <div class="settings-section card">
+        <p class="log-security-note">
+          📋 Trace des envois de paiements — utile comme preuve en cas de réclamation.<br>
+          <strong>Contient uniquement l'identifiant interne et la date</strong> — aucun montant, aucun destinataire.<br>
+          Persisté chiffré en localStorage. Désactivé par défaut.
+        </p>
+        <div class="setting-row">
+          <span class="setting-label">Activer les logs d'envoi</span>
+          <label class="toggle">
+            <input type="checkbox"
+              checked={$sendLogsStore}
+              on:change={e => { setSendLogsEnabled(e.target.checked); sendLogsStore.set(e.target.checked); }}
+            />
+            <span class="slider"></span>
+          </label>
+        </div>
+        {#if $sendLogsStore}
+          <div class="log-toolbar">
+            <button class="btn-ghost btn-sm" on:click={() => showSendLogs = !showSendLogs}>
+              {showSendLogs ? "Masquer" : "Afficher"}
+            </button>
+            <button class="btn-ghost btn-sm" on:click={clearSendLogs}>Effacer</button>
+          </div>
+          {#if showSendLogs}
+            <div class="log-list">
+              {#each getSendLogs() as entry (entry.t + entry.id)}
+                <div class="log-row log-info">
+                  <span class="log-time">{entry.t.slice(0,19).replace("T"," ")}</span>
+                  <span class="log-module">[sub#{entry.id}]</span>
+                  <span class="log-msg">{entry.event}</span>
+                </div>
+              {:else}
+                <p class="text-muted" style="font-size:12px;padding:8px">Aucun log d'envoi.</p>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      </div>
+
+    <!-- ====== CREATE CODE (full page, merchant / influencer) ====== -->
+    {:else if page === "create-code"}
+      <div class="page-header">
+        <h1>Créer un code AutoPay de partage</h1>
+        <p class="subs-subtitle">Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés</p>
+      </div>
+      <div class="create-code-page">
+        <SubscriptionCodeEditor
+          mode="create"
+          compact={false}
+          lang={$currentLang}
+          on:generated={onSubGenerated}
+        />
+      </div>
+
     <!-- ====== HOW IT WORKS ====== -->
     {:else if page === "howto"}
       <div class="page-header">
@@ -665,25 +801,47 @@
   </div>
 {/if}
 
-<!-- New subscription modal -->
+<!-- ===== "Nouvel abonnement" modal (manual form, mode="new") ===== -->
 {#if showNewSubModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-backdrop" on:click={() => showNewSubModal = false} role="dialog" aria-modal="true">
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">{$t.newSubscription}</h2>
+        <h2 class="modal-title">Nouvel abonnement</h2>
         <button class="modal-close" on:click={() => showNewSubModal = false} aria-label="Fermer">✕</button>
       </div>
       <div class="modal-body">
         <SubscriptionCodeEditor
-          initialCode={modalInitialCode}
-          mode={modalInitialMode}
+          mode="new"
           compact={true}
           lang={$currentLang}
-          on:generated={onSubGenerated}
-          on:imported={onSubImported}
+          on:new-sub={onSubNew}
           on:close={() => showNewSubModal = false}
+        />
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- ===== "Importer un code autopay" modal (mode="import") ===== -->
+{#if showImportModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showImportModal = false} role="dialog" aria-modal="true">
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-panel" on:click|stopPropagation role="document">
+      <div class="modal-header">
+        <h2 class="modal-title">Importer un code AutoPay</h2>
+        <button class="modal-close" on:click={() => showImportModal = false} aria-label="Fermer">✕</button>
+      </div>
+      <div class="modal-body">
+        <SubscriptionCodeEditor
+          mode="import"
+          initialCode={importInitialCode}
+          compact={true}
+          lang={$currentLang}
+          on:imported={onSubImported}
+          on:close={() => showImportModal = false}
         />
       </div>
     </div>
@@ -827,6 +985,33 @@
   .dup-pie { display: block; margin: 4px auto; }
   .dup-actions { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; justify-content: center; }
   .dup-no { background: var(--accent) !important; }
+
+  /* Logs panel */
+  .log-security-note {
+    font-size: 11px; color: var(--text-muted); padding: 6px 0 10px;
+    border-bottom: 1px solid var(--border); margin-bottom: 8px;
+  }
+  .log-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .log-filter-select { font-size: 11px; padding: 3px 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .log-list {
+    max-height: 240px; overflow-y: auto;
+    font-family: monospace; font-size: 11px;
+    background: var(--bg-sidebar); border-radius: 6px; padding: 4px;
+  }
+  .log-row { display: flex; gap: 6px; padding: 2px 4px; border-radius: 3px; line-height: 1.5; }
+  .log-row:hover { background: var(--border); }
+  .log-time { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+  .log-module { color: var(--accent); white-space: nowrap; flex-shrink: 0; }
+  .log-msg { word-break: break-all; }
+  .log-info .log-module { color: #3b82f6; }
+  .log-warn .log-module { color: #f59e0b; }
+  .log-warn { background: #f59e0b10; }
+  .log-error .log-module { color: #ef4444; }
+  .log-error { background: #ef444410; }
+  .badge-opt { font-size: 10px; background: #f59e0b22; color: #b45309; padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
+
+  /* Create-code full page */
+  .create-code-page { padding: 0 2px; max-width: 640px; }
 
   .section-title { font-size: 13px; font-weight: 600; color: var(--text-muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .05em; }
 

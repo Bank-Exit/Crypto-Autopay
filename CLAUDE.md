@@ -1,7 +1,7 @@
 # Crypto AutoPay — Synthèse technique pour Claude
 
 > Document de contexte pour reprendre le projet rapidement.
-> Mis à jour : 2026-10-23
+> Mis à jour : 2026-10-24
 
 ---
 
@@ -268,3 +268,28 @@ Dossier `web/` = site Vite+Svelte pour autopay.libre-market.com.
 Partage `SubscriptionCodeEditor.svelte` via alias `$lib → ../src-frontend/src/lib`.
 Pour lancer : `cd web && npm run dev`
 
+
+---
+
+## Architecture UX — 3 flux d'entrée (mis à jour 2026-10-24)
+
+| Bouton / Entry point | Modal / Page | Mode SCE | Événement | Résultat |
+|---|---|---|---|---|
+| ＋ Nouvel abonnement | Modal | `mode="new"` | `new-sub` | Ajout direct à la liste |
+| 📥 Importer un code | Modal | `mode="import"` | `imported` | Ajout avec check doublon |
+| 🔗 Créer un code (sidebar) | Pleine page | `mode="create"` | `generated` | Vue partage + préview HTML |
+| URI deep link | Modal import | `mode="import"` | `imported` | Ajout avec check doublon |
+
+## AppLogger.js — Sécurité logs
+
+- **Logs techniques** : RAM seulement, max 500 entrées. Sanitisation automatique (adresses Monero/Bitcoin, montants redactés).
+- **Logs d'envoi** : opt-in, localStorage, max 1000 entrées. Contiennent UNIQUEMENT : timestamp + subscription_id interne + type d'événement. **Aucun montant, aucune adresse**.
+- Section "Journaux" dans Paramètres : filtrable info/warn/error, effaçable.
+
+## Liens externes dans Tauri
+
+Utiliser `openExternal(url)` dans Dashboard.svelte qui tente `@tauri-apps/plugin-shell` `open()` puis fallback `window.open`. Plugin initialisé dans `src-tauri/src/lib.rs`, capability `shell:allow-open` dans `capabilities/default.json`.
+
+## Fix deep link même URL (réactivité Svelte)
+
+Dans `App.svelte` : avant de set `pendingDeepLinkCode = url`, reset à `null` + `await tick()` pour forcer Svelte à détecter le changement même si l'URL est identique.

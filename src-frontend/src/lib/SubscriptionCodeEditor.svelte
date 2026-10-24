@@ -19,7 +19,7 @@
 
   const dispatch = createEventDispatcher();
 
-  export let mode = "create";   // "create" | "import"
+  export let mode = "create";   // "create" | "new" | "import"
   export let compact = false;
   export let lang = "fr";
   /** Optional: pre-fill the import field with a code (from deep link) */
@@ -139,19 +139,15 @@
     return base;
   })();
 
-  // ---- Generate code ----
-  async function generate() {
-    generatedError = "";
-    generatedCode = "";
-
-    // Normalize amount — input type="number" returns a JS number, not a string
+  // ---- Shared payload validation & building ----
+  function buildCleanPayload() {
     const amountStr = String(payload.amount ?? "").trim();
-
-    if (!payload.custom_label.trim()) { generatedError = lang === "fr" ? "Nom requis." : "Label required."; return; }
-    if (!payload.destination_address.trim()) { generatedError = lang === "fr" ? "Adresse requise." : "Address required."; return; }
-    if (addressValid === false) { generatedError = lang === "fr" ? "Adresse invalide pour ce réseau." : "Invalid address for this network."; return; }
-    if (!amountStr || isNaN(parseFloat(amountStr)) || parseFloat(amountStr) <= 0) { generatedError = lang === "fr" ? "Montant invalide (> 0 requis)." : "Invalid amount (must be > 0)."; return; }
-
+    let err = null;
+    if (!payload.custom_label.trim()) err = lang === "fr" ? "Nom requis." : "Label required.";
+    else if (!payload.destination_address.trim()) err = lang === "fr" ? "Adresse requise." : "Address required.";
+    else if (addressValid === false) err = lang === "fr" ? "Adresse invalide pour ce réseau." : "Invalid address for this network.";
+    else if (!amountStr || isNaN(parseFloat(amountStr)) || parseFloat(amountStr) <= 0) err = lang === "fr" ? "Montant invalide (> 0 requis)." : "Invalid amount (must be > 0).";
+    if (err) return { error: err };
     const clean = {
       version: 1,
       network: payload.network,
@@ -161,25 +157,85 @@
       currency: payload.currency,
       schedule: payload.schedule,
     };
-
     if (payload.token) { clean.token = payload.token; clean.token_contract = payload.token_contract || undefined; }
     if (payload.repeat_every > 1) clean.repeat_every = payload.repeat_every;
     if (payload.description.trim()) clean.description = payload.description.trim();
     if (payload.number_of_payments > 0) clean.number_of_payments = payload.number_of_payments;
     if (payload.start_date) clean.start_date = payload.start_date;
     if (payload.canary_url.trim()) clean.canary_url = payload.canary_url.trim();
+    return { payload: clean };
+  }
 
+  // ---- mode="create" → generate shareable code ----
+  async function generate() {
+    generatedError = "";
+    generatedCode = "";
+    const result = buildCleanPayload();
+    if (result.error) { generatedError = result.error; return; }
+    console.log("[SCE] generate() — encoding payload");
     try {
-      generatedCode = await encodeAutopay(clean);
-      generatedPayloadForShare = clean; // keep for share view
-      // Note: do NOT dispatch "generated" to add to subscriptions.
-      // "Créer un code" is the merchant/share view — not a personal subscription.
+      generatedCode = await encodeAutopay(result.payload);
+      generatedPayloadForShare = result.payload;
+      dispatch("generated", { code: generatedCode, payload: result.payload });
+      console.log("[SCE] Code generated, sharing view shown");
     } catch (e) {
       generatedError = String(e);
+      console.error("[SCE] encode error:", e);
     }
   }
 
+  // ---- mode="new" → add subscription directly (no code generation) ----
+  function addSubscriptionDirectly() {
+    generatedError = "";
+    const result = buildCleanPayload();
+    if (result.error) { generatedError = result.error; return; }
+    console.log("[SCE] addSubscriptionDirectly() — dispatching new-sub");
+    dispatch("new-sub", { payload: result.payload });
+  }
+
   let generatedPayloadForShare = null;
+
+  // ---- Fiat conversion (privacy-opt-in) ----
+  let fiatEnabled = false;
+  let fiatValue = null;
+  let fiatLoading = false;
+  let showFiatWarning = false;
+  let fiatError = null;
+
+  function requestFiatEnable() { showFiatWarning = true; }
+  async function confirmFiatEnable() {
+    showFiatWarning = false;
+    fiatEnabled = true;
+    await fetchFiatRate();
+  }
+  async function fetchFiatRate() {
+    if (!payload.amount || !fiatEnabled) return;
+    fiatLoading = true; fiatError = null; fiatValue = null;
+    try {
+      const res = await fetch(`https://libremonero.com/api/price?from=${payload.currency || "XMR"}&to=EUR`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const rate = data.price || data.rate || data.EUR;
+      if (rate) fiatValue = parseFloat(payload.amount) * parseFloat(rate);
+      else throw new Error("No rate in response");
+    } catch (e) {
+      fiatError = "Erreur API"; fiatValue = null;
+      console.warn("[SCE] Fiat rate fetch failed:", e);
+    } finally { fiatLoading = false; }
+  }
+  $: if (fiatEnabled && payload.amount) { fetchFiatRate(); }
+
+  // ---- Paste from clipboard ----
+  async function pasteFromClipboard() {
+    try {
+      const text = await navigator.clipboard.readText();
+      importInput = text;
+      console.log("[SCE] Pasted from clipboard, length:", text.length);
+      if (text.trim()) parseImport();
+    } catch (e) {
+      console.warn("[SCE] Clipboard read failed:", e);
+    }
+  }
 
   // Computed share assets
   $: shareWebUrl = generatedCode
@@ -206,12 +262,15 @@
     importError = "";
     importResult = null;
     importLoading = true;
+    console.log("[SCE] parseImport() — decoding, length:", importInput.trim().length);
     try {
       const { prefix, version, payload: parsed } = await decodeAutopay(importInput.trim());
       importResult = { prefix, version, payload: parsed };
-      dispatch("imported", { code: importInput.trim(), payload: parsed });
+      console.log("[SCE] parseImport() success, prefix:", prefix, "label:", parsed.custom_label);
+      // Note: do NOT auto-dispatch "imported" here — user must click "Ajouter cet abonnement"
     } catch (e) {
       importError = String(e);
+      console.warn("[SCE] parseImport() error:", e);
     } finally {
       importLoading = false;
     }
@@ -222,23 +281,13 @@
 </script>
 
 <div class="sce" class:compact>
-  <!-- Tab switcher -->
-  <div class="sce-tabs" role="tablist">
-    <button
-      class="sce-tab" class:active={mode === "create"}
-      on:click={() => { mode = "create"; generatedCode = ""; }}
-      role="tab"
-    >
-      {l("Créer un code", "Create a code")}
-    </button>
-    <button
-      class="sce-tab" class:active={mode === "import"}
-      on:click={() => { mode = "import"; importResult = null; }}
-      role="tab"
-    >
-      {l("Importer / décoder", "Import / decode")}
-    </button>
-  </div>
+  <!--
+    Tab switcher only shown when mode is NOT pre-set to a specific single-purpose mode.
+    mode="create": merchant code generator (full page) — no tabs
+    mode="new": subscriber manual add — no tabs
+    mode="import": subscriber code import — no tabs
+  -->
+  <!--  (tabs removed — each mode is now opened in its own dedicated context)  -->
 
   <!-- ======================== CREATE ======================== -->
   {#if mode === "create"}
@@ -301,7 +350,7 @@
       <div class="field-row">
         <label class="field field-sm">
           <span>{l("Montant", "Amount")} <span class="required">*</span></span>
-          <input type="number" bind:value={payload.amount} min="0" step="any" placeholder="0.05" />
+          <input type="number" bind:value={payload.amount} min="0" step="0.01" placeholder="0.05" />
         </label>
         <label class="field field-sm">
           <span>{l("Devise", "Currency")}</span>
@@ -313,6 +362,47 @@
           </select>
         </label>
       </div>
+
+      <!-- Fiat equivalent (opt-in for privacy) -->
+      <div class="fiat-row">
+        <span class="fiat-label">≈ {l("Équivalent fiat", "Fiat equivalent")} (€)</span>
+        {#if !fiatEnabled}
+          <button class="btn-ghost btn-xs fiat-enable-btn" type="button" on:click={requestFiatEnable}>
+            {l("Activer (⚠ privacy)", "Enable (⚠ privacy)")}
+          </button>
+        {:else if fiatLoading}
+          <span class="fiat-value fiat-loading">…</span>
+        {:else if fiatError}
+          <span class="fiat-error">{fiatError}</span>
+        {:else if fiatValue !== null}
+          <span class="fiat-value">≈ {fiatValue.toFixed(2)} €</span>
+        {/if}
+      </div>
+      {#if showFiatWarning}
+        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+        <div class="fiat-popup-overlay" on:click={() => showFiatWarning = false}>
+          <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+          <div class="fiat-popup card" on:click|stopPropagation>
+            <p class="fiat-popup-title">⚠ {l("Activation de la conversion fiat", "Enable fiat conversion")}</p>
+            <p class="fiat-popup-body">
+              {l(
+                "L'API LibreMonero.com sera utilisée pour récupérer le cours actuel. C'est un service bénévole qui garantit l'anonymat et ne conserve aucun log.",
+                "The LibreMonero.com API will be used to fetch the current rate. It is a volunteer service that guarantees anonymity and keeps no logs."
+              )}
+            </p>
+            <p class="fiat-popup-body" style="font-style:italic;color:var(--text-muted)">
+              {l(
+                "Pour un anonymat maximal, il est recommandé de laisser ce champ désactivé.",
+                "For maximum anonymity, it is recommended to leave this field disabled."
+              )}
+            </p>
+            <div class="fiat-popup-actions">
+              <button class="btn-primary" type="button" on:click={confirmFiatEnable}>{l("Activer", "Enable")}</button>
+              <button class="btn-ghost" type="button" on:click={() => showFiatWarning = false}>{l("Annuler", "Cancel")}</button>
+            </div>
+          </div>
+        </div>
+      {/if}
 
       <!-- Schedule -->
       <div class="field">
@@ -400,9 +490,15 @@
         <div class="error-msg">{generatedError}</div>
       {/if}
 
-      <button class="btn-primary btn-generate" type="button" on:click={generate}>
-        {l("Générer le code AutoPay →", "Generate AutoPay code →")}
-      </button>
+      {#if mode === "new"}
+        <button class="btn-primary btn-generate" type="button" on:click={addSubscriptionDirectly}>
+          ＋ {l("Ajouter à mes abonnements", "Add to my subscriptions")}
+        </button>
+      {:else}
+        <button class="btn-primary btn-generate" type="button" on:click={generate}>
+          {l("Générer le code AutoPay →", "Generate AutoPay code →")}
+        </button>
+      {/if}
 
       <!-- ===== Share view after generation ===== -->
       {#if generatedCode}
@@ -433,6 +529,30 @@
             </button>
           </div>
 
+          <!-- Live preview of the button (only shown in full-page mode="create") -->
+          {#if !compact}
+            <div class="share-block">
+              <span class="share-label">👁 Prévisualisation du bouton</span>
+              <p class="share-preview-hint" style="font-size:11px;color:var(--text-muted)">
+                {l("Aperçu rendu tel qu'il apparaîtra sur votre site. Cliquable pour tester.", "Rendered preview as it will appear on your site. Clickable to test.")}
+              </p>
+              <div class="html-preview">
+                <a class="preview-link" href={generatedCode}
+                   on:click|preventDefault={() => {
+                     if (typeof window.__TAURI_INTERNALS__ !== "undefined") {
+                       import("@tauri-apps/plugin-shell").then(m => m.open(generatedCode)).catch(() => {});
+                     } else {
+                       window.open(generatedCode, "_blank");
+                     }
+                   }}>
+                  <button class="preview-btn" type="button">
+                    S'abonner — {generatedPayloadForShare?.amount} {generatedPayloadForShare?.currency || "XMR"} / {l("période", "period")}
+                  </button>
+                </a>
+              </div>
+            </div>
+          {/if}
+
           <button class="btn-ghost btn-sm share-back" type="button" on:click={() => { generatedCode = ""; generatedPayloadForShare = null; }}>
             ← {l("Modifier le code", "Edit code")}
           </button>
@@ -444,7 +564,13 @@
   {:else}
     <div class="sce-import">
       <label class="field">
-        <span>{l("Collez un code autopay ou monero-request", "Paste an autopay or monero-request code")}</span>
+        <span class="import-label-row">
+          {l("Collez un code autopay ou monero-request", "Paste an autopay or monero-request code")}
+          <button class="btn-paste-icon" type="button" title={l("Coller depuis le presse-papier", "Paste from clipboard")}
+            on:click={pasteFromClipboard}>
+            📋
+          </button>
+        </span>
         <textarea
           bind:value={importInput}
           rows="3"
@@ -453,7 +579,10 @@
         />
       </label>
 
-      <button class="btn-primary" type="button" on:click={parseImport} disabled={!importInput.trim() || importLoading}>
+      <button class="btn-primary" type="button" on:click={() => {
+          console.log("[SCE] Décoder clicked, input length:", importInput.trim().length);
+          parseImport();
+        }} disabled={!importInput.trim() || importLoading}>
         {importLoading ? l("Décodage…", "Decoding…") : l("Décoder →", "Decode →")}
       </button>
 
@@ -475,7 +604,10 @@
               </div>
             {/each}
           </dl>
-          <button class="btn-primary" type="button" on:click={() => dispatch("imported", { code: importInput.trim(), payload: importResult.payload })}>
+          <button class="btn-primary" type="button" on:click={() => {
+              console.log("[SCE] 'Ajouter cet abonnement' clicked — dispatching imported event");
+              dispatch("imported", { code: importInput.trim(), payload: importResult.payload });
+            }}>
             {l("Ajouter cet abonnement →", "Add this subscription →")}
           </button>
         </div>
@@ -514,6 +646,52 @@
 
   /* Form */
   .sce-form, .sce-import { display: flex; flex-direction: column; gap: 12px; }
+
+  /* Import label row with paste icon */
+  .import-label-row { display: flex; align-items: center; justify-content: space-between; }
+  .btn-paste-icon {
+    background: none; border: 1px solid var(--border); border-radius: 4px;
+    cursor: pointer; padding: 1px 5px; font-size: 14px; line-height: 1;
+    color: var(--text-muted);
+  }
+  .btn-paste-icon:hover { background: var(--border); }
+
+  /* Fiat conversion row */
+  .fiat-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); }
+  .fiat-label { font-weight: 500; }
+  .fiat-enable-btn { font-size: 11px !important; }
+  .fiat-value { color: #22c55e; font-weight: 600; }
+  .fiat-loading { font-style: italic; }
+  .fiat-error { color: #ef4444; font-size: 11px; }
+  .btn-xs { padding: 2px 7px !important; font-size: 11px !important; }
+
+  /* Fiat warning popup */
+  .fiat-popup-overlay {
+    position: fixed; inset: 0; z-index: 300;
+    display: flex; align-items: center; justify-content: center;
+    background: #0005;
+  }
+  .fiat-popup {
+    max-width: 320px; width: 90%; padding: 1.25rem;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .fiat-popup-title { font-weight: 700; font-size: 0.95rem; }
+  .fiat-popup-body { font-size: 0.84rem; line-height: 1.5; }
+  .fiat-popup-actions { display: flex; gap: 8px; }
+
+  /* HTML button live preview */
+  .html-preview {
+    padding: 16px; background: #ffffff; border: 1px dashed var(--border); border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .preview-link { text-decoration: none; }
+  .preview-btn {
+    background: #f26822; color: #fff; border: none; border-radius: 6px;
+    padding: 10px 22px; font-size: 15px; font-weight: 600; cursor: pointer;
+    box-shadow: 0 2px 6px #f2682240; transition: opacity 0.15s;
+  }
+  .preview-btn:hover { opacity: 0.9; }
+
 
   .field { display: flex; flex-direction: column; gap: 5px; }
   .field-label { font-size: 12.5px; color: var(--text-muted, #666); font-weight: 500; margin-bottom: 6px; display: block; }

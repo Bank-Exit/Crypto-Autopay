@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import Welcome from "./lib/Welcome.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
@@ -17,7 +17,9 @@
     try {
       const code = await invoke("get_pending_deep_link");
       if (code) {
-        console.log("[DeepLink] Pending from Rust state:", code);
+        console.log("[DeepLink] Pending from Rust state — resetting reactive first");
+        pendingDeepLinkCode = null;
+        await tick();
         pendingDeepLinkCode = code;
       }
     } catch(e) {
@@ -29,9 +31,12 @@
     // Deep link real-time listener (Tauri events)
     try {
       const { listen } = await import("@tauri-apps/api/event");
-      listen("autopay://open-subscription", (event) => {
+      listen("autopay://open-subscription", async (event) => {
         const url = event.payload;
         console.log("[DeepLink] Event received, appState=", appState, url);
+        // Reset to null first so Svelte triggers reactivity even for same URL
+        pendingDeepLinkCode = null;
+        await tick();
         pendingDeepLinkCode = url;
         if (appState === "welcome") appState = "unlock";
       });
