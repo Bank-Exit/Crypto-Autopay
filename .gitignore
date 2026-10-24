@@ -7,3 +7,4 @@ target/
 *.seed
 .env
 .DS_Store
+monero-wallet-rpc.log

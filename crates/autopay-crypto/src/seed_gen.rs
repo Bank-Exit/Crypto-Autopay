@@ -9,7 +9,7 @@
 use crate::wordlist_en::MONERO_WORDLIST_EN;
 use zeroize::Zeroizing;
 
-const N: u64 = MONERO_WORDLIST_EN.len() as u64; // 1624
+const N: u64 = MONERO_WORDLIST_EN.len() as u64; // 1626
 
 /// Generate a fresh 25-word Monero seed phrase.
 /// Returns the phrase as a space-separated string, zeroized on drop.
@@ -22,7 +22,7 @@ pub fn generate_seed() -> Result<Zeroizing<String>, SeedError> {
 /// Convert 32 raw bytes to a 25-word mnemonic.
 /// Algorithm: Monero 3-word encoding over GF(N).
 pub fn bytes_to_mnemonic(bytes: &[u8; 32]) -> Result<Zeroizing<String>, SeedError> {
-    if MONERO_WORDLIST_EN.len() < 1624 {
+    if MONERO_WORDLIST_EN.len() < 1626 {
         return Err(SeedError::WordlistTooShort);
     }
 
@@ -39,9 +39,11 @@ pub fn bytes_to_mnemonic(bytes: &[u8; 32]) -> Result<Zeroizing<String>, SeedErro
         words.push(MONERO_WORDLIST_EN[w3 as usize]);
     }
 
-    // 25th word: checksum
-    let checksum_word = compute_checksum(&words);
-    words.push(checksum_word);
+    // 25th word: checksum — Monero algorithm:
+    // idx = crc32(first_3_chars_of_each_data_word) % 24
+    // checksum_word = data_words[idx]  (repeats one of the 24 words)
+    let checksum_idx = compute_checksum_index(&words) as usize;
+    words.push(words[checksum_idx]);
 
     Ok(Zeroizing::new(words.join(" ")))
 }
@@ -54,9 +56,11 @@ pub fn mnemonic_to_bytes(phrase: &str) -> Result<Zeroizing<[u8; 32]>, SeedError>
         return Err(SeedError::InvalidLength(words.len()));
     }
 
-    // Verify checksum
-    let checksum_word = compute_checksum(&words[..24]);
-    if !words[24].starts_with(&checksum_word[..3]) {
+    // Verify checksum: the 25th word must match data_words[crc32(prefixes) % 24]
+    let idx = compute_checksum_index(&words[..24]) as usize;
+    let expected_prefix: String = words[idx].chars().take(3).collect();
+    let actual_prefix: String = words[24].chars().take(3).collect();
+    if expected_prefix != actual_prefix {
         return Err(SeedError::BadChecksum);
     }
 
@@ -85,20 +89,36 @@ fn find_word(word: &str) -> Result<u64, SeedError> {
         .ok_or_else(|| SeedError::UnknownWord(word.to_string()))
 }
 
-/// Compute the 25th checksum word.
-/// Monero algorithm: each word contributes its first 3 chars; compute CRC-like sum.
-fn compute_checksum<'a>(words: &[&'a str]) -> &'a str {
-    // Monero prefix-based checksum: sum the indices of word prefix matches
-    let mut checksum: u32 = 0;
-    for (i, word) in words.iter().enumerate() {
-        let prefix = &word[..word.len().min(3)];
-        let idx = MONERO_WORDLIST_EN
-            .iter()
-            .position(|&w| w.starts_with(prefix))
-            .unwrap_or(0) as u32;
-        checksum ^= idx.wrapping_add(i as u32);
+/// Compute the checksum index.
+/// Exact Monero algorithm (from monero/src/mnemonics/electrum-words.cpp):
+///   prefix_string = concat first-3-chars of each of the 24 data words
+///   index = crc32(prefix_string) % num_data_words   ← index INTO THE SEED, not the wordlist!
+///   checksum word = data_words[index]  (one of the 24 words is repeated as the 25th)
+fn compute_checksum_index(data_words: &[&str]) -> u32 {
+    let mut prefix = String::with_capacity(data_words.len() * 3);
+    for word in data_words.iter() {
+        let p: String = word.chars().take(3).collect();
+        prefix.push_str(&p);
     }
-    MONERO_WORDLIST_EN[(checksum as u64 % N) as usize]
+    let crc = crc32_zlib(prefix.as_bytes());
+    crc % data_words.len() as u32
+}
+
+/// CRC32 using the zlib/ISO-3309 polynomial (same as libz crc32_z).
+/// This is what Monero calls internally via zlib's crc32().
+fn crc32_zlib(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320; // reflected poly
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
 }
 
 #[derive(Debug, thiserror::Error)]

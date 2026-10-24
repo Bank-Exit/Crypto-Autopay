@@ -202,4 +202,5 @@ pub const MONERO_WORDLIST_EN: &[&str] = &[
     "yacht", "yahoo", "yanks", "yard", "yawning", "yearbook", "yellow", "yesterday",
     "yeti", "yields", "yodel", "yoga", "younger", "yoyo", "zapped", "zeal",
     "zebra", "zero", "zesty", "zigzags", "zinger", "zippers", "zodiac", "zombie",
+    "zones", "zoom",
 ];

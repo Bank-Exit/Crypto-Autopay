@@ -100,15 +100,17 @@ async fn create_wallet(
 }
 
 /// Unlock the wallet: verify password by decrypting the vault.
-/// Returns Ok(()) if password is correct.
+/// If the wallet file doesn't exist yet, restore it from the seed via monero-wallet-rpc.
+/// Returns Ok(address) on success.
 #[tauri::command]
 async fn unlock_wallet(
     password: String,
     state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<(), String> {
-    let vault_path = {
-        let state = state.lock().map_err(|e| e.to_string())?;
-        state.vault_path.clone()
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let (vault_path, wallet_file_path) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        (s.vault_path.clone(), s.wallet_file_path.clone())
     };
 
     let vault_json = std::fs::read_to_string(&vault_path)
@@ -117,26 +119,119 @@ async fn unlock_wallet(
     let encrypted: EncryptedSeed = serde_json::from_str(&vault_json)
         .map_err(|e| format!("Invalid vault file: {e}"))?;
 
-    // Try to decrypt (this validates the password)
-    let _seed = SeedVault::decrypt(&encrypted, &password).map_err(|_| {
-        "Incorrect password.".to_string()
-    })?;
+    // Decrypt (validates the password)
+    let seed = SeedVault::decrypt(&encrypted, &password)
+        .map_err(|_| "Incorrect password.".to_string())?;
 
-    // TODO: spawn monero-wallet-rpc with the decrypted seed
+    log::info!("Vault decrypted successfully.");
 
-    let mut state = state.lock().map_err(|e| e.to_string())?;
-    state.unlocked = true;
-    Ok(())
+    // Check if the wallet file exists (monero-wallet-rpc creates a .keys file)
+    let keys_file = wallet_file_path.with_extension("keys");
+    let wallet_exists = keys_file.exists();
+    let wallet_name = wallet_file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("autopay_wallet")
+        .to_string();
+    let wallet_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+
+    let address = if !wallet_exists {
+        // First unlock: restore wallet from seed via monero-wallet-rpc
+        log::info!("Wallet file not found — restoring from seed…");
+
+        // Start wallet-rpc in wallet-dir mode (blocking — runs in tokio task)
+        let seed_str = seed.to_string();
+        let password_clone = password.clone();
+        let wallet_name_clone = wallet_name.clone();
+        let wallet_dir_clone = wallet_dir.clone();
+
+        // We need to run blocking code; tauri commands are async (tokio)
+        let result = tokio::task::spawn_blocking(move || {
+            let config = rpc_manager::RpcConfig::default();
+            let mut mgr = rpc_manager::RpcManager::new(config);
+
+            mgr.start_for_dir(&wallet_dir_clone)?;
+            mgr.wait_for_ready(std::time::Duration::from_secs(10))?;
+
+            let address = mgr.rpc_restore_wallet(
+                &wallet_name_clone,
+                &password_clone,
+                &seed_str,
+                0, // restore from genesis — safer for a new app
+            )?;
+
+            mgr.stop();
+            Ok::<String, String>(address)
+        })
+        .await
+        .map_err(|e| format!("Task error: {e}"))??;
+
+        log::info!("Wallet restored. Address: {}", result);
+        result
+    } else {
+        // Wallet exists — just open it via RPC to get the address
+        log::info!("Wallet file found at {:?}", keys_file);
+        let password_clone = password.clone();
+        let wallet_name_clone = wallet_name.clone();
+        let wallet_dir_clone = wallet_dir.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let config = rpc_manager::RpcConfig::default();
+            let mut mgr = rpc_manager::RpcManager::new(config);
+
+            // Start in wallet-dir mode then open the existing wallet
+            mgr.start_for_dir(&wallet_dir_clone)?;
+            mgr.wait_for_ready(std::time::Duration::from_secs(10))?;
+
+            // Open the existing wallet
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "open",
+                "method": "open_wallet",
+                "params": {
+                    "filename": wallet_name_clone,
+                    "password": password_clone
+                }
+            });
+            let _ = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &body)?;
+
+            // Get address
+            let addr_body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "addr",
+                "method": "get_address",
+                "params": { "account_index": 0 }
+            });
+            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &addr_body)?;
+            let address = resp["result"]["address"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+
+            mgr.stop();
+            Ok::<String, String>(address)
+        })
+        .await
+        .map_err(|e| format!("Task error: {e}"))??;
+
+        result
+    };
+
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.unlocked = true;
+    log::info!("Wallet unlocked. Address: {}", address);
+    Ok(address)
 }
 
-/// Get the current wallet balance (mock until wallet-rpc is connected).
+/// Get the current wallet balance.
+/// NOTE: balance requires an open RPC session (password needed) — returns 0 for now,
+/// will be extended when persistent RPC session is implemented.
 #[tauri::command]
 async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<BalanceResponse, String> {
-    let state = state.lock().map_err(|e| e.to_string())?;
-    if !state.unlocked {
+    let unlocked = state.lock().map_err(|e| e.to_string())?.unlocked;
+    if !unlocked {
         return Err("Wallet is locked.".to_string());
     }
-    // TODO: call MoneroAdapter::balance() once wallet-rpc is spawned
     Ok(BalanceResponse { xmr: 0.0, atomic: 0 })
 }
 

@@ -9,17 +9,27 @@
   let password = "";
   let error = "";
   let loading = false;
+  let loadingMsg = "Déverrouillage…";
 
   async function unlock() {
     if (!password) return;
     loading = true;
     error = "";
+    loadingMsg = "Déverrouillage…";
     try {
-      await invoke("unlock_wallet", { password });
-      dispatch("unlocked");
+      const address = await invoke("unlock_wallet", { password });
+      // address is returned on success (may have taken a while if wallet was restored)
+      dispatch("unlocked", { address });
     } catch (e) {
-      error = typeof e === "string" ? e : "Mot de passe incorrect.";
-      loading = false;
+      const msg = typeof e === "string" ? e : String(e);
+      // Show friendlier message for RPC/node errors (non-critical for daily use)
+      if (msg.includes("wallet-rpc") || msg.includes("connect") || msg.includes("node")) {
+        // Wallet decrypted OK but RPC failed — still allow app to work offline
+        dispatch("unlocked", { address: null, rpcError: msg });
+      } else {
+        error = msg.includes("Incorrect") ? "Mot de passe incorrect." : msg;
+        loading = false;
+      }
     }
   }
 
@@ -107,7 +117,7 @@
       disabled={!password || loading}
     >
       {#if loading}
-        <span class="spinner"></span> Déverrouillage…
+        <span class="spinner"></span> {loadingMsg}
       {:else}
         {$t.unlock || "Déverrouiller"} →
       {/if}

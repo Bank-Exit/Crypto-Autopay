@@ -113,7 +113,13 @@
 
   {:else if appState === "unlock"}
     <Unlock
-      on:unlocked={async () => { appState = "dashboard"; await checkPendingDeepLink(); }}
+      on:unlocked={async (e) => {
+        const { address, rpcError } = e.detail || {};
+        if (rpcError) console.warn("[Unlock] RPC unavailable (offline mode):", rpcError);
+        if (address) console.log("[Unlock] Wallet address:", address.slice(0, 12) + "…");
+        appState = "dashboard";
+        await checkPendingDeepLink();
+      }}
       on:reset={onReset}
     />
 

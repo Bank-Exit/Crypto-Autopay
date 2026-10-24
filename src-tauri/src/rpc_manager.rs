@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 // ---- Public node list (mainnet, no local node needed) ----
 // Nodes are tried in order; first reachable one is used.
@@ -151,6 +152,123 @@ impl RpcManager {
         self.status = RpcStatus::Stopped;
     }
 
+    /// Start wallet-rpc in wallet-dir mode (no specific wallet pre-loaded).
+    /// Used before calling `restore_deterministic_wallet` via RPC.
+    pub fn start_for_dir(&mut self, wallet_dir: &Path) -> Result<(), String> {
+        if matches!(self.status, RpcStatus::Running) {
+            return Ok(());
+        }
+        let binary = self.detect_binary()
+            .ok_or_else(|| "monero-wallet-rpc not found.".to_string())?;
+
+        let daemon_addr = self.daemon_address();
+        let port = self.config.rpc_port;
+
+        log::info!("Starting wallet-rpc in dir mode: wallet_dir={:?}, daemon={}, port={}", wallet_dir, daemon_addr, port);
+        self.status = RpcStatus::Starting;
+
+        let child = Command::new(&binary)
+            .args([
+                "--daemon-address", &daemon_addr,
+                "--rpc-bind-ip", "127.0.0.1",
+                "--rpc-bind-port", &port.to_string(),
+                "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
+                "--disable-rpc-login",
+                "--log-level", "1",
+                "--non-interactive",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn wallet-rpc: {e}"))?;
+
+        self.process = Some(child);
+        self.status = RpcStatus::Running;
+        log::info!("wallet-rpc (dir mode) started on 127.0.0.1:{}", port);
+        Ok(())
+    }
+
+    /// Wait for the RPC endpoint to be reachable (up to `timeout`).
+    pub fn wait_for_ready(&self, timeout: Duration) -> Result<(), String> {
+        let url = self.rpc_url();
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Simple TCP connect check (fast, no HTTP overhead)
+            let addr = format!("127.0.0.1:{}", self.config.rpc_port);
+            if std::net::TcpStream::connect_timeout(
+                &addr.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
+                Duration::from_millis(200),
+            ).is_ok() {
+                // Give the RPC server a moment to initialise after TCP accepts
+                std::thread::sleep(Duration::from_millis(300));
+                log::info!("wallet-rpc is ready at {}", url);
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("wallet-rpc did not become ready within {}s", timeout.as_secs()));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Restore a wallet from a seed phrase using the `restore_deterministic_wallet` RPC.
+    /// Requires the RPC to already be running in wallet-dir mode.
+    /// Returns the restored wallet address.
+    pub fn rpc_restore_wallet(
+        &self,
+        wallet_name: &str,
+        wallet_password: &str,
+        seed_phrase: &str,
+        restore_height: u64,
+    ) -> Result<String, String> {
+        let url = self.rpc_url();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "restore",
+            "method": "restore_deterministic_wallet",
+            "params": {
+                "filename": wallet_name,
+                "password": wallet_password,
+                "seed": seed_phrase,
+                "restore_height": restore_height,
+                "autosave_current": true
+            }
+        });
+
+        // Synchronous HTTP POST (blocking) — called from a Tauri command (async ctx)
+        let response: serde_json::Value = ureq_post_json(&url, &body)?;
+
+        if let Some(err) = response.get("error") {
+            return Err(format!("RPC error: {}", err));
+        }
+        let address = response["result"]["address"]
+            .as_str()
+            .ok_or_else(|| "No address in restore response".to_string())?
+            .to_string();
+        log::info!("Wallet restored. Address: {}", address);
+        Ok(address)
+    }
+
+    /// Get the wallet balance via RPC (wallet must be open).
+    /// Returns (total_balance_xmr, unlocked_balance_xmr).
+    pub fn rpc_get_balance(&self) -> Result<(f64, f64), String> {
+        let url = self.rpc_url();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "balance",
+            "method": "get_balance",
+            "params": { "account_index": 0 }
+        });
+        let response: serde_json::Value = ureq_post_json(&url, &body)?;
+        if let Some(err) = response.get("error") {
+            return Err(format!("RPC error: {}", err));
+        }
+        let atomic = response["result"]["balance"].as_u64().unwrap_or(0);
+        let unlocked = response["result"]["unlocked_balance"].as_u64().unwrap_or(0);
+        // Monero: 1 XMR = 1_000_000_000_000 atomic units (piconero)
+        Ok((atomic as f64 / 1e12, unlocked as f64 / 1e12))
+    }
+
     pub fn rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}/json_rpc", self.config.rpc_port)
     }
@@ -158,4 +276,45 @@ impl RpcManager {
 
 impl Drop for RpcManager {
     fn drop(&mut self) { self.stop(); }
+}
+
+/// Public alias for use in lib.rs (e.g. open_wallet, get_address calls).
+pub fn ureq_post_json_pub(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    ureq_post_json(url, body)
+}
+
+/// Minimal synchronous HTTP POST helper using std::net::TcpStream.
+/// Avoids pulling in reqwest/tokio from this synchronous context.
+fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+
+    // Parse host and path from URL (http://127.0.0.1:PORT/json_rpc)
+    let without_scheme = url.trim_start_matches("http://");
+    let slash_pos = without_scheme.find('/').unwrap_or(without_scheme.len());
+    let host_port = &without_scheme[..slash_pos];
+    let path = &without_scheme[slash_pos..];
+
+    let body_str = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+
+    let mut stream = std::net::TcpStream::connect(host_port)
+        .map_err(|e| format!("Cannot connect to wallet-rpc: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.write_all(request.as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)
+        .map_err(|e| format!("Read error: {e}"))?;
+
+    // Split headers from body
+    let body_start = response.find("\r\n\r\n")
+        .ok_or("Malformed HTTP response")?;
+    let json_body = &response[body_start + 4..];
+
+    serde_json::from_str(json_body)
+        .map_err(|e| format!("JSON parse error: {e} — body: {json_body}"))
 }
