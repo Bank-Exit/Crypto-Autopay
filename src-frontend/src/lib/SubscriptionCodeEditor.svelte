@@ -171,17 +171,34 @@
 
     try {
       generatedCode = await encodeAutopay(clean);
-      dispatch("generated", { code: generatedCode, payload: clean });
+      generatedPayloadForShare = clean; // keep for share view
+      // Note: do NOT dispatch "generated" to add to subscriptions.
+      // "Créer un code" is the merchant/share view — not a personal subscription.
     } catch (e) {
       generatedError = String(e);
     }
   }
 
+  let generatedPayloadForShare = null;
+
+  // Computed share assets
+  $: shareWebUrl = generatedCode
+    ? `https://autopay.libre-market.com/add?code=${encodeURIComponent(generatedCode)}`
+    : "";
+  $: shareHtmlButton = generatedCode && generatedPayloadForShare
+    ? `<a href="${generatedCode}">\n  <button>S'abonner – ${generatedPayloadForShare.amount} ${generatedPayloadForShare.currency || 'XMR'}</button>\n</a>`
+    : "";
+
+  let copiedField = null;
+  async function copyField(text, field) {
+    try { await navigator.clipboard.writeText(text); } catch { prompt("Copier :", text); }
+    copiedField = field;
+    setTimeout(() => copiedField = null, 2000);
+  }
+
   async function copyCode() {
     if (!generatedCode) return;
-    await navigator.clipboard.writeText(generatedCode);
-    copied = true;
-    setTimeout(() => copied = false, 2000);
+    await copyField(generatedCode, "uri");
   }
 
   // ---- Import / decode ----
@@ -387,19 +404,38 @@
         {l("Générer le code AutoPay →", "Generate AutoPay code →")}
       </button>
 
-      <!-- Generated code output -->
+      <!-- ===== Share view after generation ===== -->
       {#if generatedCode}
-        <div class="generated-output">
-          <div class="output-header">
-            <span class="output-label">{l("Code crypto-autopay", "crypto-autopay code")}</span>
-            <button class="btn-copy" on:click={copyCode} type="button">
-              {copied ? (l("Copié ✓", "Copied ✓")) : l("Copier", "Copy")}
+        <div class="share-view">
+          <div class="share-success">✅ {l("Code généré — à partager avec vos abonnés", "Code generated — share with your subscribers")}</div>
+
+          <div class="share-block">
+            <span class="share-label">🔗 URI brut</span>
+            <div class="share-code">{generatedCode}</div>
+            <button class="btn-copy-sm" type="button" on:click={() => copyField(generatedCode, 'uri')}>
+              {copiedField === 'uri' ? '✓ Copié' : 'Copier'}
             </button>
           </div>
-          <div class="output-code">{generatedCode}</div>
-          <div class="output-hint">
-            {l("Partagez ce code sous forme de QR code, lien ou texte brut.", "Share this code as a QR code, link, or plain text.")}
+
+          <div class="share-block">
+            <span class="share-label">🌐 Lien web (email / SMS)</span>
+            <div class="share-code">{shareWebUrl}</div>
+            <button class="btn-copy-sm" type="button" on:click={() => copyField(shareWebUrl, 'web')}>
+              {copiedField === 'web' ? '✓ Copié' : 'Copier'}
+            </button>
           </div>
+
+          <div class="share-block">
+            <span class="share-label">🖥 Bouton HTML pour votre site</span>
+            <pre class="share-code share-pre">{shareHtmlButton}</pre>
+            <button class="btn-copy-sm" type="button" on:click={() => copyField(shareHtmlButton, 'html')}>
+              {copiedField === 'html' ? '✓ Copié' : 'Copier HTML'}
+            </button>
+          </div>
+
+          <button class="btn-ghost btn-sm share-back" type="button" on:click={() => { generatedCode = ""; generatedPayloadForShare = null; }}>
+            ← {l("Modifier le code", "Edit code")}
+          </button>
         </div>
       {/if}
     </div>
@@ -547,18 +583,29 @@
   }
 
   /* Generated output */
-  .generated-output {
-    border: 2px solid var(--accent, #e8601a);
-    border-radius: 10px; padding: 14px;
-    background: var(--accent-light, #fdf0e8);
-    display: flex; flex-direction: column; gap: 8px;
+  /* Share view (replaces old generated-output) */
+  .share-view { display: flex; flex-direction: column; gap: 12px; }
+  .share-success {
+    font-size: 0.88rem; font-weight: 600; color: #22c55e;
+    padding: 8px 12px; background: #22c55e12; border-radius: 6px;
   }
-  .output-header { display: flex; justify-content: space-between; align-items: center; }
-  .output-label { font-size: 12px; font-weight: 700; color: var(--accent, #e8601a); }
-  .btn-copy {
-    background: var(--accent, #e8601a); color: white; border: none;
-    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  .share-block {
+    display: flex; flex-direction: column; gap: 4px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
   }
+  .share-label { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .share-code {
+    font-family: monospace; font-size: 11px; word-break: break-all;
+    line-height: 1.5; color: var(--accent); background: var(--bg); padding: 6px; border-radius: 4px;
+  }
+  .share-pre { white-space: pre-wrap; }
+  .btn-copy-sm {
+    align-self: flex-start; padding: 3px 10px; font-size: 11px;
+    background: var(--accent); color: #fff; border: none; border-radius: 5px; cursor: pointer;
+  }
+  .share-back { margin-top: 4px; align-self: flex-start; }
+
+  /* Legacy (keep for any references) */
   .output-code {
     font-family: "Courier New", monospace; font-size: 11px;
     word-break: break-all; line-height: 1.6;

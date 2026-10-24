@@ -50,8 +50,78 @@
       canary_status: payload.canary_url ? "Ok" : "NotConfigured",
       payments_sent: 0,
       wallet_id: wallets[0]?.id || 1,
-      _code: payload._sourceCode || null, // keep for future backend sync
+      address: payload.address || null,           // stored for duplicate detection
+      _raw_schedule: payload.schedule || null,    // raw cron for comparison
+      _code: payload._sourceCode || null,
     };
+  }
+
+  // ---- Duplicate detection ----
+  function duplicateKey(sub) {
+    // Two subscriptions are duplicates if they share the same address AND raw schedule
+    return `${sub.address || ""}|${sub._raw_schedule || sub.schedule}`;
+  }
+
+  $: {
+    const keys = subscriptions.map(duplicateKey);
+    const seen = new Map();
+    let dups = 0;
+    for (const k of keys) {
+      seen.set(k, (seen.get(k) || 0) + 1);
+    }
+    for (const count of seen.values()) if (count > 1) dups += count - 1;
+    duplicateCount = dups;
+  }
+  let duplicateCount = 0;
+
+  // Pending duplicate subscription waiting for user confirmation
+  let pendingDuplicateSub = null;
+  let showDuplicatePopup = false;
+  let dupTimeLeft = 5;
+  let dupTimer = null;
+  const DUP_RADIUS = 20;
+  const DUP_CIRC = 2 * Math.PI * DUP_RADIUS; // ≈ 125.6
+
+  $: dupDashOffset = DUP_CIRC * (1 - dupTimeLeft / 5);
+
+  function startDupTimer() {
+    clearDupTimer();
+    dupTimeLeft = 5;
+    dupTimer = setInterval(() => {
+      dupTimeLeft = Math.max(0, dupTimeLeft - 0.05); // smooth at 20fps
+      if (dupTimeLeft <= 0) rejectDuplicate();
+    }, 50);
+  }
+  function clearDupTimer() {
+    if (dupTimer) { clearInterval(dupTimer); dupTimer = null; }
+  }
+  function rejectDuplicate() {
+    clearDupTimer();
+    showDuplicatePopup = false;
+    pendingDuplicateSub = null;
+    showNewSubModal = false;
+  }
+  function acceptDuplicate() {
+    clearDupTimer();
+    if (pendingDuplicateSub) subscriptions = [...subscriptions, pendingDuplicateSub];
+    showDuplicatePopup = false;
+    pendingDuplicateSub = null;
+    showNewSubModal = false;
+    page = "subscriptions";
+  }
+
+  function addOrConfirmDuplicate(sub) {
+    const key = duplicateKey(sub);
+    const isDup = subscriptions.some(s => duplicateKey(s) === key);
+    if (isDup) {
+      pendingDuplicateSub = sub;
+      showDuplicatePopup = true;
+      startDupTimer();
+    } else {
+      subscriptions = [...subscriptions, sub];
+      showNewSubModal = false;
+      page = "subscriptions";
+    }
   }
 
   /** Best-effort: compute next occurrence date from a 6-field cron preset */
@@ -115,17 +185,16 @@
   }
 
   function onSubGenerated({ detail }) {
-    const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
-    subscriptions = [...subscriptions, sub];
+    // "Créer un code" is the merchant/sharing view — it does NOT add to subscriptions
+    // Only imports add subscriptions (see onSubImported)
+    showNewSubModal = false; // close modal, user sees the sharing result in-place
     showNewSubModal = false;
     page = "subscriptions"; // ensure we're on the right tab
   }
 
   function onSubImported({ detail }) {
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
-    subscriptions = [...subscriptions, sub];
-    showNewSubModal = false;
-    page = "subscriptions";
+    addOrConfirmDuplicate(sub);
   }
 
   let trayStatus = "green";
@@ -265,7 +334,15 @@
     <!-- ====== SUBSCRIPTIONS ====== -->
     {#if page === "subscriptions"}
       <div class="page-header">
-        <h1>{$currentNetwork.label} AutoPay</h1>
+        <div>
+          <h1>Mes abonnements en {$currentNetwork.label}</h1>
+          <p class="subs-subtitle">
+            {subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length} abonnement{subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length !== 1 ? "s" : ""}
+            {#if duplicateCount > 0}
+              &nbsp;·&nbsp;<span class="dup-warning">Doublons : {duplicateCount}</span>
+            {/if}
+          </p>
+        </div>
         <div class="page-actions">
           <button class="btn-ghost" on:click={() => page = "find"}>{$t.findSubscriptions}</button>
           <button class="btn-ghost" on:click={openImportModal}>📥 {$t.importSubscription}</button>
@@ -285,6 +362,9 @@
         <span class="text-muted">{$t.nextRefillLabel} :</span>
         <strong>{$t.refillIn} {totalRefillText($t)}</strong>
         <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
+        <a class="refill-help-link" href="https://libre-market.com/m/epicerie/tutorial" target="_blank" rel="noopener noreferrer">
+          Comment se procurer du Monero ?
+        </a>
       </div>
 
       <SubscriptionList
@@ -297,6 +377,8 @@
             : s);
         }}
       />
+      <!-- Bottom spacer so last subscription isn't flush against edge -->
+      <div style="height:70px;flex-shrink:0"></div>
 
     <!-- ====== WALLETS ====== -->
     {:else if page === "wallets"}
@@ -546,6 +628,43 @@
   </main>
 </div>
 
+<!-- ===== Duplicate confirmation popup ===== -->
+{#if showDuplicatePopup && pendingDuplicateSub}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="dup-overlay" on:click={rejectDuplicate}>
+    <div class="dup-popup card" on:click|stopPropagation>
+      <div class="dup-icon">⚠️</div>
+      <p class="dup-title">Abonnement similaire déjà présent</p>
+      <p class="dup-label"><strong>{pendingDuplicateSub.label}</strong></p>
+      <p class="dup-question text-muted">Ajouter quand même ce doublon ?</p>
+
+      <!-- Pie countdown timer -->
+      <svg class="dup-pie" viewBox="0 0 48 48" width="48" height="48">
+        <circle cx="24" cy="24" r="{DUP_RADIUS}" fill="none" stroke="var(--border)" stroke-width="4"/>
+        <circle
+          cx="24" cy="24" r="{DUP_RADIUS}" fill="none"
+          stroke="var(--accent)" stroke-width="4"
+          stroke-dasharray="{DUP_CIRC}"
+          stroke-dashoffset="{dupDashOffset}"
+          stroke-linecap="round"
+          transform="rotate(-90 24 24)"
+          style="transition: stroke-dashoffset 0.05s linear"
+        />
+        <text x="24" y="28" text-anchor="middle" font-size="11" fill="var(--text-muted)">{Math.ceil(dupTimeLeft)}</text>
+      </svg>
+
+      <div class="dup-actions">
+        <button class="btn-primary dup-no" on:click={rejectDuplicate}>
+          Non (défaut)
+        </button>
+        <button class="btn-ghost" on:click={acceptDuplicate}>
+          Oui, ajouter
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- New subscription modal -->
 {#if showNewSubModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
@@ -675,8 +794,39 @@
     flex-shrink: 0;
     flex-wrap: wrap;
   }
-  .refill-banner { font-size: 12px; opacity: 0.85; }
+  .refill-banner { font-size: 12px; opacity: 0.85; flex-wrap: wrap; }
   .refill-hint { font-size: 11px; }
+  .refill-help-link {
+    margin-left: auto; font-size: 11px;
+    color: var(--accent); text-decoration: none; white-space: nowrap;
+  }
+  .refill-help-link:hover { text-decoration: underline; }
+
+  /* Subscription page header subtitle */
+  .subs-subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .dup-warning { color: #f59e0b; font-weight: 600; }
+
+  /* Duplicate confirmation popup */
+  .dup-overlay {
+    position: fixed; inset: 0; z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+    background: #0006; backdrop-filter: blur(2px);
+  }
+  .dup-popup {
+    max-width: 280px; width: 90%;
+    padding: 1.5rem 1.25rem;
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    text-align: center;
+    animation: pop-in 0.18s cubic-bezier(.34,1.56,.64,1);
+  }
+  @keyframes pop-in { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .dup-icon { font-size: 1.8rem; }
+  .dup-title { font-weight: 700; font-size: 0.95rem; }
+  .dup-label { font-size: 0.9rem; }
+  .dup-question { font-size: 0.82rem; }
+  .dup-pie { display: block; margin: 4px auto; }
+  .dup-actions { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; justify-content: center; }
+  .dup-no { background: var(--accent) !important; }
 
   .section-title { font-size: 13px; font-weight: 600; color: var(--text-muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .05em; }
 
