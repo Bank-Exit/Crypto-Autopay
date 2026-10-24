@@ -289,8 +289,9 @@
   -->
   <!--  (tabs removed — each mode is now opened in its own dedicated context)  -->
 
-  <!-- ======================== CREATE ======================== -->
-  {#if mode === "create"}
+  <!-- ======================== CREATE / NEW ======================== -->
+  <!-- mode="create" = merchant code generator; mode="new" = manual subscriber add (same form, different CTA) -->
+  {#if mode === "create" || mode === "new"}
     <div class="sce-form">
 
       <!-- Network selector (Monero + Bitcoin only in the app) -->
@@ -500,8 +501,8 @@
         </button>
       {/if}
 
-      <!-- ===== Share view after generation ===== -->
-      {#if generatedCode}
+      <!-- ===== Share view after generation (create mode only, not new) ===== -->
+      {#if generatedCode && mode !== "new"}
         <div class="share-view">
           <div class="share-success">✅ {l("Code généré — à partager avec vos abonnés", "Code generated — share with your subscribers")}</div>
 
@@ -630,19 +631,6 @@
     max-width: 620px;
   }
   .sce.compact { padding: 0; gap: 12px; }
-
-  /* Tabs */
-  .sce-tabs {
-    display: flex; gap: 0; border-bottom: 2px solid var(--border, #e2ddd7);
-    margin-bottom: 4px;
-  }
-  .sce-tab {
-    background: none; border: none; padding: 8px 16px;
-    font-size: 13px; color: var(--text-muted, #888); cursor: pointer;
-    border-bottom: 2px solid transparent; margin-bottom: -2px;
-    transition: color .15s, border-color .15s;
-  }
-  .sce-tab.active { color: var(--accent, #e8601a); border-bottom-color: var(--accent, #e8601a); font-weight: 600; }
 
   /* Form */
   .sce-form, .sce-import { display: flex; flex-direction: column; gap: 12px; }
@@ -782,15 +770,6 @@
     background: var(--accent); color: #fff; border: none; border-radius: 5px; cursor: pointer;
   }
   .share-back { margin-top: 4px; align-self: flex-start; }
-
-  /* Legacy (keep for any references) */
-  .output-code {
-    font-family: "Courier New", monospace; font-size: 11px;
-    word-break: break-all; line-height: 1.6;
-    background: var(--bg, white); padding: 10px; border-radius: 6px;
-    color: var(--text, #333);
-  }
-  .output-hint { font-size: 11px; color: var(--text-muted, #888); }
 
   /* Import result */
   .import-result { padding: 14px; display: flex; flex-direction: column; gap: 10px; }

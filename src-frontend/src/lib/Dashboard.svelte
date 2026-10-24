@@ -423,8 +423,40 @@
             : s);
         }}
       />
-      <!-- Bottom spacer so last subscription isn't flush against edge -->
-      <div style="height:70px;flex-shrink:0"></div>
+      <!-- Footer marketing + bottom spacer -->
+      <div class="sub-footer">
+        <div class="sub-footer-grid">
+          <div class="sub-footer-item">
+            <span class="sub-footer-icon">🔒</span>
+            <div>
+              <strong>Vie privée maximale</strong>
+              <p>Aucune donnée envoyée à l'extérieur par défaut. Zéro tracking, zéro analytics.</p>
+            </div>
+          </div>
+          <div class="sub-footer-item">
+            <span class="sub-footer-icon">🪙</span>
+            <div>
+              <strong>Anonymat Monero</strong>
+              <p>Transactions confidentielles par protocole. Montants et identités masqués.</p>
+            </div>
+          </div>
+          <div class="sub-footer-item">
+            <span class="sub-footer-icon">🛡</span>
+            <div>
+              <strong>Seed chiffrée post-quantique</strong>
+              <p>Argon2id + AES-256-GCM. Résistant aux attaques quantiques futures.</p>
+            </div>
+          </div>
+          <div class="sub-footer-item">
+            <span class="sub-footer-icon">🌐</span>
+            <div>
+              <strong>Open source</strong>
+              <p>Code auditable. Pas de tiers de confiance. Vous contrôlez vos clés.</p>
+            </div>
+          </div>
+        </div>
+        <p class="sub-footer-version">Crypto AutoPay v0.1 · 2026 · open source · <span class="sub-footer-tagline">Vos paiements, vos règles.</span></p>
+      </div>
 
     <!-- ====== WALLETS ====== -->
     {:else if page === "wallets"}
@@ -1012,6 +1044,29 @@
 
   /* Create-code full page */
   .create-code-page { padding: 0 2px; max-width: 640px; }
+
+  /* Sub-footer marketing */
+  .sub-footer {
+    margin-top: 28px; padding: 20px 16px 28px;
+    border-top: 1px solid var(--border);
+  }
+  .sub-footer-grid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
+    margin-bottom: 14px;
+  }
+  @media (max-width: 520px) { .sub-footer-grid { grid-template-columns: 1fr; } }
+  .sub-footer-item {
+    display: flex; gap: 10px; align-items: flex-start;
+    font-size: 11.5px; line-height: 1.5;
+  }
+  .sub-footer-icon { font-size: 18px; flex-shrink: 0; margin-top: 1px; }
+  .sub-footer-item strong { font-size: 12px; display: block; margin-bottom: 2px; }
+  .sub-footer-item p { margin: 0; color: var(--text-muted); }
+  .sub-footer-version {
+    font-size: 10.5px; color: var(--text-muted); text-align: center; margin: 0;
+    border-top: 1px solid var(--border); padding-top: 10px;
+  }
+  .sub-footer-tagline { font-style: italic; color: var(--accent); }
 
   .section-title { font-size: 13px; font-weight: 600; color: var(--text-muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .05em; }
 
