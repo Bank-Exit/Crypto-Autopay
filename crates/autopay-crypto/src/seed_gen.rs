@@ -19,6 +19,33 @@ pub fn generate_seed() -> Result<Zeroizing<String>, SeedError> {
     bytes_to_mnemonic(&bytes)
 }
 
+/// Fix the checksum word of a 25-word mnemonic that was generated with the old buggy algorithm.
+/// Keeps the first 24 words intact and replaces the 25th word with the correct checksum.
+/// Returns None if the mnemonic is already valid or has an unexpected format.
+pub fn fix_seed_checksum(phrase: &str) -> Option<Zeroizing<String>> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    if words.len() != 25 { return None; }
+
+    // Verify all 24 data words are in the official wordlist
+    let data_words = &words[..24];
+    for w in data_words {
+        if !MONERO_WORDLIST_EN.contains(w) { return None; }
+    }
+
+    // Check if the current checksum is already correct
+    let idx = compute_checksum_index(data_words) as usize;
+    let correct_prefix: String = data_words[idx].chars().take(3).collect();
+    let actual_prefix: String = words[24].chars().take(3).collect();
+    if correct_prefix == actual_prefix {
+        return None; // Already valid — no fix needed
+    }
+
+    // Replace 25th word with the correct checksum word
+    let mut fixed = data_words.to_vec();
+    fixed.push(data_words[idx]);
+    Some(Zeroizing::new(fixed.join(" ")))
+}
+
 /// Convert 32 raw bytes to a 25-word mnemonic.
 /// Algorithm: Monero 3-word encoding over GF(N).
 pub fn bytes_to_mnemonic(bytes: &[u8; 32]) -> Result<Zeroizing<String>, SeedError> {

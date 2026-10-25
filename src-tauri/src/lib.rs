@@ -7,6 +7,7 @@ use autopay_crypto::{
     SeedVault, EncryptedSeed,
     generate_seed as crypto_generate_seed,
     mnemonic_to_bytes,
+    fix_seed_checksum,
 };
 use autopay_core::db::Database;
 use autopay_core::models::{Subscription, SubscriptionStatus};
@@ -131,9 +132,27 @@ async fn unlock_wallet(
     let seed = SeedVault::decrypt(&encrypted, &password)
         .map_err(|_| "Incorrect password.".to_string())?;
 
-    log::info!("Vault decrypted successfully.");
+    log::info!("[Unlock] Vault decrypted successfully.");
 
-    let seed_str = seed.to_string();
+    // Auto-migrate: fix checksum if seed was created with old buggy algorithm
+    let seed_str = if let Some(fixed) = fix_seed_checksum(seed.as_str()) {
+        log::warn!("[Unlock] Seed checksum was wrong (old app version) — auto-fixing and saving corrected vault.");
+        // Re-encrypt with corrected seed and overwrite vault
+        let corrected = fixed.to_string();
+        match SeedVault::encrypt(&corrected, &password) {
+            Ok(new_encrypted) => {
+                match serde_json::to_string(&new_encrypted) {
+                    Ok(json) => { let _ = std::fs::write(&vault_path, json); }
+                    Err(e) => log::error!("[Unlock] Could not serialize corrected vault: {}", e),
+                }
+            }
+            Err(e) => log::error!("[Unlock] Could not re-encrypt corrected vault: {}", e),
+        }
+        corrected
+    } else {
+        seed.to_string()
+    };
+
     let keys_file = wallet_file_path.with_extension("keys");
     let wallet_exists = keys_file.exists();
     let wallet_name = wallet_file_path
