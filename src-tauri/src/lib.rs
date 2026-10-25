@@ -227,20 +227,8 @@ async fn unlock_wallet(
             log::info!("[Unlock/RPC] Restore OK, address={}", &addr[..addr.len().min(12)]);
             // Save height marker so we know this wallet was created with a good restore_height
             let _ = std::fs::write(&height_marker, restore_height.to_string());
-            // Sync the ~720 blocks since restore_height — 180s timeout
-            log::info!("[Unlock/RPC] Syncing ~720 blocks from restore_height (first sync, ~47s on remote node)…");
-            match rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
-                "jsonrpc":"2.0","id":"sync","method":"refresh","params":{"start_height":0}
-            }), 180) {
-                Ok(r) => log::info!("[Unlock/RPC] Sync done: blocks_fetched={}, received_money={}",
-                    r["result"]["blocks_fetched"].as_u64().unwrap_or(0),
-                    r["result"]["received_money"].as_bool().unwrap_or(false)),
-                Err(e) => log::warn!("[Unlock/RPC] Sync failed (balance may be 0 temporarily): {}", e),
-            }
-            let bal = mgr.rpc_get_balance().map(|(t, _)| t).unwrap_or_else(|e| {
-                log::warn!("[Unlock/RPC] get_balance after restore failed: {}", e);
-                0.0
-            });
+            // Balance is 0 immediately after restore — sync happens via refresh_balance later.
+            let bal = 0.0_f64;
             (addr, bal)
         } else {
             log::info!("[Unlock/RPC] .keys + cache found (height={}) — calling open_wallet", saved_height);
@@ -331,6 +319,90 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
 
 /// Send all funds (sweep_all) to a destination address.
 /// Requires the wallet to be unlocked (session_password must be set).
+/// Send a specific amount to a destination address (for scheduled payments).
+/// Security: logs only the subscription ID — no amounts, no addresses in logs.
+#[tauri::command]
+async fn send_payment(
+    destination_address: String,
+    amount_xmr: f64,
+    subscription_id: i64,
+    state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let dest = destination_address.trim().to_string();
+    if dest.len() < 90 || dest.len() > 110 {
+        return Err("Invalid destination address".to_string());
+    }
+    if amount_xmr <= 0.0 || amount_xmr > 100.0 {
+        return Err("Invalid amount".to_string());
+    }
+    let atomic_units = (amount_xmr * 1e12) as u64;
+
+    let (wallet_name, wallet_dir, password) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if !s.unlocked { return Err("Wallet is locked.".to_string()); }
+        let wn = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let pw = s.session_password.clone().ok_or("No session password")?;
+        (wn, wd, pw)
+    };
+
+    log::info!("[Payment] Sending payment for subscription #{}", subscription_id);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
+
+        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"open","method":"open_wallet",
+            "params":{"filename":wallet_name,"password":password}
+        })).map_err(|e| e.to_string())?;
+        if let Some(err) = open.get("error") {
+            return Err(format!("open_wallet: {}", err));
+        }
+
+        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"tx","method":"transfer",
+            "params":{
+                "destinations":[{"amount": atomic_units, "address": dest}],
+                "account_index": 0,
+                "priority": 1,
+                "get_tx_key": false
+            }
+        })).map_err(|e| e.to_string())?;
+
+        mgr.stop();
+
+        if let Some(err) = resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            log::error!("[Payment] sub #{} — RPC error: {}", subscription_id, msg);
+            return Err(format!("transfer RPC error: {}", msg));
+        }
+
+        let tx_hash = resp["result"]["tx_hash"].as_str().unwrap_or("").to_string();
+        log::info!("[Payment] sub #{} — sent. tx_id={}", subscription_id, tx_hash);
+        Ok(serde_json::json!({ "tx_hash": tx_hash }))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(result)
+}
+
+/// Update a subscription's next_payment_at after a successful payment.
+#[tauri::command]
+async fn update_subscription_next_payment(
+    id: i64,
+    next_payment_at: String,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<(), String> {
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    db.update_subscription_next_payment(id, &next_payment_at)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn sweep_all(
     destination: String,
@@ -746,6 +818,8 @@ pub fn run() {
             get_balance,
             refresh_balance,
             sweep_all,
+            send_payment,
+            update_subscription_next_payment,
             get_subscriptions,
             add_subscription,
             delete_subscription,

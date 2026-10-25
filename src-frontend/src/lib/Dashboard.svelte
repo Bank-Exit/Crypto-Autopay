@@ -338,6 +338,89 @@
     }
   }
 
+  // ---- Payment scheduler (frontend-driven) ----
+  let paymentInProgress = false;
+
+  async function checkDuePayments() {
+    if (paymentInProgress) return;
+    if (!walletAddress) return; // not unlocked
+    const now = new Date();
+    const due = subscriptions.filter(s => {
+      if (!["Active", "Actif"].includes(s.status)) return false;
+      if (!s.next_payment_at) return false;
+      return new Date(s.next_payment_at) <= now;
+    });
+    if (due.length === 0) return;
+
+    logInfo("Scheduler", `${due.length} payment(s) due`);
+    paymentInProgress = true;
+    for (const sub of due) {
+      await processPayment(sub);
+    }
+    paymentInProgress = false;
+  }
+
+  async function processPayment(sub) {
+    logInfo("Scheduler", `Processing payment for sub #${sub.id} — ${sub.amount} ${sub.currency}`);
+    try {
+      const result = await tauriInvoke("send_payment", {
+        destinationAddress: sub.destination_address || sub.address || "",
+        amountXmr: parseFloat(sub.amount),
+        subscriptionId: sub.id,
+      });
+      if (result?.tx_hash) {
+        logInfo("Scheduler", `Payment sent for sub #${sub.id}`);
+        // Compute next occurrence
+        const next = computeNextOccurrence(sub.schedule, sub.repeat_every || 1);
+        sub.next_payment_at = next.toISOString();
+        sub.status = "Active";
+        subscriptions = [...subscriptions];
+        await tauriInvoke("update_subscription_next_payment", {
+          id: sub.id,
+          nextPaymentAt: sub.next_payment_at
+        });
+        await refreshBalance();
+      } else {
+        logWarn("Scheduler", `Payment failed for sub #${sub.id}: ${result?.error || "unknown"}`);
+        sub.status = "Suspended";
+        subscriptions = [...subscriptions];
+      }
+    } catch (e) {
+      logError("Scheduler", `Payment error for sub #${sub.id}: ${e}`);
+    }
+  }
+
+  function computeNextOccurrence(cronExpr, repeatEvery = 1) {
+    // Parse CRON: sec min hour dom month dow (6-field) or min hour dom month dow (5-field)
+    const now = new Date();
+    const parts = String(cronExpr).trim().split(/\s+/);
+    // Try to use croner if available, else fallback to +1 month
+    try {
+      // Simple built-in parser for common patterns
+      const next = new Date(now);
+      if (parts.length === 6) {
+        const [, minP, hourP, domP, monP] = parts;
+        if (minP.startsWith('*/')) {
+          const every = parseInt(minP.slice(2));
+          next.setMinutes(Math.ceil((now.getMinutes() + 1) / every) * every, 0, 0);
+        } else if (domP !== '*') {
+          next.setMonth(next.getMonth() + 1 * repeatEvery, parseInt(domP));
+          next.setHours(parseInt(hourP) || 9, parseInt(minP) || 0, 0, 0);
+        } else {
+          next.setDate(next.getDate() + 1);
+          next.setHours(parseInt(hourP) || 9, 0, 0, 0);
+        }
+      } else {
+        next.setMonth(next.getMonth() + 1);
+      }
+      return next;
+    } catch {
+      const n = new Date(now);
+      n.setMonth(n.getMonth() + 1);
+      return n;
+    }
+  }
+
   async function doSweepAll() {
     sweepError = null;
     sweepTxHash = null;
@@ -495,14 +578,21 @@
       }
     }
 
-    // Load wallet info (balance + RPC status), then schedule refresh every 2 min
+    // Load basic wallet info (address, cached balance) — fast, no sync
     await loadWalletInfo();
-    // Set initial lastBalanceRefresh so UI shows "il y a 0s" after first load
-    lastBalanceRefresh = Date.now();
     updateRefreshAgo();
+
+    // Immediately trigger a background sync without blocking the UI
+    // (sync takes ~47s on first run — shows spinner in sidebar)
+    refreshBalance(); // intentionally NOT awaited
+
     const balanceTimer = setInterval(refreshBalance, 2 * 60 * 1000);
     const agoTimer = setInterval(updateRefreshAgo, 30 * 1000);
-    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); };
+
+    // Payment scheduler: check every minute for due subscriptions
+    const paymentTimer = setInterval(checkDuePayments, 60 * 1000);
+
+    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); clearInterval(paymentTimer); };
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */
@@ -541,6 +631,11 @@
     { id: 2, name: "Wallet services",    desc: "VPN et hébergement",       balance: "1.21", color: "#2e7d32", monthlyOut: 0.04 },
   ];
 
+  // Keep wallet[0] balance in sync with the live RPC balance
+  $: if (balanceXmr !== null && wallets.length > 0) {
+    wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
+    wallets = wallets; // trigger reactivity
+  }
   $: totalBalance = wallets.reduce((s, w) => s + parseFloat(w.balance), 0).toFixed(3);
   $: totalMonthlyOut = wallets.reduce((s, w) => s + (w.monthlyOut || 0), 0);
 
@@ -675,8 +770,10 @@
           </svg>
         </button>
       </div>
-      {#if refreshAgoLabel}
-        <div class="refresh-ago">{balanceLoading ? 'Synchro…' : refreshAgoLabel} · toutes les 2 min</div>
+      {#if balanceLoading}
+        <div class="refresh-ago sync-pulse">Synchro réseau en cours…</div>
+      {:else if refreshAgoLabel}
+        <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
       {/if}
 
         {#if balanceXmr === null}
@@ -1417,6 +1514,7 @@
   .refresh-btn:hover { color: var(--accent); }
   .refresh-btn:disabled { opacity: 0.4; cursor: default; }
   .refresh-ago { font-size: 9px; color: var(--text-muted); opacity: 0.7; margin-bottom: 4px; }
+  .sync-pulse { color: var(--accent) !important; opacity: 1 !important; animation: pulse-dot 1.5s ease-in-out infinite; }
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
   .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
   .btn-inline { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 10px; padding: 0; text-decoration: underline; }

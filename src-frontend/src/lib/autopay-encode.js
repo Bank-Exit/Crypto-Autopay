@@ -86,10 +86,22 @@ export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
   // Supports both 6-field Quartz "sec min hour dom month dow"
   //             and 5-field standard "min hour dom month dow".
   const parts = s.split(/\s+/);
-  let dom, month, dow;
-  if (parts.length === 6) { [,,,dom, month, dow] = parts; }
-  else if (parts.length === 5) { [,,dom, month, dow] = parts; }
+  let minField, dom, month, dow;
+  if (parts.length === 6) { [, minField,,dom, month, dow] = parts; }
+  else if (parts.length === 5) { [minField,,dom, month, dow] = parts; }
   else { return schedule + (n > 1 ? ` (×${n})` : ""); }
+
+  // Every-N-minutes pattern: "0 */N * * * *" or "*/N * * * *"
+  if (minField && minField.startsWith('*/')) {
+    const everyMin = parseInt(minField.slice(2));
+    if (!isNaN(everyMin)) {
+      return lang === 'fr' ? `Toutes les ${everyMin} min` : `Every ${everyMin} min`;
+    }
+  }
+  // Every hour: min=0, hour=*, dom=*, month=*, dow=*
+  if (dom === '*' && month === '*' && dow === '*' && minField === '0') {
+    return lang === 'fr' ? 'Toutes les heures' : 'Hourly';
+  }
 
   // Match on structural pattern
   if (dom === "1" && month === "*" && dow === "*")  return n === 1 ? labels.monthly   : `${labels.every} ${n} ${labels.months}`;
@@ -115,6 +127,9 @@ const SCHEDULE_LABELS = {
 
 /** Known preset schedules — 6-field Quartz cron (sec min hour dom month dow) */
 export const SCHEDULE_PRESETS = [
+  { id: "every10min", cron: "0 */10 * * * *", label_fr: "Toutes les 10 min", label_en: "Every 10 min", devOnly: true },
+  { id: "every25min", cron: "0 */25 * * * *", label_fr: "Toutes les 25 min", label_en: "Every 25 min", devOnly: true },
+  { id: "hourly",    cron: "0 0 * * * *",    label_fr: "Toutes les heures", label_en: "Hourly" },
   { id: "daily",     cron: "0 0 9 * * *",   label_fr: "Quotidien",      label_en: "Daily" },
   { id: "weekly",    cron: "0 0 9 * * 1",   label_fr: "Hebdomadaire",   label_en: "Weekly" },
   { id: "monthly",   cron: "0 0 9 1 * *",   label_fr: "Mensuel",        label_en: "Monthly" },

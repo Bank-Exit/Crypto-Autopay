@@ -17,8 +17,10 @@
   let showLogs = false;
   let liveLogs = [];
   let logFilter = "all"; // "all" | "warn" | "error"
-  $: filteredLogs = logFilter === "all" ? liveLogs
-    : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"));
+  // Newest first (reverse chronological order)
+  $: filteredLogs = (logFilter === "all" ? liveLogs
+    : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"))
+  ).slice().reverse();
 
   onMount(async () => {
     const unsub = subscribeToLogs(entries => { liveLogs = [...entries]; });
@@ -176,7 +178,7 @@
     <div class="logs-overlay" role="button" tabindex="-1" aria-label="Fermer les logs" on:click={() => showLogs = false} on:keydown={e => e.key === 'Escape' && (showLogs = false)}></div>
     <div class="logs-drawer">
       <div class="logs-header">
-        <span>📋 Logs techniques</span>
+        <span>📋 Logs <span style="font-size:10px;color:#aaa;font-weight:400">↑ plus récent en haut</span></span>
         <div class="logs-filters">
           <button class:active={logFilter==="all"} on:click={() => logFilter="all"}>Tous</button>
           <button class:active={logFilter==="warn"} on:click={() => logFilter="warn"}>⚠️ Warnings</button>
