@@ -156,33 +156,48 @@
   function nextOccurrence(schedule) {
     const now = new Date();
     const s = (schedule || "").trim();
-    // Monthly (dom=1): next 1st of month
-    if (s === "0 0 9 1 * *" || s === "0 9 1 * *") {
-      const d = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-      return d.toISOString().split("T")[0];
+    const parts = s.split(/\s+/);
+
+    // Every N minutes: "0 */N * * * *" or "*/N * * * *"
+    const minField = parts.length >= 6 ? parts[1] : parts[0];
+    if (minField && minField.startsWith("*/")) {
+      const n = parseInt(minField.slice(2)) || 1;
+      return new Date(now.getTime() + n * 60 * 1000).toISOString();
     }
-    // Weekly (Monday): next Monday
+    // Hourly: min=0, hour=* → next full hour
+    const hourField = parts.length >= 6 ? parts[2] : parts[1];
+    if (minField === "0" && hourField === "*") {
+      const d = new Date(now);
+      d.setMinutes(0, 0, 0); d.setHours(d.getHours() + 1);
+      return d.toISOString();
+    }
+    // Monthly (dom=1)
+    if (s === "0 0 9 1 * *" || s === "0 9 1 * *") {
+      return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+    }
+    // Weekly (Monday)
     if (s === "0 0 9 * * 1" || s === "0 9 * * 1") {
       const d = new Date(now);
       d.setDate(now.getDate() + ((8 - now.getDay()) % 7 || 7));
-      return d.toISOString().split("T")[0];
+      return d.toISOString();
     }
     // Daily
     if (s === "0 0 9 * * *" || s === "0 9 * * *") {
       const d = new Date(now);
       d.setDate(now.getDate() + 1);
-      return d.toISOString().split("T")[0];
+      return d.toISOString();
     }
     // Quarterly
     if (s.includes("*/3")) {
       const nextMonth = Math.ceil((now.getMonth() + 1) / 3) * 3;
-      return new Date(now.getFullYear(), nextMonth, 1).toISOString().split("T")[0];
+      return new Date(now.getFullYear(), nextMonth, 1).toISOString();
     }
     // Yearly
     if (s === "0 0 9 1 1 *" || s === "0 9 1 1 *") {
-      return new Date(now.getFullYear() + 1, 0, 1).toISOString().split("T")[0];
+      return new Date(now.getFullYear() + 1, 0, 1).toISOString();
     }
-    return null;
+    // Fallback: now + 1 month
+    return new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString();
   }
 
   // ---- 3 separate entry points ----
@@ -410,7 +425,7 @@
   }
 
   async function processPayment(sub) {
-    logInfo("Scheduler", `Processing payment for sub #${sub.id} — ${sub.amount} ${sub.currency}`);
+    logInfo("Scheduler", `Processing payment for sub #${sub.id}`);
     try {
       const result = await tauriInvoke("send_payment", {
         destinationAddress: sub.destination_address || sub.address || "",
@@ -418,25 +433,29 @@
         subscriptionId: sub.id,
       });
       if (result?.tx_hash) {
-        logInfo("Scheduler", `Payment sent for sub #${sub.id}`);
+        logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${result.tx_hash.slice(0, 12)}...`);
         lastPaymentSentAt = Date.now();
-        // Compute next occurrence
-        const next = computeNextOccurrence(sub.schedule, sub.repeat_every || 1);
-        sub.next_payment_at = next.toISOString();
-        sub.status = "Active";
-        subscriptions = [...subscriptions];
+        // Compute next occurrence from raw schedule
+        const rawSched = sub._raw_schedule || sub.schedule;
+        const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
+        const nextIso = next instanceof Date ? next.toISOString() : new Date(next).toISOString();
+        const idx = subscriptions.findIndex(s => s.id === sub.id);
+        if (idx !== -1) {
+          subscriptions[idx] = { ...subscriptions[idx], next_payment_at: nextIso, status: "Active", payments_sent: (sub.payments_sent || 0) + 1 };
+          subscriptions = [...subscriptions];
+        }
         await tauriInvoke("update_subscription_next_payment", {
           id: sub.id,
-          nextPaymentAt: sub.next_payment_at
+          nextPaymentAt: nextIso
         });
         await refreshBalance();
       } else {
-        logWarn("Scheduler", `Payment failed for sub #${sub.id}: ${result?.error || "unknown"}`);
-        sub.status = "Suspended";
-        subscriptions = [...subscriptions];
+        // RPC returned but no tx_hash — unexpected, just log
+        logWarn("Scheduler", `[WARN] Reponse inattendue pour sub #${sub.id} — pas de tx_hash dans la reponse`);
       }
     } catch (e) {
-      logError("Scheduler", `Payment error for sub #${sub.id}: ${e}`);
+      // Tauri command returned an Err() — log clearly, do NOT suspend the subscription
+      logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${e}`);
     }
   }
 

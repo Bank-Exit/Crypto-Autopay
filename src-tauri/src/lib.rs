@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Emitter, Listener};
@@ -43,6 +44,8 @@ pub struct AppState {
     pub pending_deep_link: Option<String>,
     /// Timestamp (Unix seconds) of the last outgoing payment — enforces 25-min Monero cooldown.
     pub last_payment_sent_at: Option<i64>,
+    /// RPC busy flag — only one command can use the wallet RPC at a time (port 18083).
+    pub rpc_busy: Arc<AtomicBool>,
     /// RPC process manager.
     pub rpc: RpcManager,
 }
@@ -376,19 +379,31 @@ async fn send_payment(
     }
     let atomic_units = (amount_xmr * 1e12) as u64;
 
-    let (wallet_name, wallet_dir, password) = {
+    let (wallet_name, wallet_dir, password, rpc_busy) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Wallet is locked.".to_string()); }
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
         let pw = s.session_password.clone().ok_or("No session password")?;
-        (wn, wd, pw)
+        let busy = Arc::clone(&s.rpc_busy);
+        (wn, wd, pw, busy)
     };
+
+    // Exclusive RPC access — reject if already in use (refresh_balance running)
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("RPC busy: balance refresh in progress. Retry in a moment.".to_string());
+    }
 
     log::info!("[Payment] Sending payment for subscription #{}", subscription_id);
 
+    let busy_clone = Arc::clone(&rpc_busy);
     let result = tokio::task::spawn_blocking(move || {
+        // RAII guard: always clear rpc_busy when this closure exits
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(Arc::clone(&busy_clone));
+
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
@@ -398,6 +413,7 @@ async fn send_payment(
             "params":{"filename":wallet_name,"password":password}
         })).map_err(|e| e.to_string())?;
         if let Some(err) = open.get("error") {
+            mgr.stop();
             return Err(format!("open_wallet: {}", err));
         }
 
@@ -420,7 +436,11 @@ async fn send_payment(
         }
 
         let tx_hash = resp["result"]["tx_hash"].as_str().unwrap_or("").to_string();
-        log::info!("[Payment] sub #{} — sent. tx_id={}", subscription_id, tx_hash);
+        if tx_hash.is_empty() {
+            log::error!("[Payment] sub #{} — transfer returned no tx_hash. Full result: {:?}", subscription_id, resp["result"]);
+            return Err("transfer returned empty tx_hash".to_string());
+        }
+        log::info!("[Payment] sub #{} — SUCCESS. tx_hash={}...", subscription_id, &tx_hash[..12.min(tx_hash.len())]);
         Ok(serde_json::json!({ "tx_hash": tx_hash }))
     })
     .await
@@ -517,17 +537,28 @@ async fn refresh_balance(
     state: tauri::State<'_, Mutex<AppState>>,
     app_handle: tauri::AppHandle,
 ) -> Result<BalanceResponse, String> {
-    let (wallet_name, wallet_dir, password) = {
+    let (wallet_name, wallet_dir, password, rpc_busy) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Locked".into()); }
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
         let pw = s.session_password.clone().ok_or("No session")?;
-        (wn, wd, pw)
+        let busy = Arc::clone(&s.rpc_busy);
+        (wn, wd, pw, busy)
     };
 
+    // If a payment is in progress, skip this refresh rather than crashing the payment
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        log::warn!("[refresh_balance] RPC busy (payment in progress) — skipping refresh");
+        return Err("RPC busy".into());
+    }
+
     let (xmr, atomic) = tokio::task::spawn_blocking(move || {
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(rpc_busy);
+
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
@@ -958,6 +989,7 @@ pub fn run() {
                 session_password: None,
                 pending_deep_link: None,
                 last_payment_sent_at: None,
+                rpc_busy: Arc::new(AtomicBool::new(false)),
                 rpc: RpcManager::new(rpc_config),
             }));
 

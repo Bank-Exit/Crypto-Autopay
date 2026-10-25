@@ -539,6 +539,18 @@
         {/if}
       </div>
 
+      <!-- Mandatory scheduling fields -->
+      <div class="field-row">
+        <label class="field field-sm">
+          <span>{l("Nombre de paiements", "Number of payments")} <span class="hint">0 = {l("illimité","unlimited")}</span></span>
+          <input type="number" bind:value={payload.number_of_payments} min="0" step="1" />
+        </label>
+        <label class="field field-sm">
+          <span>{l("Date de début", "Start date")}</span>
+          <input type="date" bind:value={payload.start_date} />
+        </label>
+      </div>
+
       <!-- Advanced fields (collapsible) -->
       <button class="btn-toggle-advanced" type="button" on:click={() => showAdvanced = !showAdvanced}>
         {showAdvanced ? "▲" : "▼"} {l("Options avancées", "Advanced options")}
@@ -550,17 +562,6 @@
             <span>{l("Description", "Description")}</span>
             <textarea bind:value={payload.description} rows="2" placeholder={l("Détails de l'abonnement…", "Subscription details…")} />
           </label>
-
-          <div class="field-row">
-            <label class="field field-sm">
-              <span>{l("Nombre de paiements max", "Max payments")} <span class="hint">0={l("illimité","unlimited")}</span></span>
-              <input type="number" bind:value={payload.number_of_payments} min="0" step="1" />
-            </label>
-            <label class="field field-sm">
-              <span>{l("Date de début", "Start date")}</span>
-              <input type="date" bind:value={payload.start_date} />
-            </label>
-          </div>
 
           <label class="field field-sm">
             <span>{l("Période d'essai gratuit (jours)", "Free trial (days)")} <span class="hint">0={l("aucun","none")}</span></span>
