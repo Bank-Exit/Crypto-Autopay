@@ -187,21 +187,63 @@ async fn unlock_wallet(
         })?;
         log::info!("[Unlock/RPC] RPC endpoint ready");
 
-        let (address, balance) = if !wallet_exists {
-            log::info!("[Unlock/RPC] No .keys file found — calling restore_deterministic_wallet");
-            let addr = mgr.rpc_restore_wallet(&wn, &pw, &sd, 0).map_err(|e| {
+        // Compute a safe restore_height: current daemon height minus 24h buffer.
+        // 720 blocks ≈ 24 hours. Avoids scan-from-genesis (millions of blocks).
+        // Sufficient for recent deposits; users who had older funds will need a manual rescan.
+        let daemon_height = rpc_manager::get_daemon_block_height(&mgr.daemon_address());
+        let restore_height: u64 = if daemon_height > 720 { daemon_height - 720 } else { 0 };
+        log::info!("[Unlock/RPC] daemon_height={}, restore_height={}", daemon_height, restore_height);
+
+        // Cache file (no extension) and height-marker file paths.
+        let cache_file = wd.join(&wn);
+        let height_marker = wd.join(format!("{}.height", wn));
+        let cache_exists = cache_file.exists();
+
+        // Detect stale scan: if height_marker is missing or says "0", the wallet was created with
+        // restore_height=0 (old bug) — we must delete and recreate from a recent height.
+        let saved_height: u64 = std::fs::read_to_string(&height_marker)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let stale_scan = saved_height == 0 && cache_exists; // was scanned from genesis
+
+        let (address, balance) = if !wallet_exists || !cache_exists || stale_scan {
+            // Force fresh restore: delete both files so restore_deterministic_wallet can create cleanly.
+            if stale_scan {
+                log::warn!("[Unlock/RPC] Detected stale restore_height=0 — resetting wallet cache to height {}", restore_height);
+            } else if !wallet_exists {
+                log::info!("[Unlock/RPC] No .keys — fresh restore at height {}", restore_height);
+            } else {
+                log::info!("[Unlock/RPC] Cache missing — restore at height {}", restore_height);
+            }
+            // Delete both wallet files (restore_deterministic_wallet fails if they exist)
+            let _ = std::fs::remove_file(&cache_file);
+            let _ = std::fs::remove_file(wd.join(format!("{}.keys", wn)));
+            let addr = mgr.rpc_restore_wallet(&wn, &pw, &sd, restore_height).map_err(|e| {
                 let is_seed = e.contains("word list") || e.contains("Electrum") || e.contains("verification");
                 log::error!("[Unlock/RPC] restore failed (seed_invalid={}): {}", is_seed, e);
                 (e, is_seed)
             })?;
-            log::info!("[Unlock/RPC] Restore OK");
-            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or_else(|e| {
+            log::info!("[Unlock/RPC] Restore OK, address={}", &addr[..addr.len().min(12)]);
+            // Save height marker so we know this wallet was created with a good restore_height
+            let _ = std::fs::write(&height_marker, restore_height.to_string());
+            // Sync the ~720 blocks since restore_height — 180s timeout
+            log::info!("[Unlock/RPC] Syncing ~720 blocks from restore_height (first sync, ~47s on remote node)…");
+            match rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"sync","method":"refresh","params":{"start_height":0}
+            }), 180) {
+                Ok(r) => log::info!("[Unlock/RPC] Sync done: blocks_fetched={}, received_money={}",
+                    r["result"]["blocks_fetched"].as_u64().unwrap_or(0),
+                    r["result"]["received_money"].as_bool().unwrap_or(false)),
+                Err(e) => log::warn!("[Unlock/RPC] Sync failed (balance may be 0 temporarily): {}", e),
+            }
+            let bal = mgr.rpc_get_balance().map(|(t, _)| t).unwrap_or_else(|e| {
                 log::warn!("[Unlock/RPC] get_balance after restore failed: {}", e);
                 0.0
             });
             (addr, bal)
         } else {
-            log::info!("[Unlock/RPC] .keys file found — calling open_wallet");
+            log::info!("[Unlock/RPC] .keys + cache found (height={}) — calling open_wallet", saved_height);
             let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
                 "jsonrpc":"2.0","id":"open","method":"open_wallet",
                 "params":{"filename":wn,"password":pw}
@@ -389,15 +431,19 @@ async fn refresh_balance(
             log::warn!("[refresh_balance] open_wallet error: {}", err);
         }
 
-        // Trigger wallet refresh (sync with daemon) — may take a few seconds
-        log::info!("[refresh_balance] Calling wallet refresh…");
-        let refresh_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        // Trigger wallet refresh (sync with daemon) — 180s timeout (720 blocks ≈ 47s on remote node)
+        log::info!("[refresh_balance] Calling wallet refresh (may take up to ~2 min for first sync)…");
+        let refresh_resp = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"refresh","method":"refresh",
             "params":{"start_height":0}
-        }));
+        }), 180);
         match &refresh_resp {
-            Ok(r) => log::info!("[refresh_balance] refresh done: blocks_fetched={}", r["result"]["blocks_fetched"].as_u64().unwrap_or(0)),
-            Err(e) => log::warn!("[refresh_balance] refresh failed (non-fatal): {}", e),
+            Ok(r) => {
+                let fetched = r["result"]["blocks_fetched"].as_u64().unwrap_or(0);
+                let received = r["result"]["received_money"].as_bool().unwrap_or(false);
+                log::info!("[refresh_balance] Sync done: blocks_fetched={}, received_money={}", fetched, received);
+            }
+            Err(e) => log::warn!("[refresh_balance] refresh failed (non-fatal, will retry): {}", e),
         }
 
         let (total, _unlocked) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));

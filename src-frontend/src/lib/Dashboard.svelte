@@ -1189,7 +1189,7 @@
     <!-- ====== RECEIVE XMR ====== -->
     {:else if page === "receive"}
       <div class="page-header">
-        <h1>{$t.receiveTitle || 'Recevoir des XMR'}</h1>
+          <h1>{$t.receivePageTitle || 'Recevoir des XMR'}</h1>
         <p class="subs-subtitle">{$t.receiveDesc || 'Partagez cette adresse ou ce QR code pour recevoir des paiements Monero.'}</p>
       </div>
       <div class="receive-page">

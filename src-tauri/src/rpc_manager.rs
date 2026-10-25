@@ -370,9 +370,40 @@ pub fn ureq_post_json_pub(url: &str, body: &serde_json::Value) -> Result<serde_j
     ureq_post_json(url, body)
 }
 
+/// Same as ureq_post_json_pub but with a custom read timeout (use for long-running RPC calls like `refresh`).
+pub fn ureq_post_json_long(url: &str, body: &serde_json::Value, timeout_secs: u64) -> Result<serde_json::Value, String> {
+    ureq_post_json_timeout(url, body, timeout_secs)
+}
+
+/// Query the Monero daemon directly for the current blockchain height.
+/// Used to compute a sensible restore_height (recent) for new wallets.
+/// Falls back to 0 on error — caller should handle gracefully.
+pub fn get_daemon_block_height(daemon_addr: &str) -> u64 {
+    let url = format!("http://{}/json_rpc", daemon_addr);
+    log::info!("[RPC] Querying daemon block count from {}", daemon_addr);
+    match ureq_post_json(&url, &serde_json::json!({
+        "jsonrpc":"2.0","id":"h","method":"get_block_count"
+    })) {
+        Ok(r) => {
+            let count = r["result"]["count"].as_u64().unwrap_or(0);
+            log::info!("[RPC] Daemon block count: {}", count);
+            count
+        }
+        Err(e) => {
+            log::warn!("[RPC] Could not get daemon height: {} — restore_height will be 0", e);
+            0
+        }
+    }
+}
+
 /// Minimal synchronous HTTP POST helper using std::net::TcpStream.
 /// Avoids pulling in reqwest/tokio from this synchronous context.
 fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    ureq_post_json_timeout(url, body, 60)
+}
+
+/// Same as ureq_post_json but with a configurable read timeout.
+fn ureq_post_json_timeout(url: &str, body: &serde_json::Value, timeout_secs: u64) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
 
     let method_hint = body.get("method").and_then(|m| m.as_str()).unwrap_or("?");
@@ -395,7 +426,7 @@ fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         log::error!("[RPC/HTTP] {}", msg);
         msg
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
 
     stream.write_all(request.as_bytes()).map_err(|e| {
         let msg = format!("Write to {} failed: {}", host_port, e);

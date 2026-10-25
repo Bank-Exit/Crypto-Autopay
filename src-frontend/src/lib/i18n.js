@@ -144,7 +144,8 @@ const T = {
     paymentModeLabel: "Mode : {mode}",
 
     // Receive / Sweep
-    receiveTitle: "Recevoir des XMR",
+    receiveTitle: "Recharger le wallet",
+    receivePageTitle: "Recevoir des XMR",
     receiveDesc: "Partagez cette adresse ou ce QR code pour recevoir des paiements Monero.",
     receiveAddress: "Adresse de réception",
     receiveCopy: "Copier l'adresse",
@@ -330,7 +331,8 @@ const T = {
     subscriptionsCountPlural: "{n} subscriptions",
     paymentModeLabel: "Mode: {mode}",
 
-    receiveTitle: "Receive XMR",
+    receiveTitle: "Top up wallet",
+    receivePageTitle: "Receive XMR",
     receiveDesc: "Share this address or QR code to receive Monero payments.",
     receiveAddress: "Receive address",
     receiveCopy: "Copy address",
