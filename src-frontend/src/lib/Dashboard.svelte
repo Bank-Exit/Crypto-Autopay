@@ -193,10 +193,21 @@
   let showNewSubModal  = false;   // for "Nouvel abonnement" (mode="new")
   let showImportModal  = false;   // for "Importer un code" (mode="import")
   let importInitialCode = null;   // pre-filled code from deep link
+  let editingSubData   = null;    // pre-filled data for edit mode
 
   function openNewSubModal() {
     logInfo("Dashboard", "Opening manual-add modal (mode=new)");
     showImportModal = false;
+    editingSubData = null;
+    showNewSubModal = true;
+  }
+
+  async function openEditSubModal(sub) {
+    logInfo("Dashboard", `Opening edit modal for sub #${sub.id}`);
+    showImportModal = false;
+    showNewSubModal = false;
+    editingSubData = { ...sub };
+    await tick();
     showNewSubModal = true;
   }
 
@@ -222,6 +233,22 @@
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: null });
     addOrConfirmDuplicate(sub);
     showNewSubModal = false;
+    editingSubData = null;
+  }
+
+  async function onSubEdit({ detail }) {
+    const editId = editingSubData?.id;
+    if (!editId) { onSubNew({ detail }); return; }
+    const updated = payloadToSubscription({ ...detail.payload, _sourceCode: null });
+    updated.id = editId;
+    updated._db_id = editingSubData._db_id;
+    updated.payments_sent = editingSubData.payments_sent || 0;
+    updated.next_payment_at = editingSubData.next_payment_at;
+    updated.status = editingSubData.status;
+    subscriptions = subscriptions.map(s => s.id === editId ? updated : s);
+    logInfo("Dashboard", `Sub #${editId} updated`);
+    showNewSubModal = false;
+    editingSubData = null;
   }
 
   /**
@@ -341,9 +368,19 @@
   // ---- Payment scheduler (frontend-driven) ----
   let paymentInProgress = false;
 
+  // Monero 25-min minimum between sends
+  const MONERO_MIN_INTERVAL_MS = 25 * 60 * 1000;
+  let lastPaymentSentAt = null;
+
   async function checkDuePayments() {
     if (paymentInProgress) return;
     if (!walletAddress) return; // not unlocked
+    // Enforce 25-min cooldown
+    if (lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS) {
+      const remaining = Math.ceil((MONERO_MIN_INTERVAL_MS - (Date.now() - lastPaymentSentAt)) / 60000);
+      logInfo("Scheduler", `Monero 25-min cooldown: ${remaining}min remaining`);
+      return;
+    }
     const now = new Date();
     const due = subscriptions.filter(s => {
       if (!["Active", "Actif"].includes(s.status)) return false;
@@ -354,9 +391,21 @@
 
     logInfo("Scheduler", `${due.length} payment(s) due`);
     paymentInProgress = true;
-    for (const sub of due) {
-      await processPayment(sub);
+    // Only send one payment per cycle (Monero 25-min rule)
+    await processPayment(due[0]);
+    paymentInProgress = false;
+  }
+
+  async function triggerNow(sub) {
+    if (paymentInProgress) { alert("Un paiement est deja en cours"); return; }
+    if (lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS) {
+      const remaining = Math.ceil((MONERO_MIN_INTERVAL_MS - (Date.now() - lastPaymentSentAt)) / 60000);
+      alert(`Monero: attendre encore ${remaining} min (confirmations blocs)`);
+      return;
     }
+    paymentInProgress = true;
+    logInfo("Scheduler", `Manual trigger for sub #${sub.id}`);
+    await processPayment(sub);
     paymentInProgress = false;
   }
 
@@ -370,6 +419,7 @@
       });
       if (result?.tx_hash) {
         logInfo("Scheduler", `Payment sent for sub #${sub.id}`);
+        lastPaymentSentAt = Date.now();
         // Compute next occurrence
         const next = computeNextOccurrence(sub.schedule, sub.repeat_every || 1);
         sub.next_payment_at = next.toISOString();
@@ -639,7 +689,25 @@
   $: totalBalance = wallets.reduce((s, w) => s + parseFloat(w.balance), 0).toFixed(3);
   $: totalMonthlyOut = wallets.reduce((s, w) => s + (w.monthlyOut || 0), 0);
 
-  let nextPayment = { label: "Le Média Libre", amount: "0.05", in_days: 8 };
+  // Computed from actual subscriptions (reactive)
+  $: nextPayment = (() => {
+    const active = subscriptions.filter(s =>
+      ["Active", "Actif"].includes(s.status) && s.next_payment_at
+    );
+    if (!active.length) return null;
+    active.sort((a, b) => new Date(a.next_payment_at) - new Date(b.next_payment_at));
+    const soonest = active[0];
+    const ms = new Date(soonest.next_payment_at) - Date.now();
+    const days = Math.ceil(ms / 86400000);
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor(ms / 60000);
+    let label_time;
+    if (m < 60) label_time = `dans ${m} min`;
+    else if (h < 24) label_time = `dans ${h}h`;
+    else label_time = days <= 0 ? "maintenant" : `J-${days}`;
+    return { label: soonest.label, amount: soonest.amount, in_days: days, label_time, sub: soonest };
+  })();
+
   let page = "subscriptions";
 
   let editingWallet = null;
@@ -847,12 +915,14 @@
         </div>
       </div>
 
+      {#if nextPayment}
       <div class="next-banner card">
         <span class="text-muted">{$t.nextPayment}</span>
         <strong>{nextPayment.label}</strong>
         <span>{nextPayment.amount} {$currentNetwork.symbol}</span>
-        <span class="text-muted">{$t.inPrefix} {nextPayment.in_days} {$t.inDaysSuffix}</span>
+        <span class="text-muted">{nextPayment.label_time}</span>
       </div>
+      {/if}
 
       <!-- Refill estimate banner -->
       <div class="refill-banner card">
@@ -884,6 +954,8 @@
             await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: sub.status === "Paused" });
           }
         }}
+        on:trigger-now={e => triggerNow(e.detail.sub)}
+        on:edit-sub={e => openEditSubModal(e.detail.sub)}
       />
       <!-- Footer marketing + bottom spacer -->
       <div class="sub-footer">
@@ -1405,20 +1477,21 @@
 <!-- ===== "Nouvel abonnement" modal (manual form, mode="new") ===== -->
 {#if showNewSubModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showNewSubModal = false} role="dialog" aria-modal="true">
+  <div class="modal-backdrop" on:click={() => { showNewSubModal = false; editingSubData = null; }} role="dialog" aria-modal="true">
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">Nouvel abonnement</h2>
-        <button class="modal-close" on:click={() => showNewSubModal = false} aria-label="Fermer">✕</button>
+        <h2 class="modal-title">{editingSubData ? "Modifier l'abonnement" : "Nouvel abonnement"}</h2>
+        <button class="modal-close" on:click={() => { showNewSubModal = false; editingSubData = null; }} aria-label="Fermer">✕</button>
       </div>
       <div class="modal-body">
         <SubscriptionCodeEditor
           mode="new"
           compact={true}
           lang={$currentLang}
-          on:new-sub={onSubNew}
-          on:close={() => showNewSubModal = false}
+          editData={editingSubData}
+          on:new-sub={editingSubData ? onSubEdit : onSubNew}
+          on:close={() => { showNewSubModal = false; editingSubData = null; }}
         />
       </div>
     </div>

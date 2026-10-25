@@ -41,6 +41,8 @@ pub struct AppState {
     /// A deep-link URL waiting to be consumed by the frontend.
     /// Set when the app is launched/focused via a crypto-autopay: URI.
     pub pending_deep_link: Option<String>,
+    /// Timestamp (Unix seconds) of the last outgoing payment — enforces 25-min Monero cooldown.
+    pub last_payment_sent_at: Option<i64>,
     /// RPC process manager.
     pub rpc: RpcManager,
 }
@@ -166,6 +168,35 @@ async fn unlock_wallet(
         .to_string();
     let wallet_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
 
+    // Fast-path: if we have a cached address + valid height marker, skip RPC entirely.
+    // The background refresh (refresh_balance) will sync the balance.
+    let addr_cache_file = wallet_dir.join(format!("{}.address", wallet_name));
+    let height_marker_fast = wallet_dir.join(format!("{}.height", wallet_name));
+    let saved_height_fast: u64 = std::fs::read_to_string(&height_marker_fast)
+        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+
+    if let Some(cached_addr) = std::fs::read_to_string(&addr_cache_file).ok()
+        .map(|s| s.trim().to_string())
+        .filter(|a| a.len() > 90 && saved_height_fast > 0)
+    {
+        log::info!("[Unlock] Fast path: using cached address {}…", &cached_addr[..12]);
+        if let Ok(mut s) = state.lock() {
+            s.unlocked = true;
+            s.session_password = Some(password.clone());
+            s.wallet_address = Some(cached_addr.clone());
+            s.wallet_file_path = wallet_file_path.clone();
+            s.rpc_connected = false;
+            s.rpc_last_error = None;
+            s.balance_atomic = 0;
+        }
+        return Ok(UnlockResult {
+            address: cached_addr,
+            balance_xmr: 0.0,
+            rpc_error: None,
+            seed_invalid: false,
+        });
+    }
+
     // Try RPC session — non-fatal on failure
     log::info!("[Unlock] wallet_dir={:?}, wallet_exists={}, wallet_name={}", wallet_dir, wallet_exists, wallet_name);
     let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
@@ -282,6 +313,12 @@ async fn unlock_wallet(
         }
     };
 
+    // Cache address on disk so next unlock is instant (fast-path above)
+    if !address.is_empty() {
+        let _ = std::fs::write(&addr_cache_file, &address);
+        log::info!("[Unlock] Address cached to disk for fast future unlocks");
+    }
+
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
     s.session_password = Some(password);
@@ -289,6 +326,7 @@ async fn unlock_wallet(
     s.balance_atomic = (balance_xmr * 1e12) as u64;
     s.rpc_connected = rpc_error.is_none();
     s.rpc_last_error = rpc_error.clone();
+    s.wallet_file_path = wallet_file_path.clone();
 
     log::info!("[Unlock] Done. rpc_connected={}, seed_invalid={}", s.rpc_connected, seed_invalid);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
@@ -707,6 +745,159 @@ struct UnlockResult {
 //  App entry point
 // ============================================================
 
+/// Parse a CRON expression to its period in minutes (best effort).
+/// Supports: "0 */N * * * *" (every N min), "0 0 * * * *" (hourly), "0 0 H * * *" (daily).
+fn cron_period_minutes(cron: &str) -> i64 {
+    let parts: Vec<&str> = cron.trim().split_whitespace().collect();
+    // 6-field: sec min hour dom month dow
+    let min_field = if parts.len() >= 6 { parts[1] } else if parts.len() >= 5 { parts[0] } else { "*" };
+    let hour_field = if parts.len() >= 6 { parts[2] } else if parts.len() >= 5 { parts[1] } else { "*" };
+    if min_field.starts_with("*/") {
+        if let Ok(n) = min_field[2..].parse::<i64>() { return n.max(25); }
+    }
+    if min_field == "0" && hour_field == "*" { return 60; }      // hourly
+    if min_field == "0" { return 24 * 60; }                      // daily
+    30 * 24 * 60 // monthly fallback
+}
+
+/// Minimum interval between Monero sends (10 confirmations ≈ 20 min, use 25 min safely).
+const MONERO_MIN_SEND_INTERVAL_SECS: u64 = 25 * 60;
+
+/// Background scheduler: check for due subscriptions and send payments.
+/// Called every 60 seconds from a tokio::spawn task.
+async fn run_payment_scheduler(app: &tauri::AppHandle) {
+    use chrono::Utc;
+
+    let (session_pw, wallet_dir, wallet_name, last_sent) = {
+        let state = match app.try_state::<Mutex<AppState>>() {
+            Some(s) => s,
+            None => return,
+        };
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if !s.unlocked { return; }
+        let pw = match &s.session_password {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let dir = match app.path().app_data_dir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let name = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        let last = s.last_payment_sent_at;
+        (pw, dir, name, last)
+    };
+
+    // Enforce 25-minute minimum between Monero sends
+    if let Some(last) = last_sent {
+        let elapsed = Utc::now().timestamp() - last;
+        if elapsed < MONERO_MIN_SEND_INTERVAL_SECS as i64 {
+            log::debug!("[Scheduler] Monero 25-min cooldown: {}s remaining", MONERO_MIN_SEND_INTERVAL_SECS as i64 - elapsed);
+            return;
+        }
+    }
+
+    // Read due subscriptions from DB
+    let db_state = match app.try_state::<Mutex<Database>>() {
+        Some(s) => s,
+        None => return,
+    };
+    let subs = match db_state.lock() {
+        Ok(db) => match db.list_subscriptions() {
+            Ok(s) => s,
+            Err(e) => { log::warn!("[Scheduler] DB read failed: {}", e); return; }
+        },
+        Err(_) => return,
+    };
+
+    let now = Utc::now();
+    let due: Vec<_> = subs.into_iter().filter(|s| {
+        if s.status != autopay_core::models::SubscriptionStatus::Active { return false; }
+        // Check max_payments (stored in grace_period_hours field temporarily)
+        // TODO: add proper max_payments field to DB
+        if let Some(next) = s.next_payment_at {
+            next <= now
+        } else {
+            false
+        }
+    }).collect();
+
+    if due.is_empty() { return; }
+    log::info!("[Scheduler] {} subscription(s) due", due.len());
+
+    for sub in due {
+        let dest = sub.destination_address.clone();
+        let amount_pico = (sub.amount.parse::<f64>().unwrap_or(0.0) * 1e12) as u64;
+        let sub_id = sub.id.clone();
+
+        log::info!("[Scheduler] Sending payment for sub {}", sub_id);
+
+        let wallet_dir2 = wallet_dir.clone();
+        let wallet_name2 = wallet_name.clone();
+        let pw2 = session_pw.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+            mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
+            mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
+
+            let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"o","method":"open_wallet",
+                "params":{"filename":wallet_name2,"password":pw2}
+            })).map_err(|e| e.to_string())?;
+            if let Some(err) = open.get("error") {
+                return Err(format!("open_wallet: {}", err));
+            }
+
+            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"tx","method":"transfer",
+                "params":{
+                    "destinations":[{"amount": amount_pico, "address": dest}],
+                    "account_index": 0, "priority": 1
+                }
+            })).map_err(|e| e.to_string())?;
+            mgr.stop();
+
+            if let Some(err) = resp.get("error") {
+                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                return Err(format!("transfer error: {}", msg));
+            }
+            Ok(resp["result"]["tx_hash"].as_str().unwrap_or("").to_string())
+        }).await;
+
+        match result {
+            Ok(Ok(tx_hash)) => {
+                log::info!("[Scheduler] Payment sent for sub {} (tx={})", sub_id, tx_hash);
+                // Update last_payment_sent_at in AppState
+                if let Some(state) = app.try_state::<Mutex<AppState>>() {
+                    if let Ok(mut s) = state.lock() {
+                        s.last_payment_sent_at = Some(Utc::now().timestamp());
+                    }
+                }
+                // Update next_payment_at in DB — compute next occurrence
+                // For now, advance by the period using chrono; TODO: full CRON parsing
+                if let Some(next) = sub.next_payment_at {
+                    let period_min = cron_period_minutes(&sub.schedule);
+                    let new_next = next + chrono::Duration::minutes(period_min);
+                    if let Ok(db) = db_state.lock() {
+                        let _ = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1);
+                    }
+                }
+                // Emit event so frontend can refresh balance and subscription list
+                app.emit("payment-sent", serde_json::json!({"sub_id": sub_id})).ok();
+            }
+            Ok(Err(e)) => log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e),
+            Err(e) => log::error!("[Scheduler] Task panic for sub {}: {}", sub_id, e),
+        }
+        // Only send one payment per cycle to respect 25-min Monero rule
+        break;
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -766,6 +957,7 @@ pub fn run() {
                 rpc_last_error: None,
                 session_password: None,
                 pending_deep_link: None,
+                last_payment_sent_at: None,
                 rpc: RpcManager::new(rpc_config),
             }));
 
@@ -780,6 +972,21 @@ pub fn run() {
                     ])
                     .build(),
             )?;
+
+            // Background payment scheduler — runs every 60s, independent of UI
+            {
+                let sched_handle = app.handle().clone();
+                tokio::spawn(async move {
+                    // Wait 30s before first check (let app fully initialize)
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        run_payment_scheduler(&sched_handle).await;
+                    }
+                });
+            }
 
             // Deep link handler — listen for scheme events, store and re-emit to frontend
             let handle = app.handle().clone();

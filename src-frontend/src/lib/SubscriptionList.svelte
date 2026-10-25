@@ -1,9 +1,74 @@
 <script>
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount } from "svelte";
   import { t } from "./i18n.js";
   import { currentNetwork } from "./network.js";
 
   const dispatch = createEventDispatcher();
+
+  // Live clock for countdown timers
+  let now = new Date();
+  let clockInterval;
+  onMount(() => {
+    clockInterval = setInterval(() => { now = new Date(); }, 1000);
+    return () => clearInterval(clockInterval);
+  });
+
+  // Parse a 6-field CRON expression to period duration in ms.
+  // Supports every-N-minutes, hourly, daily, weekly, monthly.
+  function parsePeriodMs(cron) {
+    if (!cron) return null;
+    const parts = String(cron).trim().split(/\s+/);
+    let minF, hourF, domF;
+    if (parts.length === 6) [, minF, hourF, domF] = parts;
+    else if (parts.length === 5) [minF, hourF, domF] = parts;
+    else return null;
+
+    if (minF && minF.startsWith('*/')) return parseInt(minF.slice(2)) * 60 * 1000;
+    if (domF === '*' && hourF === '*') return 60 * 60 * 1000; // hourly
+    if (domF === '*') return 24 * 60 * 60 * 1000;             // daily
+    return 30 * 24 * 60 * 60 * 1000;                          // monthly fallback
+  }
+
+  /** Return remaining ms until next_payment_at (capped at periodMs) */
+  function remainingMs(sub, now) {
+    if (!sub.next_payment_at) return null;
+    const next = new Date(sub.next_payment_at);
+    return Math.max(0, next - now);
+  }
+
+  /** Human-readable countdown */
+  function countdownText(sub, now) {
+    const ms = remainingMs(sub, now);
+    if (ms === null) return null;
+    if (ms <= 0) return "Maintenant";
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `Dans ${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `Dans ${m}min`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `Dans ${h}h`;
+    const d = Math.floor(h / 24);
+    return `J-${d}`;
+  }
+
+  /** Fraction of period elapsed (0 = just paid, 1 = due now), for pie chart */
+  function pieFraction(sub, now) {
+    const rem = remainingMs(sub, now);
+    const period = parsePeriodMs(sub.raw_schedule || sub.schedule);
+    if (rem === null || !period) return 0;
+    return Math.min(1, Math.max(0, 1 - rem / period));
+  }
+
+  /** SVG pie arc path for a fraction 0–1 */
+  function piePath(f) {
+    const r = 10, cx = 12, cy = 12;
+    if (f >= 1) return `M${cx},${cy} m-${r},0 a${r},${r} 0 1 1 ${2*r},0 a${r},${r} 0 1 1 -${2*r},0`;
+    const angle = f * 2 * Math.PI;
+    const x = cx + r * Math.sin(angle);
+    const y = cy - r * Math.cos(angle);
+    const large = f > 0.5 ? 1 : 0;
+    return `M${cx},${cy} L${cx},${cy - r} A${r},${r} 0 ${large} 1 ${x},${y} Z`;
+  }
 
   // Kebab menu state
   let openMenuId = null;
@@ -26,6 +91,18 @@
   function togglePause(sub, event) {
     event.stopPropagation();
     dispatch("toggle-pause", { id: sub.id });
+    openMenuId = null;
+  }
+
+  function triggerNow(sub, event) {
+    event.stopPropagation();
+    dispatch("trigger-now", { sub });
+    openMenuId = null;
+  }
+
+  function editSub(sub, event) {
+    event.stopPropagation();
+    dispatch("edit-sub", { sub });
     openMenuId = null;
   }
 
@@ -143,6 +220,15 @@
                 <span class="text-muted">{$t.next}</span>
                 <strong>{formatDate(sub.next_payment_at)}</strong>
               </span>
+              <!-- Pie countdown timer -->
+              <span class="pie-wrap" title={countdownText(sub, now)}>
+                <svg width="24" height="24" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10" fill="var(--bg-sidebar)" stroke="var(--border)" stroke-width="1.5"/>
+                  <path d={piePath(pieFraction(sub, now))} fill="var(--accent)" opacity="0.8"/>
+                  <circle cx="12" cy="12" r="10" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+                </svg>
+                <span class="countdown-label">{countdownText(sub, now)}</span>
+              </span>
             {:else if isSuspended(sub)}
               <span class="badge badge-red suspended-badge">{$t.suspendedNoNext}</span>
             {/if}
@@ -164,11 +250,19 @@
             {#if openMenuId === sub.id}
               <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
               <div class="kebab-menu" on:click|stopPropagation>
-                <button class="kebab-item" on:click={e => togglePause(sub, e)}>
-                  {sub.status === "Paused" ? "▶ Reprendre" : "⏸ Pause"}
-                </button>
+                {#if !isSuspended(sub)}
+                  <button class="kebab-item kebab-trigger" on:click={e => triggerNow(sub, e)}>
+                    ▶ Declencher maintenant
+                  </button>
+                  <button class="kebab-item" on:click={e => editSub(sub, e)}>
+                    ✏ Modifier
+                  </button>
+                  <button class="kebab-item" on:click={e => togglePause(sub, e)}>
+                    {sub.status === "Paused" ? "▶ Reprendre" : "⏸ Pause"}
+                  </button>
+                {/if}
                 <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
-                  🗑 Supprimer
+                  Supprimer
                 </button>
               </div>
             {/if}
@@ -222,6 +316,16 @@
   }
 
   .suspended-badge { font-size: 11px; }
+
+  .pie-wrap {
+    display: flex; align-items: center; gap: 4px;
+    cursor: default;
+  }
+  .countdown-label {
+    font-size: 11px; color: var(--text-muted); white-space: nowrap;
+  }
+  .kebab-trigger { color: var(--accent); }
+  .kebab-trigger:hover { background: var(--accent-light); }
 
   .sub-actions { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; }
 

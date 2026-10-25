@@ -127,7 +127,6 @@ const SCHEDULE_LABELS = {
 
 /** Known preset schedules — 6-field Quartz cron (sec min hour dom month dow) */
 export const SCHEDULE_PRESETS = [
-  { id: "every10min", cron: "0 */10 * * * *", label_fr: "Toutes les 10 min", label_en: "Every 10 min", devOnly: true },
   { id: "every25min", cron: "0 */25 * * * *", label_fr: "Toutes les 25 min", label_en: "Every 25 min", devOnly: true },
   { id: "hourly",    cron: "0 0 * * * *",    label_fr: "Toutes les heures", label_en: "Hourly" },
   { id: "daily",     cron: "0 0 9 * * *",   label_fr: "Quotidien",      label_en: "Daily" },

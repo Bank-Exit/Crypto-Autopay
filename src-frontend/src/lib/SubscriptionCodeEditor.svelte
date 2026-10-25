@@ -24,6 +24,8 @@
   export let lang = "fr";
   /** Optional: pre-fill the import field with a code (from deep link) */
   export let initialCode = null;
+  /** Optional: pre-fill payload for editing an existing subscription */
+  export let editData = null;
   /**
    * Optional duplicate checker injected by parent.
    * (payload) => "exact" | "soft" | null
@@ -73,10 +75,21 @@
     currency: "XMR",
     schedule: "0 0 9 1 * *",
     repeat_every: 1,
-    number_of_payments: 0,
+    number_of_payments: 1,
     start_date: "",
     canary_url: "",
     trial_days: 0,
+    ...(editData ? {
+      custom_label: editData.label || editData.custom_label || "",
+      description: editData.description || "",
+      destination_address: editData.destination_address || editData.address || "",
+      amount: editData.amount || "",
+      currency: editData.currency || "XMR",
+      schedule: editData.raw_schedule || editData.schedule || "0 0 9 1 * *",
+      number_of_payments: editData.max_payments ?? editData.number_of_payments ?? 1,
+      start_date: editData.start_date || "",
+      canary_url: editData.canary_url || "",
+    } : {}),
   };
 
   let schedulePresetId = "monthly";
