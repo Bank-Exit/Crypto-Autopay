@@ -176,16 +176,16 @@
         {:else}
           {#each filteredLogs as log}
             <div class="log-line log-{log.level}">
-              <span class="log-time">{log.time}</span>
+              <span class="log-time">{log.t ? log.t.slice(11,19) : "??:??:??"}</span>
               <span class="log-mod">[{log.module}]</span>
-              <span class="log-msg">{log.message}</span>
+              <span class="log-msg">{log.msg}</span>
             </div>
           {/each}
         {/if}
       </div>
       <div class="logs-footer">
         <button on:click={() => {
-          const txt = filteredLogs.map(l => `${l.time} [${l.level}] [${l.module}] ${l.message}`).join('\n');
+          const txt = filteredLogs.map(l => `${l.t ? l.t.slice(11,19) : "??"} [${l.level}] [${l.module}] ${l.msg}`).join('\n');
           navigator.clipboard.writeText(txt).catch(() => {});
         }}>📋 Copier</button>
         <span class="logs-hint">Ces logs ne contiennent ni montant ni adresse.</span>

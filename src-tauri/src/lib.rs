@@ -144,48 +144,87 @@ async fn unlock_wallet(
     let wallet_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
 
     // Try RPC session — non-fatal on failure
+    log::info!("[Unlock] wallet_dir={:?}, wallet_exists={}, wallet_name={}", wallet_dir, wallet_exists, wallet_name);
     let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
+
     let rpc_result: Result<(String, f64), (String, bool)> = tokio::task::spawn_blocking(move || {
+        log::info!("[Unlock/RPC] spawn_blocking started");
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
-        mgr.start_for_dir(&wd).map_err(|e| (e, false))?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| (e, false))?;
+        log::info!("[Unlock/RPC] Using daemon: {}, port: {}", mgr.daemon_address(), mgr.config_port());
+
+        mgr.start_for_dir(&wd).map_err(|e| {
+            log::error!("[Unlock/RPC] start_for_dir failed: {}", e);
+            (e, false)
+        })?;
+
+        log::info!("[Unlock/RPC] Process spawned, waiting for RPC to be ready…");
+        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| {
+            log::error!("[Unlock/RPC] wait_for_ready timed out: {}", e);
+            (e, false)
+        })?;
+        log::info!("[Unlock/RPC] RPC endpoint ready");
 
         let (address, balance) = if !wallet_exists {
-            log::info!("Restoring wallet from seed…");
+            log::info!("[Unlock/RPC] No .keys file found — calling restore_deterministic_wallet");
             let addr = mgr.rpc_restore_wallet(&wn, &pw, &sd, 0).map_err(|e| {
                 let is_seed = e.contains("word list") || e.contains("Electrum") || e.contains("verification");
+                log::error!("[Unlock/RPC] restore failed (seed_invalid={}): {}", is_seed, e);
                 (e, is_seed)
             })?;
-            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or(0.0);
+            log::info!("[Unlock/RPC] Restore OK");
+            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or_else(|e| {
+                log::warn!("[Unlock/RPC] get_balance after restore failed: {}", e);
+                0.0
+            });
             (addr, bal)
         } else {
-            log::info!("Opening existing wallet…");
-            rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            log::info!("[Unlock/RPC] .keys file found — calling open_wallet");
+            let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
                 "jsonrpc":"2.0","id":"open","method":"open_wallet",
                 "params":{"filename":wn,"password":pw}
-            })).map_err(|e| (e, false))?;
-            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            })).map_err(|e| {
+                log::error!("[Unlock/RPC] open_wallet failed: {}", e);
+                (e, false)
+            })?;
+            if let Some(err) = open_resp.get("error") {
+                let msg = format!("open_wallet RPC error: {}", err);
+                log::error!("[Unlock/RPC] {}", msg);
+                return Err((msg, false));
+            }
+            log::info!("[Unlock/RPC] open_wallet OK — fetching address");
+            let addr_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
                 "jsonrpc":"2.0","id":"addr","method":"get_address",
                 "params":{"account_index":0}
-            })).map_err(|e| (e, false))?;
-            let addr = resp["result"]["address"].as_str().unwrap_or("").to_string();
-            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or(0.0);
+            })).map_err(|e| {
+                log::error!("[Unlock/RPC] get_address failed: {}", e);
+                (e, false)
+            })?;
+            let addr = addr_resp["result"]["address"].as_str().unwrap_or("").to_string();
+            log::info!("[Unlock/RPC] Address retrieved ({}…)", &addr[..addr.len().min(12)]);
+            let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or_else(|e| {
+                log::warn!("[Unlock/RPC] get_balance failed: {}", e);
+                0.0
+            });
             (addr, bal)
         };
+        log::info!("[Unlock/RPC] Session complete — stopping wallet-rpc");
         mgr.stop();
         Ok::<(String, f64), (String, bool)>((address, balance))
     })
     .await
-    .unwrap_or_else(|e| Err((format!("Task spawn error: {e}"), false)));
+    .unwrap_or_else(|e| {
+        log::error!("[Unlock/RPC] tokio spawn_blocking panicked: {}", e);
+        Err((format!("Internal task error: {e}"), false))
+    });
 
     let (address, balance_xmr, rpc_error, seed_invalid) = match rpc_result {
         Ok((addr, bal)) => {
             let prefix = if addr.len() > 12 { &addr[..12] } else { &addr };
-            log::info!("Wallet RPC OK. Address: {}…", prefix);
+            log::info!("[Unlock] RPC session OK. Address: {}…, balance: {} XMR", prefix, bal);
             (addr, bal, None, false)
         }
         Err((e, is_seed)) => {
-            log::warn!("Wallet RPC failed (non-fatal): {}", e);
+            log::warn!("[Unlock] RPC failed (non-fatal, degraded mode). seed_invalid={}: {}", is_seed, e);
             (String::new(), 0.0, Some(e), is_seed)
         }
     };

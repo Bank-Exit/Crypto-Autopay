@@ -287,21 +287,27 @@
   let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20, send_logs_enabled: false };
 
   async function loadRpcState() {
+    logInfo("RPC", "Fetching RPC status from backend…");
     const [status, binary, nodes] = await Promise.all([
       tauriInvoke("get_rpc_status"),
       tauriInvoke("detect_rpc_binary"),
       tauriInvoke("get_public_nodes"),
     ]);
-    rpcStatus = status?.toLowerCase?.() ?? "stopped";
-    rpcStatusLabel = status === "Running" ? "En marche" : status === "Starting" ? "Démarrage…" : status === "Stopped" ? "Arrêté" : "Erreur";
+    rpcStatus = (typeof status === "string" ? status : status?.toString?.() ?? "stopped").toLowerCase();
+    rpcStatusLabel = rpcStatus === "running" ? "En marche" : rpcStatus === "starting" ? "Démarrage…" : rpcStatus === "stopped" ? "Arrêté" : "Erreur";
     rpcBinaryPath = binary;
     publicNodes = nodes ?? [];
-    logInfo("RPC", `Status: ${status}, binary: ${binary ?? "not found"}`);
+    logInfo("RPC", `Status: ${JSON.stringify(status)}, binary: ${binary ?? "not found"}, nodes: ${nodes?.length ?? 0}`);
+    if (!binary) {
+      logWarn("RPC", "monero-wallet-rpc binary not found in PATH. Install the Monero CLI suite or set the path manually in Settings → RPC.");
+    }
   }
 
   async function saveRpcConfig() {
+    logInfo("RPC", `Saving config: node=${rpcConfig.daemon_address ?? "auto"}, port=${rpcConfig.rpc_port}`);
     const result = await tauriInvoke("save_rpc_config", { config: rpcConfig });
-    if (result === null) logInfo("RPC", "Config saved"); // null = Ok(())
+    if (result === null || result === undefined) logInfo("RPC", "Config saved OK");
+    else logWarn("RPC", `save_rpc_config returned: ${JSON.stringify(result)}`);
     await loadRpcState();
   }
 

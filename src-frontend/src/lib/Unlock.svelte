@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme, toggleTheme } from "./theme.js";
+  import { logInfo, logWarn, logError } from "./AppLogger.js";
 
   const dispatch = createEventDispatcher();
 
@@ -18,23 +19,28 @@
     error = "";
     rpcWarning = null;
     loadingMsg = "Déverrouillage…";
+    logInfo("Unlock", "unlock_wallet invoked");
     try {
       const result = await invoke("unlock_wallet", { password });
-      // result = { address, balance_xmr, rpc_error, seed_invalid }
+      logInfo("Unlock", `unlock_wallet returned: address=${result.address ? result.address.slice(0,12)+"…" : "none"}, balance=${result.balance_xmr}, seed_invalid=${result.seed_invalid}, rpc_error=${result.rpc_error ?? "none"}`);
+
       if (result.rpc_error) {
         if (result.seed_invalid) {
+          logError("Unlock", `Seed invalid: ${result.rpc_error}`);
           rpcWarning = { type: "seed_invalid", raw: result.rpc_error };
         } else {
+          logWarn("Unlock", `RPC unavailable (offline mode): ${result.rpc_error}`);
           rpcWarning = { type: "network", raw: result.rpc_error };
         }
         loading = false;
-        // Still dispatch unlocked — user can use the app without RPC
         dispatch("unlocked", { address: result.address, balance: result.balance_xmr, rpcError: result.rpc_error });
       } else {
+        logInfo("Unlock", "Unlock OK — dispatching to dashboard");
         dispatch("unlocked", { address: result.address, balance: result.balance_xmr });
       }
     } catch (e) {
       const msg = typeof e === "string" ? e : String(e);
+      logError("Unlock", `unlock_wallet threw: ${msg}`);
       error = msg.includes("Incorrect") ? "Mot de passe incorrect." : msg;
       loading = false;
     }

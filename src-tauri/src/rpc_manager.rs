@@ -103,6 +103,9 @@ impl RpcManager {
             .unwrap_or_else(|| PUBLIC_NODES[0].to_string())
     }
 
+    /// Expose local RPC port for logging.
+    pub fn config_port(&self) -> u16 { self.config.rpc_port }
+
     /// Start the wallet-rpc process.
     /// `wallet_file`: path to the wallet file (without extension).
     /// `wallet_password`: wallet password.
@@ -153,67 +156,123 @@ impl RpcManager {
     }
 
     /// Start wallet-rpc in wallet-dir mode (no specific wallet pre-loaded).
-    /// Used before calling `restore_deterministic_wallet` via RPC.
+    /// Logs every step so failures are diagnosable.
     pub fn start_for_dir(&mut self, wallet_dir: &Path) -> Result<(), String> {
         if matches!(self.status, RpcStatus::Running) {
+            log::info!("[RPC] start_for_dir: already running, skipping");
             return Ok(());
         }
-        let binary = self.detect_binary()
-            .ok_or_else(|| "monero-wallet-rpc not found.".to_string())?;
 
-        let daemon_addr = self.daemon_address();
+        // --- 1. Binary detection ---
+        let binary = match self.detect_binary() {
+            Some(b) => {
+                log::info!("[RPC] Binary found: {:?}", b);
+                b
+            }
+            None => {
+                let msg = "monero-wallet-rpc not found in PATH and no custom path configured. \
+                           Install the Monero CLI tools or set the binary path in Settings.";
+                log::error!("[RPC] {}", msg);
+                return Err(msg.to_string());
+            }
+        };
+
+        // --- 2. Port availability check ---
         let port = self.config.rpc_port;
+        let addr_str = format!("127.0.0.1:{}", port);
+        if std::net::TcpStream::connect_timeout(
+            &addr_str.parse().unwrap(),
+            Duration::from_millis(100),
+        ).is_ok() {
+            log::warn!("[RPC] Port {} already in use — killing stale process", port);
+            // Try to kill whatever is on that port
+            let _ = Command::new("fuser").args(["-k", &format!("{}/tcp", port)]).status();
+            std::thread::sleep(Duration::from_millis(500));
+        }
 
-        log::info!("Starting wallet-rpc in dir mode: wallet_dir={:?}, daemon={}, port={}", wallet_dir, daemon_addr, port);
+        // --- 3. Daemon address ---
+        let daemon_addr = self.daemon_address();
+        log::info!("[RPC] Daemon node: {}", daemon_addr);
+
+        // --- 4. Wallet dir ---
+        log::info!("[RPC] Wallet dir: {:?} (exists={})", wallet_dir, wallet_dir.exists());
+        if !wallet_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(wallet_dir) {
+                log::error!("[RPC] Could not create wallet dir: {}", e);
+                return Err(format!("Cannot create wallet dir: {e}"));
+            }
+        }
+
+        // --- 5. Spawn ---
+        let args = [
+            "--daemon-address", &daemon_addr,
+            "--rpc-bind-ip", "127.0.0.1",
+            "--rpc-bind-port", &port.to_string(),
+            "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
+            "--disable-rpc-login",
+            "--log-level", "1",
+            "--non-interactive",
+        ];
+        log::info!("[RPC] Spawning: {:?} {:?}", binary, args);
         self.status = RpcStatus::Starting;
 
         let child = Command::new(&binary)
-            .args([
-                "--daemon-address", &daemon_addr,
-                "--rpc-bind-ip", "127.0.0.1",
-                "--rpc-bind-port", &port.to_string(),
-                "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
-                "--disable-rpc-login",
-                "--log-level", "1",
-                "--non-interactive",
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to spawn wallet-rpc: {e}"))?;
+            .map_err(|e| {
+                let msg = format!("Failed to spawn {:?}: {} — check binary permissions", binary, e);
+                log::error!("[RPC] {}", msg);
+                msg
+            })?;
 
+        log::info!("[RPC] Process spawned, PID={:?}", child.id());
         self.process = Some(child);
         self.status = RpcStatus::Running;
-        log::info!("wallet-rpc (dir mode) started on 127.0.0.1:{}", port);
         Ok(())
     }
 
-    /// Wait for the RPC endpoint to be reachable (up to `timeout`).
+    /// Wait for the local RPC endpoint to accept TCP connections.
     pub fn wait_for_ready(&self, timeout: Duration) -> Result<(), String> {
-        let url = self.rpc_url();
+        let addr_str = format!("127.0.0.1:{}", self.config.rpc_port);
         let deadline = Instant::now() + timeout;
+        let mut attempts = 0u32;
+
+        log::info!("[RPC] Waiting for local RPC on {} (timeout={}s)…", addr_str, timeout.as_secs());
+
         loop {
-            // Simple TCP connect check (fast, no HTTP overhead)
-            let addr = format!("127.0.0.1:{}", self.config.rpc_port);
-            if std::net::TcpStream::connect_timeout(
-                &addr.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
+            attempts += 1;
+            match std::net::TcpStream::connect_timeout(
+                &addr_str.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
                 Duration::from_millis(200),
-            ).is_ok() {
-                // Give the RPC server a moment to initialise after TCP accepts
-                std::thread::sleep(Duration::from_millis(300));
-                log::info!("wallet-rpc is ready at {}", url);
-                return Ok(());
+            ) {
+                Ok(_) => {
+                    // Extra wait for the RPC server to fully initialise
+                    std::thread::sleep(Duration::from_millis(400));
+                    log::info!("[RPC] Ready after {} attempt(s)", attempts);
+                    return Ok(());
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        let msg = format!(
+                            "wallet-rpc not ready after {}s ({} attempts). Last TCP error: {}. \
+                             Possible causes: binary crash, port conflict, missing lib.",
+                            timeout.as_secs(), attempts, e
+                        );
+                        log::error!("[RPC] {}", msg);
+                        return Err(msg);
+                    }
+                    if attempts % 10 == 0 {
+                        log::warn!("[RPC] Still waiting… attempt {}, error: {}", attempts, e);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
-            if Instant::now() >= deadline {
-                return Err(format!("wallet-rpc did not become ready within {}s", timeout.as_secs()));
-            }
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
-    /// Restore a wallet from a seed phrase using the `restore_deterministic_wallet` RPC.
-    /// Requires the RPC to already be running in wallet-dir mode.
-    /// Returns the restored wallet address.
+    /// Restore a wallet from a seed phrase via the `restore_deterministic_wallet` RPC.
     pub fn rpc_restore_wallet(
         &self,
         wallet_name: &str,
@@ -222,30 +281,53 @@ impl RpcManager {
         restore_height: u64,
     ) -> Result<String, String> {
         let url = self.rpc_url();
+        let word_count = seed_phrase.split_whitespace().count();
+        log::info!("[RPC] restore_deterministic_wallet: name={}, restore_height={}, seed_words={}", wallet_name, restore_height, word_count);
+
         let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "restore",
+            "jsonrpc": "2.0", "id": "restore",
             "method": "restore_deterministic_wallet",
             "params": {
-                "filename": wallet_name,
-                "password": wallet_password,
-                "seed": seed_phrase,
-                "restore_height": restore_height,
+                "filename": wallet_name, "password": wallet_password,
+                "seed": seed_phrase, "restore_height": restore_height,
                 "autosave_current": true
             }
         });
 
-        // Synchronous HTTP POST (blocking) — called from a Tauri command (async ctx)
-        let response: serde_json::Value = ureq_post_json(&url, &body)?;
+        let response = ureq_post_json(&url, &body).map_err(|e| {
+            let msg = format!("HTTP POST to {} failed: {}", url, e);
+            log::error!("[RPC] {}", msg);
+            msg
+        })?;
+
+        log::debug!("[RPC] restore response: {}", response);
 
         if let Some(err) = response.get("error") {
-            return Err(format!("RPC error: {}", err));
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            let detail = if message.contains("word list") || message.contains("Electrum") {
+                "Seed checksum invalid — seed was generated with an older/buggy app version. \
+                 Reset your wallet and create a new one."
+            } else if message.contains("already exists") {
+                "Wallet file already exists. This is unexpected — it may have been partially created."
+            } else {
+                message
+            };
+            let msg = format!("RPC restore_deterministic_wallet failed (code {}): {} — {}", code, message, detail);
+            log::error!("[RPC] {}", msg);
+            return Err(msg);
         }
+
         let address = response["result"]["address"]
             .as_str()
-            .ok_or_else(|| "No address in restore response".to_string())?
+            .ok_or_else(|| {
+                let msg = format!("No 'address' in restore response. Full response: {}", response);
+                log::error!("[RPC] {}", msg);
+                msg
+            })?
             .to_string();
-        log::info!("Wallet restored. Address: {}", address);
+
+        log::info!("[RPC] Wallet restored successfully. Address prefix: {}…", &address[..address.len().min(12)]);
         Ok(address)
     }
 
@@ -253,19 +335,24 @@ impl RpcManager {
     /// Returns (total_balance_xmr, unlocked_balance_xmr).
     pub fn rpc_get_balance(&self) -> Result<(f64, f64), String> {
         let url = self.rpc_url();
+        log::info!("[RPC] Calling get_balance…");
         let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "balance",
+            "jsonrpc": "2.0", "id": "balance",
             "method": "get_balance",
             "params": { "account_index": 0 }
         });
-        let response: serde_json::Value = ureq_post_json(&url, &body)?;
+        let response = ureq_post_json(&url, &body).map_err(|e| {
+            log::error!("[RPC] get_balance HTTP error: {}", e);
+            e
+        })?;
         if let Some(err) = response.get("error") {
-            return Err(format!("RPC error: {}", err));
+            let msg = format!("get_balance RPC error: {}", err);
+            log::error!("[RPC] {}", msg);
+            return Err(msg);
         }
-        let atomic = response["result"]["balance"].as_u64().unwrap_or(0);
+        let atomic   = response["result"]["balance"].as_u64().unwrap_or(0);
         let unlocked = response["result"]["unlocked_balance"].as_u64().unwrap_or(0);
-        // Monero: 1 XMR = 1_000_000_000_000 atomic units (piconero)
+        log::info!("[RPC] Balance: total={} pico, unlocked={} pico", atomic, unlocked);
         Ok((atomic as f64 / 1e12, unlocked as f64 / 1e12))
     }
 
@@ -288,7 +375,10 @@ pub fn ureq_post_json_pub(url: &str, body: &serde_json::Value) -> Result<serde_j
 fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
 
-    // Parse host and path from URL (http://127.0.0.1:PORT/json_rpc)
+    let method_hint = body.get("method").and_then(|m| m.as_str()).unwrap_or("?");
+    log::debug!("[RPC/HTTP] POST {} method={}", url, method_hint);
+
+    // Parse host and path
     let without_scheme = url.trim_start_matches("http://");
     let slash_pos = without_scheme.find('/').unwrap_or(without_scheme.len());
     let host_port = &without_scheme[..slash_pos];
@@ -300,21 +390,38 @@ fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         body_str.len()
     );
 
-    let mut stream = std::net::TcpStream::connect(host_port)
-        .map_err(|e| format!("Cannot connect to wallet-rpc: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    stream.write_all(request.as_bytes())
-        .map_err(|e| format!("Write error: {e}"))?;
+    let mut stream = std::net::TcpStream::connect(host_port).map_err(|e| {
+        let msg = format!("TCP connect to {} failed: {} (is wallet-rpc running?)", host_port, e);
+        log::error!("[RPC/HTTP] {}", msg);
+        msg
+    })?;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+
+    stream.write_all(request.as_bytes()).map_err(|e| {
+        let msg = format!("Write to {} failed: {}", host_port, e);
+        log::error!("[RPC/HTTP] {}", msg);
+        msg
+    })?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)
-        .map_err(|e| format!("Read error: {e}"))?;
+    stream.read_to_string(&mut response).map_err(|e| {
+        let msg = format!("Read from {} failed: {}", host_port, e);
+        log::error!("[RPC/HTTP] {}", msg);
+        msg
+    })?;
 
-    // Split headers from body
-    let body_start = response.find("\r\n\r\n")
-        .ok_or("Malformed HTTP response")?;
+    let body_start = response.find("\r\n\r\n").ok_or_else(|| {
+        let msg = format!("Malformed HTTP response (no header/body separator). Raw: {}", &response[..response.len().min(200)]);
+        log::error!("[RPC/HTTP] {}", msg);
+        msg
+    })?;
     let json_body = &response[body_start + 4..];
 
-    serde_json::from_str(json_body)
-        .map_err(|e| format!("JSON parse error: {e} — body: {json_body}"))
+    log::debug!("[RPC/HTTP] Response body ({}B): {}", json_body.len(), &json_body[..json_body.len().min(300)]);
+
+    serde_json::from_str(json_body).map_err(|e| {
+        let msg = format!("JSON parse error: {} — body: {}", e, &json_body[..json_body.len().min(300)]);
+        log::error!("[RPC/HTTP] {}", msg);
+        msg
+    })
 }
