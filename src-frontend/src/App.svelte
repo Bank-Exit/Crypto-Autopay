@@ -7,7 +7,7 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
-  import { subscribeToLogs } from "./lib/AppLogger.js";
+  import { subscribeToLogs, logInfo, logWarn, logError } from "./lib/AppLogger.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
   let appState = "checking";
@@ -20,8 +20,22 @@
   $: filteredLogs = logFilter === "all" ? liveLogs
     : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"));
 
-  onMount(() => {
-    const unsub = subscribeToLogs(entries => { liveLogs = [...entries].reverse(); });
+  onMount(async () => {
+    const unsub = subscribeToLogs(entries => { liveLogs = [...entries]; });
+
+    // Forward Rust log events (tauri-plugin-log webview target) into AppLogger
+    try {
+      const { attachLogger } = await import("@tauri-apps/plugin-log");
+      await attachLogger(({ level, message, location }) => {
+        const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
+        if (level >= 4) logError(mod, message);      // ERROR = 4
+        else if (level >= 3) logWarn(mod, message);  // WARN  = 3
+        else logInfo(mod, message);                  // INFO  = 2, DEBUG = 1
+      });
+    } catch (e) {
+      // In browser dev mode tauri-plugin-log is not available — ignore
+    }
+
     return unsub;
   });
 
@@ -159,7 +173,7 @@
 
   <!-- Logs drawer -->
   {#if showLogs}
-    <div class="logs-overlay" on:click={() => showLogs = false}></div>
+    <div class="logs-overlay" role="button" tabindex="-1" aria-label="Fermer les logs" on:click={() => showLogs = false} on:keydown={e => e.key === 'Escape' && (showLogs = false)}></div>
     <div class="logs-drawer">
       <div class="logs-header">
         <span>📋 Logs techniques</span>

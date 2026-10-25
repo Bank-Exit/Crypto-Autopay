@@ -312,27 +312,104 @@
   }
 
   // ---- Load persisted subscriptions from SQLite on mount ----
-  // Balance display (refreshed at unlock + every 5min)
-  let balanceXmr = null; // null = not loaded, 0 = loaded but empty
+  // ---- Wallet / RPC state ----
+  let balanceXmr = null;        // null = not loaded yet
   let balanceLoading = false;
+  let rpcOk = null;             // null=unknown, true=connected, false=error
+  let rpcError = null;          // last error string
+  let walletAddress = null;
 
-  async function loadBalance() {
+  // RPC state → user-friendly diagnosis
+  function rpcDiagnosis(err) {
+    if (!err) return null;
+    if (err.includes("word list") || err.includes("Electrum") || err.includes("checksum")) {
+      return {
+        icon: "🔴", level: "error",
+        title: "Seed de récupération invalide",
+        detail: "Votre phrase secrète a été créée avec une ancienne version bugguée. L'app tente de la corriger automatiquement au prochain déverrouillage.",
+        action: "reset",
+        actionLabel: "Réinitialiser le wallet",
+      };
+    }
+    if (err.includes("not found") || err.includes("PATH") || err.includes("binary")) {
+      return {
+        icon: "🔴", level: "error",
+        title: "Outil Monero introuvable",
+        detail: "monero-wallet-rpc n'est pas installé ou n'est pas dans le PATH. Installez les outils Monero CLI.",
+        action: "settings",
+        actionLabel: "Configurer dans Paramètres",
+        link: "https://getmonero.org/downloads/",
+        linkLabel: "Télécharger Monero CLI",
+      };
+    }
+    if (err.includes("timeout") || err.includes("not ready") || err.includes("attempt")) {
+      return {
+        icon: "🟠", level: "warn",
+        title: "monero-wallet-rpc n'a pas démarré",
+        detail: "Le processus s'est lancé mais n'a pas répondu dans les 15 secondes. Vérifiez qu'aucun autre processus n'utilise le port 18083.",
+        action: "retry",
+        actionLabel: "Réessayer",
+      };
+    }
+    if (err.includes("connect") || err.includes("TCP") || err.includes("Connexion refusée")) {
+      return {
+        icon: "🟠", level: "warn",
+        title: "Connexion au nœud Monero impossible",
+        detail: "Impossible de joindre le nœud distant. Vérifiez votre connexion internet ou changez de nœud dans les Paramètres.",
+        action: "settings",
+        actionLabel: "Changer de nœud",
+      };
+    }
+    if (err.includes("Task spawn") || err.includes("Internal task")) {
+      return {
+        icon: "🔴", level: "error",
+        title: "Erreur interne",
+        detail: "Une erreur inattendue s'est produite. Copiez les logs et signalez-la.",
+        action: "logs",
+        actionLabel: "Copier les logs",
+      };
+    }
+    return {
+      icon: "🟠", level: "warn",
+      title: "RPC indisponible",
+      detail: err.length > 120 ? err.slice(0, 120) + "…" : err,
+      action: "settings",
+      actionLabel: "Voir Paramètres",
+    };
+  }
+
+  async function loadWalletInfo() {
     balanceLoading = true;
     try {
-      const b = await tauriInvoke("get_balance");
-      if (b) balanceXmr = b.xmr;
-    } catch (_) {}
+      const info = await tauriInvoke("get_wallet_info");
+      if (info) {
+        balanceXmr = info.balance_xmr ?? 0;
+        rpcOk = info.rpc_connected;
+        rpcError = info.rpc_last_error ?? null;
+        walletAddress = info.address ?? null;
+        logInfo("Dashboard", `Wallet info: rpc_ok=${rpcOk}, balance=${balanceXmr} XMR${rpcError ? ", error=" + rpcError.slice(0, 80) : ""}`);
+      }
+    } catch (e) {
+      logWarn("Dashboard", `get_wallet_info failed: ${e}`);
+    }
     balanceLoading = false;
   }
 
   async function refreshBalance() {
     balanceLoading = true;
+    logInfo("Dashboard", "Refreshing balance via RPC…");
     try {
       const b = await tauriInvoke("refresh_balance");
-      if (b) balanceXmr = b.xmr;
-      logInfo("Dashboard", "Balance refreshed");
+      if (b) {
+        balanceXmr = b.xmr;
+        rpcOk = true;
+        rpcError = null;
+        logInfo("Dashboard", `Balance refreshed: ${b.xmr} XMR`);
+      }
     } catch (e) {
-      logWarn("Dashboard", "Balance refresh failed (offline?)");
+      rpcOk = false;
+      rpcError = String(e);
+      logWarn("Dashboard", `Balance refresh failed: ${e}`);
     }
     balanceLoading = false;
   }
@@ -354,8 +431,8 @@
       }
     }
 
-    // Load cached balance, then schedule refresh every 5 min
-    await loadBalance();
+    // Load wallet info (balance + RPC status), then schedule refresh every 5 min
+    await loadWalletInfo();
     const balanceTimer = setInterval(refreshBalance, 5 * 60 * 1000);
     return () => clearInterval(balanceTimer);
   });
@@ -506,10 +583,18 @@
       </button>
     </nav>
 
-    <!-- Total balance (real from RPC, refreshed every 5min) -->
+    <!-- Balance card: arbre complet des états RPC -->
     <div class="sidebar-balance card">
       <div class="balance-label">
-        {$t.balance}
+        <!-- RPC status dot -->
+        {#if rpcOk === null}
+          <span class="rpc-dot dot-unknown" title="Vérification en cours…">●</span>
+        {:else if rpcOk}
+          <span class="rpc-dot dot-ok" title="Connecté au réseau Monero">●</span>
+        {:else}
+          <span class="rpc-dot dot-err" title="RPC indisponible">●</span>
+        {/if}
+        Solde
         <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title="Actualiser le solde">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
                stroke-linecap="round" stroke-linejoin="round"
@@ -519,15 +604,47 @@
           </svg>
         </button>
       </div>
+
       {#if balanceXmr === null}
-        <div class="balance-amount text-muted" style="font-size:14px">Chargement…</div>
-      {:else}
-        <div class="balance-amount text-accent">
-          {balanceXmr.toFixed(4)} {$currentNetwork.symbol}
-        </div>
+        <div class="balance-amount" style="font-size:13px;color:var(--text-muted)">Chargement…</div>
+
+      {:else if rpcOk}
+        <!-- Connected: just show the balance -->
+        <div class="balance-amount text-accent">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
         {#if balanceXmr === 0}
-          <div class="balance-hint">Solde nul ou RPC indisponible</div>
+          <div class="balance-hint">Wallet vide — rechargez-le en Monero pour commencer.</div>
         {/if}
+
+      {:else if rpcOk === false}
+        <!-- RPC failed: show balance anyway + diagnosis -->
+        <div class="balance-amount" style="color:var(--text-muted)">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
+        {#if rpcError}
+          {@const diag = rpcDiagnosis(rpcError)}
+          {#if diag}
+            <div class="rpc-diag rpc-diag-{diag.level}">
+              <div class="rpc-diag-title">{diag.icon} {diag.title}</div>
+              <div class="rpc-diag-detail">{diag.detail}</div>
+              <div class="rpc-diag-actions">
+                {#if diag.action === "settings"}
+                  <button class="rpc-diag-btn" on:click={() => page = "settings"}>⚙️ {diag.actionLabel}</button>
+                {:else if diag.action === "retry"}
+                  <button class="rpc-diag-btn" on:click={refreshBalance} disabled={balanceLoading}>↻ {diag.actionLabel}</button>
+                {:else if diag.action === "reset"}
+                  <button class="rpc-diag-btn rpc-diag-btn-danger">⚠️ {diag.actionLabel}</button>
+                {/if}
+                {#if diag.link}
+                  <a href={diag.link} class="rpc-diag-link" target="_blank">{diag.linkLabel} ↗</a>
+                {/if}
+              </div>
+            </div>
+          {/if}
+        {:else}
+          <div class="balance-hint">Solde non actualisé — <button class="btn-inline" on:click={refreshBalance}>Réessayer</button></div>
+        {/if}
+
+      {:else}
+        <!-- rpcOk === null: never tried (fresh launch before unlock) -->
+        <div class="balance-amount text-muted" style="font-size:13px">—</div>
       {/if}
     </div>
   </aside>
@@ -1166,6 +1283,34 @@
   .refresh-btn:disabled { opacity: 0.4; cursor: default; }
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
   .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
+  .btn-inline { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 10px; padding: 0; text-decoration: underline; }
+
+  /* RPC dot indicator */
+  .rpc-dot { font-size: 10px; line-height: 1; }
+  .dot-unknown { color: #9ca3af; }
+  .dot-ok { color: #22c55e; }
+  .dot-err { color: #f59e0b; animation: pulse-dot 2s ease-in-out infinite; }
+  @keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+  /* RPC diagnosis panel */
+  .rpc-diag {
+    margin-top: 4px; border-radius: 6px; padding: 7px 9px;
+    font-size: 10px; line-height: 1.45;
+    border-left: 3px solid;
+  }
+  .rpc-diag-warn { background: #fffbeb; border-color: #f59e0b; color: #92400e; }
+  .rpc-diag-error { background: #fef2f2; border-color: #ef4444; color: #7f1d1d; }
+  .rpc-diag-title { font-weight: 700; margin-bottom: 3px; }
+  .rpc-diag-detail { opacity: 0.85; margin-bottom: 6px; }
+  .rpc-diag-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+  .rpc-diag-btn {
+    border: 1px solid currentColor; border-radius: 4px; background: none;
+    color: inherit; font-size: 10px; padding: 2px 7px; cursor: pointer; opacity: 0.9;
+  }
+  .rpc-diag-btn:hover { opacity: 1; background: #0001; }
+  .rpc-diag-btn-danger { border-color: #ef4444; color: #ef4444; }
+  .rpc-diag-link { font-size: 10px; color: inherit; opacity: 0.75; }
+
   @keyframes spin { to { transform: rotate(360deg); } }
   .balance-wallets { display: flex; flex-direction: column; gap: 3px; }
   .balance-sub { display: flex; align-items: center; gap: 5px; font-size: 10.5px; }

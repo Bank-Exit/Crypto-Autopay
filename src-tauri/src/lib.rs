@@ -31,6 +31,10 @@ pub struct AppState {
     pub wallet_address: Option<String>,
     /// Cached XMR balance (piconero units, refreshed at unlock time).
     pub balance_atomic: u64,
+    /// Whether the last RPC session succeeded (used for UI status dot).
+    pub rpc_connected: bool,
+    /// Last RPC error message (None = no error or not yet tried).
+    pub rpc_last_error: Option<String>,
     /// Wallet password stored in memory for this session (for balance refresh).
     /// Cleared when the app is locked.
     pub session_password: Option<String>,
@@ -253,9 +257,25 @@ async fn unlock_wallet(
     s.session_password = Some(password);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
     s.balance_atomic = (balance_xmr * 1e12) as u64;
+    s.rpc_connected = rpc_error.is_none();
+    s.rpc_last_error = rpc_error.clone();
 
-    log::info!("Wallet unlocked (rpc_error={:?}, seed_invalid={})", rpc_error, seed_invalid);
+    log::info!("[Unlock] Done. rpc_connected={}, seed_invalid={}", s.rpc_connected, seed_invalid);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
+}
+
+/// Get full wallet+RPC info: balance, address, connection status, last error.
+#[tauri::command]
+async fn get_wallet_info(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "unlocked": s.unlocked,
+        "address": s.wallet_address,
+        "balance_xmr": s.balance_atomic as f64 / 1e12,
+        "balance_atomic": s.balance_atomic,
+        "rpc_connected": s.rpc_connected,
+        "rpc_last_error": s.rpc_last_error,
+    }))
 }
 
 /// Get the cached wallet balance (set at unlock time, refreshed by refresh_balance).
@@ -535,18 +555,24 @@ pub fn run() {
                 unlocked: false,
                 wallet_address: None,
                 balance_atomic: 0,
+                rpc_connected: false,
+                rpc_last_error: None,
                 session_password: None,
                 pending_deep_link: None,
                 rpc: RpcManager::new(rpc_config),
             }));
 
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            // Enable logging to both stdout and webview (always, not just debug)
+            // The webview target lets the frontend receive Rust logs via @tauri-apps/plugin-log
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets([
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                    ])
+                    .build(),
+            )?;
 
             // Deep link handler — listen for scheme events, store and re-emit to frontend
             let handle = app.handle().clone();
@@ -581,6 +607,7 @@ pub fn run() {
             check_wallet_exists,
             create_wallet,
             unlock_wallet,
+            get_wallet_info,
             get_balance,
             refresh_balance,
             get_subscriptions,
