@@ -976,8 +976,9 @@ pub fn run() {
             // Background payment scheduler — runs every 60s, independent of UI
             {
                 let sched_handle = app.handle().clone();
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     // Wait 30s before first check (let app fully initialize)
+                    tauri::async_runtime::spawn(async {}).await.ok(); // yield to runtime
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
