@@ -315,6 +315,8 @@
   // ---- Wallet / RPC state ----
   let balanceXmr = null;        // null = not loaded yet
   let balanceLoading = false;
+  let lastBalanceRefresh = null; // Date of last successful balance fetch
+  let refreshAgoLabel = "";      // "il y a X" string, updated every 30s
   let rpcOk = null;             // null=unknown, true=connected, false=error
   let rpcError = null;          // last error string
   let walletAddress = null;
@@ -447,6 +449,14 @@
     balanceLoading = false;
   }
 
+  function updateRefreshAgo() {
+    if (!lastBalanceRefresh) { refreshAgoLabel = ""; return; }
+    const secs = Math.round((Date.now() - lastBalanceRefresh) / 1000);
+    if (secs < 60)        refreshAgoLabel = `il y a ${secs}s`;
+    else if (secs < 3600) refreshAgoLabel = `il y a ${Math.round(secs/60)} min`;
+    else                  refreshAgoLabel = `il y a ${Math.round(secs/3600)} h`;
+  }
+
   async function refreshBalance() {
     balanceLoading = true;
     logInfo("Dashboard", "Refreshing balance via RPC…");
@@ -456,6 +466,8 @@
         balanceXmr = b.xmr;
         rpcOk = true;
         rpcError = null;
+        lastBalanceRefresh = Date.now();
+        updateRefreshAgo();
         logInfo("Dashboard", `Balance refreshed: ${b.xmr} XMR`);
       }
     } catch (e) {
@@ -483,10 +495,14 @@
       }
     }
 
-    // Load wallet info (balance + RPC status), then schedule refresh every 5 min
+    // Load wallet info (balance + RPC status), then schedule refresh every 2 min
     await loadWalletInfo();
-    const balanceTimer = setInterval(refreshBalance, 5 * 60 * 1000);
-    return () => clearInterval(balanceTimer);
+    // Set initial lastBalanceRefresh so UI shows "il y a 0s" after first load
+    lastBalanceRefresh = Date.now();
+    updateRefreshAgo();
+    const balanceTimer = setInterval(refreshBalance, 2 * 60 * 1000);
+    const agoTimer = setInterval(updateRefreshAgo, 30 * 1000);
+    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); };
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */
@@ -650,7 +666,7 @@
           <span class="rpc-dot dot-err" title="RPC indisponible">●</span>
         {/if}
         {$t.balance || 'Solde'}
-        <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title="Actualiser le solde">
+        <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title={$t.balanceRefresh || 'Actualiser le solde'}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
                stroke-linecap="round" stroke-linejoin="round"
                style={balanceLoading ? "animation: spin 1s linear infinite" : ""}>
@@ -659,6 +675,9 @@
           </svg>
         </button>
       </div>
+      {#if refreshAgoLabel}
+        <div class="refresh-ago">{balanceLoading ? 'Synchro…' : refreshAgoLabel} · toutes les 2 min</div>
+      {/if}
 
         {#if balanceXmr === null}
         <div class="balance-amount" style="font-size:13px;color:var(--text-muted)">{$t.balanceLoading || 'Chargement…'}</div>
@@ -1337,6 +1356,8 @@
 <style>
   .layout {
     display: flex;
+    flex-direction: row;   /* explicit — WebKitGTK sometimes needs this */
+    align-items: stretch;
     height: 100vh;
     overflow: hidden;
   }
@@ -1391,10 +1412,11 @@
 
   /* Balance card at bottom */
   .sidebar-balance { padding: 10px; margin-top: auto; }
-  .balance-label { font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 3px; display: flex; align-items: center; gap: 4px; }
+  .balance-label { font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 2px; display: flex; align-items: center; gap: 4px; }
   .refresh-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 0; display: flex; align-items: center; }
   .refresh-btn:hover { color: var(--accent); }
   .refresh-btn:disabled { opacity: 0.4; cursor: default; }
+  .refresh-ago { font-size: 9px; color: var(--text-muted); opacity: 0.7; margin-bottom: 4px; }
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
   .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
   .btn-inline { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 10px; padding: 0; text-decoration: underline; }

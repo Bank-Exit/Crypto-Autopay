@@ -379,14 +379,32 @@ async fn refresh_balance(
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
-        rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+
+        // Open wallet
+        let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"open","method":"open_wallet",
             "params":{"filename":wallet_name,"password":password}
         })).map_err(|e| e.to_string())?;
-        let (unlocked, _) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));
-        let atomic = (unlocked * 1e12) as u64;
+        if let Some(err) = open_resp.get("error") {
+            log::warn!("[refresh_balance] open_wallet error: {}", err);
+        }
+
+        // Trigger wallet refresh (sync with daemon) — may take a few seconds
+        log::info!("[refresh_balance] Calling wallet refresh…");
+        let refresh_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"refresh","method":"refresh",
+            "params":{"start_height":0}
+        }));
+        match &refresh_resp {
+            Ok(r) => log::info!("[refresh_balance] refresh done: blocks_fetched={}", r["result"]["blocks_fetched"].as_u64().unwrap_or(0)),
+            Err(e) => log::warn!("[refresh_balance] refresh failed (non-fatal): {}", e),
+        }
+
+        let (total, _unlocked) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));
+        let atomic = (total * 1e12) as u64;
+        log::info!("[refresh_balance] Total balance: {} XMR ({} pico)", total, atomic);
         mgr.stop();
-        Ok::<(f64, u64), String>((unlocked, atomic))
+        Ok::<(f64, u64), String>((total, atomic))
     })
     .await
     .map_err(|e| e.to_string())??;
