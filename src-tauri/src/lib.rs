@@ -287,6 +287,77 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
     Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic })
 }
 
+/// Send all funds (sweep_all) to a destination address.
+/// Requires the wallet to be unlocked (session_password must be set).
+#[tauri::command]
+async fn sweep_all(
+    destination: String,
+    state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    // Validate destination looks like a Monero address (basic length check)
+    let dest = destination.trim().to_string();
+    if dest.len() < 90 || dest.len() > 110 {
+        return Err("Invalid Monero address (expected 95-106 characters).".to_string());
+    }
+
+    let (wallet_name, wallet_dir, password) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if !s.unlocked { return Err("Wallet is locked.".to_string()); }
+        let wn = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let pw = s.session_password.clone().ok_or("No session password")?;
+        (wn, wd, pw)
+    };
+
+    log::info!("[Sweep] Initiating sweep_all to {}…", &dest[..dest.len().min(12)]);
+
+    let tx_hash = tokio::task::spawn_blocking(move || {
+        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
+
+        // Open wallet
+        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"open","method":"open_wallet",
+            "params":{"filename":wallet_name,"password":password}
+        })).map_err(|e| e.to_string())?;
+        if let Some(err) = open.get("error") {
+            return Err(format!("open_wallet error: {}", err));
+        }
+
+        // sweep_all
+        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"sweep","method":"sweep_all",
+            "params":{
+                "address": dest,
+                "account_index": 0,
+                "get_tx_hex": false
+            }
+        })).map_err(|e| e.to_string())?;
+
+        mgr.stop();
+
+        if let Some(err) = resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("sweep_all RPC error: {}", msg));
+        }
+
+        // Return first tx hash
+        let hash = resp["result"]["tx_hash_list"][0]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        log::info!("[Sweep] Done. tx_hash={}", hash);
+        Ok(hash)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(tx_hash)
+}
+
 /// Refresh balance using the stored session password (called by frontend timer).
 /// Opens a transient wallet-rpc session, fetches unlocked balance, stores it.
 #[tauri::command]
@@ -610,6 +681,7 @@ pub fn run() {
             get_wallet_info,
             get_balance,
             refresh_balance,
+            sweep_all,
             get_subscriptions,
             add_subscription,
             delete_subscription,

@@ -319,6 +319,58 @@
   let rpcError = null;          // last error string
   let walletAddress = null;
 
+  // Receive / QR state
+  let copiedAddr = false;
+  let sweepDest = "";
+  let sweepLoading = false;
+  let sweepError = null;
+  let sweepTxHash = null;
+
+  async function copyAddress(addr) {
+    try {
+      await navigator.clipboard.writeText(addr);
+      copiedAddr = true;
+      setTimeout(() => copiedAddr = false, 2000);
+    } catch (e) {
+      logWarn("Receive", `Clipboard error: ${e}`);
+    }
+  }
+
+  async function doSweepAll() {
+    sweepError = null;
+    sweepTxHash = null;
+    sweepLoading = true;
+    logInfo("Sweep", "[SweepAll] Sending sweep_all transaction…");
+    try {
+      const hash = await tauriInvoke("sweep_all", { destination: sweepDest.trim() });
+      if (hash) {
+        sweepTxHash = hash;
+        logInfo("Sweep", "[SweepAll] Done");
+        // Refresh balance
+        await tauriInvoke("refresh_balance");
+        await loadWalletInfo();
+      } else {
+        sweepError = "Aucun hash retourné";
+      }
+    } catch (e) {
+      sweepError = String(e);
+      logError("Sweep", `[SweepAll] Error: ${e}`);
+    } finally {
+      sweepLoading = false;
+    }
+  }
+
+  // QR code generation (returns SVG string)
+  async function generateQR(address) {
+    try {
+      const QRCode = (await import("qrcode")).default;
+      return await QRCode.toString(address, { type: "svg", margin: 2, width: 220 });
+    } catch (e) {
+      logWarn("QR", `QR generation failed: ${e}`);
+      return `<svg width="220" height="220" viewBox="0 0 220 220" xmlns="http://www.w3.org/2000/svg"><rect width="220" height="220" fill="#eee"/><text x="110" y="115" text-anchor="middle" fill="#666" font-size="12">QR unavailable</text></svg>`;
+    }
+  }
+
   // RPC state → user-friendly diagnosis
   function rpcDiagnosis(err) {
     if (!err) return null;
@@ -546,7 +598,7 @@
             <span class="tray-label">OK</span>
           </div>
           <div class="tray-row mode-tray">
-            <span class="tray-label mode-tray-label">Mode : {$paymentMode === 'semi-auto' ? 'Semi-auto' : 'Auto'}</span>
+            <span class="tray-label mode-tray-label">{($t.paymentModeLabel || 'Mode : {mode}').replace('{mode}', $paymentMode === 'semi-auto' ? ($t.paymentModeSemiAuto || 'Semi-auto') : ($t.paymentModeAuto || 'Auto'))}</span>
           </div>
         </div>
       </div>
@@ -556,6 +608,9 @@
       <!-- No emojis except Trouver des souscriptions -->
       <button class="nav-item" class:active={page === "subscriptions"} on:click={() => page = "subscriptions"}>
         {$t.navSubscriptions}
+      </button>
+      <button class="nav-item" class:active={page === "receive"} on:click={() => page = "receive"}>
+        {$t.receiveTitle || 'Recevoir XMR'}
       </button>
       <button class="nav-item" class:active={page === "wallets"} on:click={() => page = "wallets"}>
         {$t.navWallets}
@@ -594,7 +649,7 @@
         {:else}
           <span class="rpc-dot dot-err" title="RPC indisponible">●</span>
         {/if}
-        Solde
+        {$t.balance || 'Solde'}
         <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title="Actualiser le solde">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
                stroke-linecap="round" stroke-linejoin="round"
@@ -605,14 +660,15 @@
         </button>
       </div>
 
-      {#if balanceXmr === null}
-        <div class="balance-amount" style="font-size:13px;color:var(--text-muted)">Chargement…</div>
+        {#if balanceXmr === null}
+        <div class="balance-amount" style="font-size:13px;color:var(--text-muted)">{$t.balanceLoading || 'Chargement…'}</div>
 
       {:else if rpcOk}
         <!-- Connected: just show the balance -->
         <div class="balance-amount text-accent">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
         {#if balanceXmr === 0}
-          <div class="balance-hint">Wallet vide — rechargez-le en Monero pour commencer.</div>
+          <div class="balance-hint">{$t.balanceEmpty || 'Wallet vide — rechargez-le en Monero pour commencer.'}</div>
+          <button class="btn-receive" on:click={() => page = "receive"}>⬇ Recevoir XMR</button>
         {/if}
 
       {:else if rpcOk === false}
@@ -656,9 +712,13 @@
     {#if page === "subscriptions"}
       <div class="page-header">
         <div>
-          <h1>Mes abonnements récurrents en {$currentNetwork.label}</h1>
+          <h1>{($t.subscriptionsTitle || 'Mes abonnements récurrents en {network}').replace('{network}', $currentNetwork.label)}</h1>
           <p class="subs-subtitle">
-            {subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length} abonnement{subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length !== 1 ? "s" : ""}
+            {#if subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length === 1}
+              {($t.subscriptionsCount || '{n} abonnement').replace('{n}', 1)}
+            {:else}
+              {($t.subscriptionsCountPlural || '{n} abonnements').replace('{n}', subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length)}
+            {/if}
             {#if duplicateCount > 0}
               &nbsp;·&nbsp;<span class="dup-warning">Doublons : {duplicateCount}</span>
             {/if}
@@ -1107,6 +1167,60 @@
         />
       </div>
 
+    <!-- ====== RECEIVE XMR ====== -->
+    {:else if page === "receive"}
+      <div class="page-header">
+        <h1>{$t.receiveTitle || 'Recevoir des XMR'}</h1>
+        <p class="subs-subtitle">{$t.receiveDesc || 'Partagez cette adresse ou ce QR code pour recevoir des paiements Monero.'}</p>
+      </div>
+      <div class="receive-page">
+        {#if walletAddress}
+          <div class="qr-wrapper">
+            {#await generateQR(walletAddress) then svgStr}
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+              {@html svgStr}
+            {/await}
+          </div>
+          <div class="receive-address-box">
+            <span class="receive-address">{walletAddress}</span>
+            <button class="btn-copy" on:click={() => copyAddress(walletAddress)}>
+              {copiedAddr ? ($t.receiveCopied || 'Copié !') : ($t.receiveCopy || 'Copier l\'adresse')}
+            </button>
+          </div>
+
+          <!-- Sweep section (only when balance > 0) -->
+          {#if balanceXmr !== null && balanceXmr > 0}
+            <div class="sweep-section">
+              <h2>{$t.sweepTitle || 'Vider le wallet'}</h2>
+              <p class="sweep-warn">{$t.sweepWarning || '⚠️ Cette action est irréversible.'}</p>
+              <p class="subs-subtitle">{$t.sweepDesc || 'Envoyer tous les fonds disponibles vers une autre adresse Monero.'}</p>
+              <label class="sweep-label">{$t.sweepDestLabel || 'Adresse de destination'}</label>
+              <input
+                class="sweep-input"
+                type="text"
+                bind:value={sweepDest}
+                placeholder={$t.sweepDestPlaceholder || '4... (adresse Monero)'}
+              />
+              {#if sweepError}
+                <div class="sweep-error">{$t.sweepError || 'Erreur'} : {sweepError}</div>
+              {/if}
+              {#if sweepTxHash}
+                <div class="sweep-success">{$t.sweepSuccess || 'Transaction envoyée !'} <code>{sweepTxHash}</code></div>
+              {/if}
+              <button
+                class="btn-danger"
+                on:click={doSweepAll}
+                disabled={sweepLoading || sweepDest.trim().length < 90}
+              >
+                {sweepLoading ? 'Envoi en cours…' : ($t.sweepConfirm || 'Vider le wallet')}
+              </button>
+            </div>
+          {/if}
+        {:else}
+          <div class="balance-hint">Adresse non disponible — déverrouillez le wallet d'abord.</div>
+        {/if}
+      </div>
+
     <!-- ====== HOW IT WORKS ====== -->
     {:else if page === "howto"}
       <div class="page-header">
@@ -1284,6 +1398,27 @@
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
   .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
   .btn-inline { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 10px; padding: 0; text-decoration: underline; }
+
+  /* Receive page */
+  .receive-page { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; gap: 20px; padding-top: 12px; }
+  .qr-wrapper { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+  .qr-wrapper svg { display: block; }
+  .receive-address-box { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 100%; }
+  .receive-address { font-family: monospace; font-size: 12px; word-break: break-all; text-align: center; color: var(--text-muted); padding: 8px 12px; background: var(--surface); border-radius: 6px; border: 1px solid var(--border); width: 100%; box-sizing: border-box; }
+  .btn-copy { padding: 8px 18px; background: var(--accent); color: #fff; border: none; border-radius: 7px; font-size: 13px; cursor: pointer; }
+  .btn-copy:hover { opacity: 0.88; }
+  .btn-receive { margin-top: 4px; padding: 6px 14px; font-size: 12px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%; }
+  .btn-receive:hover { opacity: 0.88; }
+  .sweep-section { width: 100%; border-top: 1px solid var(--border); padding-top: 20px; display: flex; flex-direction: column; gap: 8px; }
+  .sweep-section h2 { margin: 0; font-size: 15px; }
+  .sweep-warn { font-size: 12px; color: #f59e0b; margin: 0; }
+  .sweep-label { font-size: 12px; color: var(--text-muted); }
+  .sweep-input { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 7px; font-family: monospace; font-size: 12px; box-sizing: border-box; background: var(--surface); color: var(--text); }
+  .sweep-error { color: #ef4444; font-size: 12px; }
+  .sweep-success { color: #22c55e; font-size: 12px; word-break: break-all; }
+  .btn-danger { padding: 10px 18px; background: #ef4444; color: #fff; border: none; border-radius: 7px; font-size: 13px; cursor: pointer; font-weight: 600; }
+  .btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-danger:not(:disabled):hover { background: #dc2626; }
 
   /* RPC dot indicator */
   .rpc-dot { font-size: 10px; line-height: 1; }

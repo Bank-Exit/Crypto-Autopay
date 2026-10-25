@@ -131,6 +131,33 @@ const T = {
     themeDark: "Sombre",
     timezone: "Fuseau horaire",
 
+    // Balance card
+    balance: "Solde",
+    balanceEmpty: "Wallet vide — rechargez-le en Monero pour commencer.",
+    balanceLoading: "Chargement…",
+    balanceRefresh: "Actualiser le solde",
+
+    // Subscriptions header
+    subscriptionsTitle: "Mes abonnements récurrents en {network}",
+    subscriptionsCount: "{n} abonnement",
+    subscriptionsCountPlural: "{n} abonnements",
+    paymentModeLabel: "Mode : {mode}",
+
+    // Receive / Sweep
+    receiveTitle: "Recevoir des XMR",
+    receiveDesc: "Partagez cette adresse ou ce QR code pour recevoir des paiements Monero.",
+    receiveAddress: "Adresse de réception",
+    receiveCopy: "Copier l'adresse",
+    receiveCopied: "Copié !",
+    sweepTitle: "Vider le wallet",
+    sweepDesc: "Envoyer tous les fonds disponibles vers une autre adresse Monero.",
+    sweepDestLabel: "Adresse de destination",
+    sweepDestPlaceholder: "4... (adresse Monero)",
+    sweepConfirm: "Vider le wallet",
+    sweepWarning: "⚠️ Cette action est irréversible. Tous les fonds seront transférés.",
+    sweepSuccess: "Transaction envoyée !",
+    sweepError: "Erreur lors de l'envoi",
+
     walletsTitle: "Mes wallets",
     walletName: "Nom du wallet",
     walletDesc: "Description",
@@ -292,6 +319,30 @@ const T = {
     themeLight: "Light (default)",
     themeDark: "Dark",
     timezone: "Timezone",
+
+    balance: "Balance",
+    balanceEmpty: "Empty wallet — top it up with Monero to get started.",
+    balanceLoading: "Loading…",
+    balanceRefresh: "Refresh balance",
+
+    subscriptionsTitle: "My recurring subscriptions in {network}",
+    subscriptionsCount: "{n} subscription",
+    subscriptionsCountPlural: "{n} subscriptions",
+    paymentModeLabel: "Mode: {mode}",
+
+    receiveTitle: "Receive XMR",
+    receiveDesc: "Share this address or QR code to receive Monero payments.",
+    receiveAddress: "Receive address",
+    receiveCopy: "Copy address",
+    receiveCopied: "Copied!",
+    sweepTitle: "Empty wallet",
+    sweepDesc: "Send all available funds to another Monero address.",
+    sweepDestLabel: "Destination address",
+    sweepDestPlaceholder: "4... (Monero address)",
+    sweepConfirm: "Empty wallet",
+    sweepWarning: "⚠️ This action is irreversible. All funds will be transferred.",
+    sweepSuccess: "Transaction sent!",
+    sweepError: "Send error",
 
     walletsTitle: "My wallets",
     walletName: "Wallet name",

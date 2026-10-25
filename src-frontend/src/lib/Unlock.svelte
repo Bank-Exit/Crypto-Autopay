@@ -120,12 +120,23 @@
           autofocus
         />
         {#if import.meta.env.DEV}
-          <!-- Dev bypass: skip password check (DEV build only) -->
+          <!-- Dev bypass: skip password check but still load wallet info -->
           <button
             class="dev-bypass"
             type="button"
-            title="[DEV] bypass"
-            on:click={() => dispatch("unlocked")}
+            title="[DEV] bypass (loads wallet info)"
+            on:click={async () => {
+              logInfo("Unlock", "[DEV] Bypass activated — loading wallet info");
+              try {
+                const { invoke: inv } = await import("@tauri-apps/api/core");
+                const info = await inv("get_wallet_info");
+                logInfo("Unlock", `[DEV] Wallet info: rpc_ok=${info?.rpc_connected}, balance=${info?.balance_xmr}`);
+                dispatch("unlocked", { address: info?.address ?? "", balance: info?.balance_xmr ?? 0 });
+              } catch (e) {
+                logWarn("Unlock", `[DEV] get_wallet_info unavailable: ${e}`);
+                dispatch("unlocked", { address: "", balance: 0 });
+              }
+            }}
           >▶</button>
         {/if}
       </div>
