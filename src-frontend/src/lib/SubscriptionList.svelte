@@ -51,18 +51,26 @@
     return `J-${d}`;
   }
 
-  /** Fraction of period elapsed (0 = just paid, 1 = due now), for pie chart */
+  /** Fraction of period elapsed (0 = just paid, 1 = due now), for pie chart.
+   *  Uses _raw_schedule (CRON) for period calculation. */
   function pieFraction(sub, now) {
     const rem = remainingMs(sub, now);
-    const period = parsePeriodMs(sub.raw_schedule || sub.schedule);
-    if (rem === null || !period) return 0;
-    return Math.min(1, Math.max(0, 1 - rem / period));
+    const rawSched = sub._raw_schedule || sub.raw_schedule || sub.schedule;
+    const period = parsePeriodMs(rawSched);
+    if (rem === null || !period || period <= 0) return 0;
+    const frac = 1 - rem / period;
+    return Math.min(1, Math.max(0, frac));
   }
 
-  /** SVG pie arc path for a fraction 0–1 */
+  /** SVG pie arc path for a fraction 0–1, clockwise from 12 o'clock.
+   *  fraction=0 → empty (just paid), fraction=1 → full circle (due now). */
   function piePath(f) {
     const r = 10, cx = 12, cy = 12;
-    if (f >= 1) return `M${cx},${cy} m-${r},0 a${r},${r} 0 1 1 ${2*r},0 a${r},${r} 0 1 1 -${2*r},0`;
+    if (f <= 0.001) return `M${cx},${cy}`; // invisible dot — avoids degenerate arc bug
+    if (f >= 0.999) {
+      // Full circle using two arcs (SVG can't do a single 360° arc)
+      return `M${cx},${cy-r} A${r},${r} 0 1 1 ${cx-0.001},${cy-r} Z`;
+    }
     const angle = f * 2 * Math.PI;
     const x = cx + r * Math.sin(angle);
     const y = cy - r * Math.cos(angle);

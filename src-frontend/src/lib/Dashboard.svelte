@@ -362,6 +362,9 @@
   let rpcOk = null;             // null=unknown, true=connected, false=error
   let rpcError = null;          // last error string
   let walletAddress = null;
+  // Sync progress (from get_sync_info after each refresh)
+  let syncInfo = null; // { wallet_height, daemon_height, blocks_behind, synced }
+  let syncPollTimer = null;
 
   // Receive / QR state
   let copiedAddr = false;
@@ -609,9 +612,19 @@
     else                  refreshAgoLabel = `il y a ${Math.round(secs/3600)} h`;
   }
 
+  async function pollSyncInfo() {
+    try {
+      const info = await tauriInvoke("get_sync_info");
+      if (info) syncInfo = info;
+    } catch(_) {}
+  }
+
   async function refreshBalance() {
     balanceLoading = true;
     logInfo("Dashboard", "Refreshing balance via RPC…");
+    // Poll sync progress every 5s while balance is loading
+    if (syncPollTimer) clearInterval(syncPollTimer);
+    syncPollTimer = setInterval(pollSyncInfo, 5000);
     try {
       const b = await tauriInvoke("refresh_balance");
       if (b) {
@@ -620,13 +633,19 @@
         rpcError = null;
         lastBalanceRefresh = Date.now();
         updateRefreshAgo();
-        logInfo("Dashboard", `Balance refreshed: ${b.xmr} XMR`);
+        logInfo("Dashboard", `Balance refreshed: [REDACTED]`);
+        await pollSyncInfo(); // update after refresh completes
       }
     } catch (e) {
-      rpcOk = false;
-      rpcError = String(e);
-      logWarn("Dashboard", `Balance refresh failed: ${e}`);
+      if (String(e).includes("RPC busy")) {
+        logInfo("Dashboard", "Balance refresh skipped (paiement en cours)");
+      } else {
+        rpcOk = false;
+        rpcError = String(e);
+        logWarn("Dashboard", `Balance refresh failed: ${e}`);
+      }
     }
+    if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
     balanceLoading = false;
   }
 
@@ -661,7 +680,10 @@
     // Payment scheduler: check every minute for due subscriptions
     const paymentTimer = setInterval(checkDuePayments, 60 * 1000);
 
-    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); clearInterval(paymentTimer); };
+    // Fast ticker every 10s — forces reactive nextPayment banner to update
+    const tickTimer = setInterval(() => { nowTick = Date.now(); }, 10 * 1000);
+
+    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); clearInterval(paymentTimer); clearInterval(tickTimer); };
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */
@@ -708,22 +730,30 @@
   $: totalBalance = wallets.reduce((s, w) => s + parseFloat(w.balance), 0).toFixed(3);
   $: totalMonthlyOut = wallets.reduce((s, w) => s + (w.monthlyOut || 0), 0);
 
-  // Computed from actual subscriptions (reactive)
+  // Ticker updated every 10s by setInterval — forces nextPayment label to recompute
+  let nowTick = Date.now();
+
+  // Computed from actual subscriptions (reactive, refreshed every 10s via nowTick)
   $: nextPayment = (() => {
+    void nowTick; // declare dependency so Svelte re-runs when nowTick changes
+    const now = Date.now();
     const active = subscriptions.filter(s =>
       ["Active", "Actif"].includes(s.status) && s.next_payment_at
     );
     if (!active.length) return null;
     active.sort((a, b) => new Date(a.next_payment_at) - new Date(b.next_payment_at));
     const soonest = active[0];
-    const ms = new Date(soonest.next_payment_at) - Date.now();
+    const ms = new Date(soonest.next_payment_at) - now;
     const days = Math.ceil(ms / 86400000);
     const h = Math.floor(ms / 3600000);
     const m = Math.floor(ms / 60000);
+    const s = Math.floor(ms / 1000);
     let label_time;
-    if (m < 60) label_time = `dans ${m} min`;
+    if (s < 0) label_time = "maintenant";
+    else if (s < 60) label_time = `dans ${s}s`;
+    else if (m < 60) label_time = `dans ${m} min`;
     else if (h < 24) label_time = `dans ${h}h`;
-    else label_time = days <= 0 ? "maintenant" : `J-${days}`;
+    else label_time = `J-${days}`;
     return { label: soonest.label, amount: soonest.amount, in_days: days, label_time, sub: soonest };
   })();
 
@@ -859,6 +889,14 @@
       </div>
       {#if balanceLoading}
         <div class="refresh-ago sync-pulse">Synchro réseau en cours…</div>
+        {#if syncInfo && syncInfo.blocks_behind > 10}
+          <div class="sync-progress-wrap">
+            <div class="sync-progress-bar" style="width:{Math.min(100, 100 - syncInfo.blocks_behind / Math.max(syncInfo.daemon_height, 1) * 100)}%"></div>
+            <span class="sync-progress-label">{syncInfo.blocks_behind.toLocaleString()} blocs restants</span>
+          </div>
+        {:else if syncInfo && syncInfo.blocks_behind > 0}
+          <div class="sync-progress-label-small">{syncInfo.blocks_behind} blocs restants</div>
+        {/if}
       {:else if refreshAgoLabel}
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
       {/if}
@@ -1607,6 +1645,10 @@
   .refresh-btn:disabled { opacity: 0.4; cursor: default; }
   .refresh-ago { font-size: 9px; color: var(--text-muted); opacity: 0.7; margin-bottom: 4px; }
   .sync-pulse { color: var(--accent) !important; opacity: 1 !important; animation: pulse-dot 1.5s ease-in-out infinite; }
+  .sync-progress-wrap { position: relative; height: 4px; background: var(--border); border-radius: 2px; margin: 3px 0 2px; overflow: hidden; }
+  .sync-progress-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 1s ease; }
+  .sync-progress-label { font-size: 9px; color: var(--text-muted); }
+  .sync-progress-label-small { font-size: 9px; color: var(--text-muted); margin-top: 2px; }
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
   .balance-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
   .btn-inline { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 10px; padding: 0; text-decoration: underline; }

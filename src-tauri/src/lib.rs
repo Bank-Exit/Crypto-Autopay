@@ -44,6 +44,10 @@ pub struct AppState {
     pub pending_deep_link: Option<String>,
     /// Timestamp (Unix seconds) of the last outgoing payment — enforces 25-min Monero cooldown.
     pub last_payment_sent_at: Option<i64>,
+    /// Last known wallet scan height (from get_height after refresh).
+    pub last_wallet_height: u64,
+    /// Last known daemon height (from get_daemon_block_height).
+    pub last_daemon_height: u64,
     /// RPC busy flag — only one command can use the wallet RPC at a time (port 18083).
     pub rpc_busy: Arc<AtomicBool>,
     /// RPC process manager.
@@ -554,7 +558,7 @@ async fn refresh_balance(
         return Err("RPC busy".into());
     }
 
-    let (xmr, atomic) = tokio::task::spawn_blocking(move || {
+    let (xmr, atomic, wallet_height) = tokio::task::spawn_blocking(move || {
         struct RpcGuard(Arc<AtomicBool>);
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(rpc_busy);
@@ -562,6 +566,11 @@ async fn refresh_balance(
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+
+        // Get wallet current height before sync (for progress reporting)
+        let wallet_height_before = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"h","method":"get_height","params":{}
+        })).ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(0);
 
         // Open wallet
         let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
@@ -578,28 +587,58 @@ async fn refresh_balance(
             "jsonrpc":"2.0","id":"refresh","method":"refresh",
             "params":{"start_height":0}
         }), 180);
-        match &refresh_resp {
+        let blocks_fetched = match &refresh_resp {
             Ok(r) => {
                 let fetched = r["result"]["blocks_fetched"].as_u64().unwrap_or(0);
                 let received = r["result"]["received_money"].as_bool().unwrap_or(false);
                 log::info!("[refresh_balance] Sync done: blocks_fetched={}, received_money={}", fetched, received);
+                fetched
             }
-            Err(e) => log::warn!("[refresh_balance] refresh failed (non-fatal, will retry): {}", e),
-        }
+            Err(e) => { log::warn!("[refresh_balance] refresh failed (non-fatal, will retry): {}", e); 0 }
+        };
+
+        // Get updated wallet height after sync
+        let wallet_height_after = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"h2","method":"get_height","params":{}
+        })).ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(wallet_height_before + blocks_fetched);
 
         let (total, _unlocked) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));
         let atomic = (total * 1e12) as u64;
         log::info!("[refresh_balance] Total balance: {} XMR ({} pico)", total, atomic);
         mgr.stop();
-        Ok::<(f64, u64), String>((total, atomic))
+        Ok::<(f64, u64, u64), String>((total, atomic, wallet_height_after))
     })
     .await
     .map_err(|e| e.to_string())??;
 
+    // Get daemon height (non-blocking, direct REST call)
+    let daemon_addr = state.lock().map_err(|e| e.to_string())?.rpc.daemon_address();
+    let daemon_height = {
+        let h = rpc_manager::get_daemon_block_height(&daemon_addr);
+        if h > 0 { h } else { wallet_height }
+    };
+
     if let Ok(mut s) = state.lock() {
         s.balance_atomic = atomic;
+        s.last_wallet_height = wallet_height;
+        s.last_daemon_height = daemon_height;
     }
     Ok(BalanceResponse { xmr, atomic })
+}
+
+/// Return last known wallet/daemon heights for sync progress display.
+#[tauri::command]
+async fn get_sync_info(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let wallet_h = s.last_wallet_height;
+    let daemon_h = s.last_daemon_height;
+    let blocks_behind = if daemon_h > wallet_h { daemon_h - wallet_h } else { 0 };
+    Ok(serde_json::json!({
+        "wallet_height": wallet_h,
+        "daemon_height": daemon_h,
+        "blocks_behind": blocks_behind,
+        "synced": blocks_behind < 5,
+    }))
 }
 
 /// Get all subscriptions from the local SQLite database.
@@ -989,6 +1028,8 @@ pub fn run() {
                 session_password: None,
                 pending_deep_link: None,
                 last_payment_sent_at: None,
+                last_wallet_height: 0,
+                last_daemon_height: 0,
                 rpc_busy: Arc::new(AtomicBool::new(false)),
                 rpc: RpcManager::new(rpc_config),
             }));
@@ -1055,6 +1096,7 @@ pub fn run() {
             create_wallet,
             unlock_wallet,
             get_wallet_info,
+            get_sync_info,
             get_balance,
             refresh_balance,
             sweep_all,
