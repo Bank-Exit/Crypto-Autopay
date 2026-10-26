@@ -27,10 +27,27 @@
     } catch (_) { return () => {}; }
   }
 
-  // Payment success animation
+  // Payment loader + success animation
   let showPayAnim = false;
+  let showPayLoader = false;
+  let payLoaderCountdown = 15;
+  let payLoaderTimer = null;
   let payAnimTimer = null;
+
+  function startPaymentLoader() {
+    showPayLoader = true;
+    showPayAnim = false;
+    payLoaderCountdown = 15;
+    if (payLoaderTimer) clearInterval(payLoaderTimer);
+    payLoaderTimer = setInterval(() => {
+      payLoaderCountdown = Math.max(0, payLoaderCountdown - 1);
+    }, 1000);
+  }
+
   function showPaymentAnimation() {
+    // Stop loader, show success
+    if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
+    showPayLoader = false;
     showPayAnim = true;
     if (payAnimTimer) clearTimeout(payAnimTimer);
     payAnimTimer = setTimeout(() => { showPayAnim = false; }, 4000);
@@ -335,16 +352,28 @@
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
     addOrConfirmDuplicate(sub);
     showImportModal = false;
-    // Persist to SQLite
-    if (detail.code) {
-      const result = await tauriInvoke("add_subscription", { code: detail.code });
-      if (result) {
-        logInfo("Dashboard", `Subscription persisted to DB: ${result.id}`);
-        // Update local sub with real DB id
-        subscriptions = subscriptions.map(s =>
-          s._code === detail.code ? { ...s, _db_id: result.id, id: result.id } : s
-        );
-      }
+
+    // Try parsed code first (crypto-autopay: or monero-request: prefix)
+    let result = null;
+    if (detail.code && (detail.code.startsWith("crypto-autopay:") || detail.code.startsWith("monero-request:"))) {
+      result = await tauriInvoke("add_subscription", { code: detail.code });
+      if (result) logInfo("Dashboard", `Sub persisted via code: ${result.id}`);
+    }
+    // Fallback: save via payload (works for manually decoded or converted codes)
+    if (!result && detail.payload) {
+      const payload = { ...detail.payload, start_immediately: detail.payload.start_immediately ?? true };
+      result = await tauriInvoke("save_subscription", { payload });
+      if (result) logInfo("Dashboard", `Sub persisted via payload fallback: ${result.id}`);
+    }
+    if (result) {
+      subscriptions = subscriptions.map(s =>
+        s._code === detail.code || s.id === sub.id
+          ? { ...s, _db_id: result.id, id: result.id,
+              next_payment_at: result.next_payment_at || s.next_payment_at }
+          : s
+      );
+    } else {
+      logWarn("Dashboard", "Sub NOT persisted to DB — both add_subscription and save_subscription failed");
     }
   }
 
@@ -464,6 +493,7 @@
 
   async function processPayment(sub, retryOnBusy = true) {
     logInfo("Scheduler", `Processing payment for sub #${sub.id}`);
+    if (retryOnBusy) startPaymentLoader(); // show loader immediately
 
     let result = null;
     let invokeError = null;
@@ -486,6 +516,8 @@
     }
 
     if (invokeError) {
+      if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
+      showPayLoader = false;
       const isLockedOutputs = invokeError.includes("rejected by daemon") || invokeError.includes("not enough money");
       if (isLockedOutputs) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouillee (confirmations en cours) pour sub #${sub.id} — attendez ~20 min`);
@@ -498,6 +530,12 @@
     if (result?.tx_hash) {
       logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${result.tx_hash.slice(0, 12)}...`);
       lastPaymentSentAt = Date.now();
+      // Optimistic balance subtraction — avoids showing stale balance while locked outputs settle
+      const sentAmt = parseFloat(sub.amount) || 0;
+      if (balanceXmr !== null && sentAmt > 0) {
+        balanceXmr = Math.max(0, balanceXmr - sentAmt);
+        if (wallets.length > 0) wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
+      }
       showPaymentAnimation(); // fullscreen animation
       const rawSched = sub._raw_schedule || sub.schedule;
       const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
@@ -881,6 +919,15 @@
   ];
 </script>
 
+<!-- Payment loading overlay (shows while payment RPC is running) -->
+{#if showPayLoader}
+  <div class="pay-anim-overlay pay-loader-overlay" role="presentation">
+    <div class="pay-loader-ring"></div>
+    <div class="pay-loader-countdown">{payLoaderCountdown}</div>
+    <div class="pay-anim-label" style="font-size:15px;margin-top:8px">Envoi en cours…</div>
+  </div>
+{/if}
+
 <!-- Payment success animation overlay -->
 {#if showPayAnim}
   <div class="pay-anim-overlay" on:click={() => showPayAnim = false} role="presentation">
@@ -898,7 +945,7 @@
       <circle class="orbit-dot od2" cx="200" cy="164" r="4" fill="var(--accent)" opacity="0.6"/>
       <circle class="orbit-dot od3" cx="200" cy="164" r="3" fill="var(--accent)" opacity="0.4"/>
     </svg>
-    <div class="pay-anim-label">Paiement envoyé</div>
+    <div class="pay-anim-label">{$currentLang === 'fr' ? 'Paiement envoyé !' : 'Payment sent!'}</div>
   </div>
 {/if}
 
@@ -1011,7 +1058,7 @@
         {:else if syncInfo && syncInfo.blocks_behind > 0}
           <div class="sync-progress-label-small">{syncInfo.blocks_behind} blocs restants</div>
         {:else if !syncInfo}
-          <div class="sync-progress-label-small">Récupération de la hauteur daemon…</div>
+          <div class="sync-progress-label-small">Connexion à la blockchain…</div>
         {/if}
       {:else if refreshAgoLabel}
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
@@ -1736,6 +1783,20 @@
     to   { transform: rotate(360deg) translateY(-70px) rotate(-360deg); }
   }
   @keyframes pay-fade-in { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+
+  /* Payment loader */
+  .pay-loader-overlay { cursor: default; }
+  .pay-loader-ring {
+    width: 80px; height: 80px; border-radius: 50%;
+    border: 6px solid rgba(var(--accent-rgb, 249,115,22), 0.2);
+    border-top-color: var(--accent);
+    animation: spin 1s linear infinite;
+  }
+  .pay-loader-countdown {
+    position: absolute; font-size: 28px; font-weight: 700;
+    color: var(--accent); line-height: 80px;
+    width: 80px; text-align: center;
+  }
 
   .layout {
     display: flex;
