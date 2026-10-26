@@ -4,6 +4,22 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Emitter, Listener};
 
+// ============================================================
+//  Alert system
+// ============================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AlertLevel { Orange, Red }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppAlert {
+    pub level: AlertLevel,
+    pub kind: String,            // "BALANCE_LOW", "PAYMENT_FAILED", etc.
+    pub sub_id: Option<String>,  // related subscription id (no address/amount)
+    pub message: String,         // human-readable, no secrets
+    pub created_at: i64,         // Unix timestamp
+}
+
 use autopay_crypto::{
     SeedVault, EncryptedSeed,
     generate_seed as crypto_generate_seed,
@@ -48,6 +64,8 @@ pub struct AppState {
     pub last_wallet_height: u64,
     /// Last known daemon height (from get_daemon_block_height).
     pub last_daemon_height: u64,
+    /// Active alerts — recomputed after each scheduler run / refresh.
+    pub alerts: Vec<AppAlert>,
     /// RPC busy flag — only one command can use the wallet RPC at a time (port 18083).
     pub rpc_busy: Arc<AtomicBool>,
     /// RPC process manager.
@@ -626,6 +644,111 @@ async fn refresh_balance(
     Ok(BalanceResponse { xmr, atomic })
 }
 
+/// Return current active alerts (for frontend badge display).
+#[tauri::command]
+async fn get_alerts(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<AppAlert>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(s.alerts.clone())
+}
+
+/// Recompute all alerts based on current state and subscriptions.
+/// Returns the worst AlertLevel, or None if clean.
+fn recompute_alerts(
+    state: &mut AppState,
+    subs: &[Subscription],
+    now_ts: i64,
+) -> Option<AlertLevel> {
+    use chrono::Utc;
+    let mut alerts: Vec<AppAlert> = Vec::new();
+
+    let balance_xmr = state.balance_atomic as f64 / 1e12;
+
+    // RED: wallet empty with active subscriptions
+    if balance_xmr == 0.0 && subs.iter().any(|s| s.status == SubscriptionStatus::Active) {
+        alerts.push(AppAlert {
+            level: AlertLevel::Red,
+            kind: "BALANCE_EMPTY".into(),
+            sub_id: None,
+            message: "Wallet balance is zero — recurring payments cannot be sent".into(),
+            created_at: now_ts,
+        });
+    }
+
+    // Estimate monthly spending (XMR/month) from active subs
+    let monthly_xmr: f64 = subs.iter().filter(|s| s.status == SubscriptionStatus::Active).map(|s| {
+        let amt: f64 = s.amount.parse().unwrap_or(0.0);
+        let cron_parts: Vec<&str> = s.schedule.trim().split_whitespace().collect();
+        let min_field = if cron_parts.len() >= 6 { cron_parts[1] } else { cron_parts.get(0).copied().unwrap_or("*") };
+        let period_min = if min_field.starts_with("*/") {
+            min_field[2..].parse::<f64>().unwrap_or(1440.0)
+        } else if min_field == "0" { 60.0 } else { 1440.0 };
+        let sends_per_month = 43200.0 / period_min; // 43200 min/month
+        amt * sends_per_month
+    }).sum();
+
+    // ORANGE: balance will run out in < 30 days
+    if balance_xmr > 0.0 && monthly_xmr > 0.0 {
+        let days_left = (balance_xmr / monthly_xmr) * 30.0;
+        if days_left < 30.0 && days_left >= 0.0 {
+            alerts.push(AppAlert {
+                level: AlertLevel::Orange,
+                kind: "BALANCE_LOW".into(),
+                sub_id: None,
+                message: format!("Wallet balance will run out in ~{:.0} days at current spending rate", days_left),
+                created_at: now_ts,
+            });
+        }
+    }
+
+    // RED: canary expired for any subscription
+    for sub in subs {
+        if sub.status == SubscriptionStatus::Active {
+            if let Some(ref canary) = sub.canary_url {
+                if !canary.is_empty() {
+                    // Check last_canary_status from DB if available — simplified: flag if explicitly "Expired"
+                    // TODO: use DB canary_status field when available
+                }
+            }
+        }
+    }
+
+    // RED / ORANGE: overdue payments
+    for sub in subs.iter().filter(|s| s.status == SubscriptionStatus::Active) {
+        if let Some(next) = sub.next_payment_at {
+            let overdue_secs = now_ts - next.timestamp();
+            if overdue_secs > 24 * 3600 {
+                // RED: overdue by more than 24h
+                alerts.push(AppAlert {
+                    level: AlertLevel::Red,
+                    kind: "PAYMENT_OVERDUE_HARD".into(),
+                    sub_id: Some(sub.id.clone()),
+                    message: format!("Sub #{} overdue by >24h — possible payment failure", sub.id),
+                    created_at: now_ts,
+                });
+            } else if overdue_secs > 3600 {
+                // ORANGE: overdue by 1–24h
+                alerts.push(AppAlert {
+                    level: AlertLevel::Orange,
+                    kind: "PAYMENT_OVERDUE_SOFT".into(),
+                    sub_id: Some(sub.id.clone()),
+                    message: format!("Sub #{} overdue by >1h", sub.id),
+                    created_at: now_ts,
+                });
+            }
+        }
+    }
+
+    state.alerts = alerts;
+    // Worst level
+    if state.alerts.iter().any(|a| a.level == AlertLevel::Red) {
+        Some(AlertLevel::Red)
+    } else if state.alerts.iter().any(|a| a.level == AlertLevel::Orange) {
+        Some(AlertLevel::Orange)
+    } else {
+        None
+    }
+}
+
 /// Return last known wallet/daemon heights for sync progress display.
 #[tauri::command]
 async fn get_sync_info(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
@@ -830,6 +953,27 @@ fn cron_period_minutes(cron: &str) -> i64 {
     30 * 24 * 60 // monthly fallback
 }
 
+/// Update the system tray icon based on current alert level.
+fn update_tray_icon(app: &tauri::AppHandle, level: Option<AlertLevel>, alert_count: usize) {
+    use tauri::tray::TrayIconId;
+    let icon_bytes: &[u8] = match level {
+        Some(AlertLevel::Red)    => include_bytes!("../icons/tray-alert.png"),
+        Some(AlertLevel::Orange) => include_bytes!("../icons/tray-warn.png"),
+        None                     => include_bytes!("../icons/tray-ok.png"),
+    };
+    let tooltip = match level {
+        Some(AlertLevel::Red)    => format!("Crypto AutoPay — {} alerte(s) critique(s)", alert_count),
+        Some(AlertLevel::Orange) => format!("Crypto AutoPay — {} avertissement(s)", alert_count),
+        None                     => "Crypto AutoPay — Tout va bien".to_string(),
+    };
+    if let Ok(img) = tauri::image::Image::from_bytes(icon_bytes) {
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_icon(Some(img));
+            let _ = tray.set_tooltip(Some(&tooltip));
+        }
+    }
+}
+
 /// Minimum interval between Monero sends (10 confirmations ≈ 20 min, use 25 min safely).
 const MONERO_MIN_SEND_INTERVAL_SECS: u64 = 25 * 60;
 
@@ -960,11 +1104,42 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 // Emit event so frontend can refresh balance and subscription list
                 app.emit("payment-sent", serde_json::json!({"sub_id": sub_id})).ok();
             }
-            Ok(Err(e)) => log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e),
+            Ok(Err(e)) => {
+                log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
+                // Add orange alert for failed payment
+                if let Some(state) = app.try_state::<Mutex<AppState>>() {
+                    if let Ok(mut s) = state.lock() {
+                        s.alerts.retain(|a| a.kind != "PAYMENT_FAILED" || a.sub_id.as_deref() != Some(&sub_id));
+                        s.alerts.push(AppAlert {
+                            level: AlertLevel::Orange,
+                            kind: "PAYMENT_FAILED".into(),
+                            sub_id: Some(sub_id.clone()),
+                            message: format!("Payment failed for sub #{}", sub_id),
+                            created_at: chrono::Utc::now().timestamp(),
+                        });
+                        let count = s.alerts.len();
+                        let worst = if s.alerts.iter().any(|a| a.level == AlertLevel::Red) { Some(AlertLevel::Red) } else { Some(AlertLevel::Orange) };
+                        drop(s);
+                        update_tray_icon(app, worst, count);
+                    }
+                }
+            }
             Err(e) => log::error!("[Scheduler] Task panic for sub {}: {}", sub_id, e),
         }
         // Only send one payment per cycle to respect 25-min Monero rule
         break;
+    }
+
+    // Recompute alerts + update tray icon after each scheduler run
+    if let (Some(state_rc), Some(db_rc)) = (app.try_state::<Mutex<AppState>>(), app.try_state::<Mutex<Database>>()) {
+        let subs = db_rc.lock().ok().and_then(|db| db.list_subscriptions().ok()).unwrap_or_default();
+        if let Ok(mut s) = state_rc.lock() {
+            let now_ts = chrono::Utc::now().timestamp();
+            let worst = recompute_alerts(&mut s, &subs, now_ts);
+            let count = s.alerts.len();
+            drop(s);
+            update_tray_icon(app, worst, count);
+        }
     }
 }
 
@@ -1030,6 +1205,7 @@ pub fn run() {
                 last_payment_sent_at: None,
                 last_wallet_height: 0,
                 last_daemon_height: 0,
+                alerts: Vec::new(),
                 rpc_busy: Arc::new(AtomicBool::new(false)),
                 rpc: RpcManager::new(rpc_config),
             }));
@@ -1087,7 +1263,34 @@ pub fn run() {
                 }
             });
 
+            // System tray: minimize-to-tray with alert icon
+            let tray_icon_bytes = include_bytes!("../icons/tray-ok.png");
+            if let Ok(img) = tauri::image::Image::from_bytes(tray_icon_bytes) {
+                let tray = tauri::tray::TrayIconBuilder::with_id("main")
+                    .icon(img)
+                    .tooltip("Crypto AutoPay")
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click { .. } = event {
+                            if let Some(win) = tray.app_handle().get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                    })
+                    .build(app)?;
+                log::info!("[Tray] System tray initialized");
+            } else {
+                log::warn!("[Tray] Could not load tray icon — tray not available");
+            }
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Close button → minimize to tray instead of quitting
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_pending_deep_link,
@@ -1097,6 +1300,7 @@ pub fn run() {
             unlock_wallet,
             get_wallet_info,
             get_sync_info,
+            get_alerts,
             get_balance,
             refresh_balance,
             sweep_all,

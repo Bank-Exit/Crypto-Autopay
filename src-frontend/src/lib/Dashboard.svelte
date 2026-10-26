@@ -19,6 +19,19 @@
       return null;
     }
   }
+
+  async function tauriListen(event, cb) {
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      return await listen(event, cb);
+    } catch (_) { return () => {}; }
+  }
+
+  let activeAlerts = [];
+  async function refreshAlerts() {
+    const alerts = await tauriInvoke("get_alerts");
+    activeAlerts = alerts || [];
+  }
   import { logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
            setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
 
@@ -451,7 +464,10 @@
           id: sub.id,
           nextPaymentAt: nextIso
         });
-        await refreshBalance();
+        // Immediately show loading state for balance (XMR sent, balance will update)
+        balanceLoading = true;
+        // Refresh after 5s (transaction propagates, balance includes locked+unlocked)
+        setTimeout(async () => { await refreshBalance(); }, 5000);
       } else {
         // RPC returned but no tx_hash — unexpected, just log
         logWarn("Scheduler", `[WARN] Reponse inattendue pour sub #${sub.id} — pas de tx_hash dans la reponse`);
@@ -683,7 +699,26 @@
     // Fast ticker every 10s — forces reactive nextPayment banner to update
     const tickTimer = setInterval(() => { nowTick = Date.now(); }, 10 * 1000);
 
-    return () => { clearInterval(balanceTimer); clearInterval(agoTimer); clearInterval(paymentTimer); clearInterval(tickTimer); };
+    // Listen for Rust background scheduler events
+    const unlistenPayment = await tauriListen("payment-sent", async () => {
+      logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
+      balanceLoading = true;
+      setTimeout(async () => {
+        await loadRpcState();
+        await refreshBalance();
+        await refreshAlerts();
+      }, 5000);
+    });
+
+    // Refresh alerts periodically
+    await refreshAlerts();
+    const alertTimer = setInterval(refreshAlerts, 60 * 1000);
+
+    return () => {
+      clearInterval(balanceTimer); clearInterval(agoTimer);
+      clearInterval(paymentTimer); clearInterval(tickTimer); clearInterval(alertTimer);
+      unlistenPayment();
+    };
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */
@@ -822,8 +857,15 @@
         <div>
           <div class="sidebar-appname">Monero AutoPay</div>
           <div class="tray-row">
-            <span class="status-dot {trayStatus}"></span>
-            <span class="tray-label">OK</span>
+            <span class="status-dot {activeAlerts.some(a => a.level === 'Red') ? 'red' : activeAlerts.some(a => a.level === 'Orange') ? 'orange' : trayStatus}"></span>
+            {#if activeAlerts.length > 0}
+              <span class="alert-badge" class:badge-red={activeAlerts.some(a => a.level === 'Red')} class:badge-orange={!activeAlerts.some(a => a.level === 'Red')}>
+                {activeAlerts.length}
+              </span>
+              <span class="tray-label" style="color:{activeAlerts.some(a=>a.level==='Red') ? '#ef4444' : '#f97316'}">{activeAlerts.some(a => a.level === 'Red') ? 'Alerte critique' : 'Avertissement'}</span>
+            {:else}
+              <span class="tray-label">OK</span>
+            {/if}
           </div>
           <div class="tray-row mode-tray">
             <span class="tray-label mode-tray-label">{($t.paymentModeLabel || 'Mode : {mode}').replace('{mode}', $paymentMode === 'semi-auto' ? ($t.paymentModeSemiAuto || 'Semi-auto') : ($t.paymentModeAuto || 'Auto'))}</span>
@@ -852,6 +894,16 @@
       <button class="nav-item find-nav" class:active={page === "find"} on:click={() => page = "find"}>
         {$t.findSubscriptions}
       </button>
+
+      {#if activeAlerts.length > 0}
+        <div class="alerts-panel">
+          {#each activeAlerts as a}
+            <div class="alert-item" class:alert-red={a.level === 'Red'} class:alert-orange={a.level === 'Orange'}>
+              {a.level === 'Red' ? '🔴' : '🟠'} {a.message}
+            </div>
+          {/each}
+        </div>
+      {/if}
 
       <div class="nav-divider"></div>
 
@@ -1609,6 +1661,25 @@
 
   .tray-row { display: flex; align-items: center; gap: 4px; margin-top: 1px; }
   .tray-label { font-size: 10px; color: var(--text-muted); }
+  .alert-badge {
+    font-size: 9px; font-weight: 700; min-width: 14px; height: 14px;
+    border-radius: 7px; display: flex; align-items: center; justify-content: center;
+    padding: 0 3px; color: white;
+  }
+  .badge-red { background: #ef4444; }
+  .badge-orange { background: #f97316; }
+  .alerts-panel {
+    margin: 4px 8px; padding: 6px 8px;
+    background: var(--bg-card); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 4px;
+    border: 1px solid var(--border);
+  }
+  .alert-item {
+    font-size: 10px; line-height: 1.3; color: var(--text);
+    word-break: break-word;
+  }
+  .alert-red { color: #ef4444; }
+  .alert-orange { color: #f97316; }
 
   .sidebar-nav {
     flex: 1;
