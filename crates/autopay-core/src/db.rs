@@ -134,9 +134,9 @@ impl Database {
     }
 
     /// Update only the next_payment_at field by row id (used by frontend scheduler).
-    pub fn update_subscription_next_payment(&self, id: i64, next_payment_at: &str) -> Result<(), DbError> {
+    pub fn update_subscription_next_payment(&self, id: &str, next_payment_at: &str) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE subscriptions SET next_payment_at = ?1, updated_at = ?2 WHERE rowid = ?3",
+            "UPDATE subscriptions SET next_payment_at = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![next_payment_at, Utc::now().to_rfc3339(), id],
         )?;
         Ok(())

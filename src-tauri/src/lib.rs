@@ -85,6 +85,18 @@ async fn get_pending_deep_link(state: tauri::State<'_, Mutex<AppState>>) -> Resu
     Ok(s.pending_deep_link.take())
 }
 
+/// Lock the wallet session (clears password from memory, marks as locked).
+/// Called by the frontend auto-lock timer after inactivity.
+#[tauri::command]
+async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.unlocked = false;
+    s.session_password = None;
+    // Keep wallet_address cached (it's in the .address file anyway)
+    log::info!("[Security] Wallet locked (auto-lock or manual)");
+    Ok(())
+}
+
 /// Generate a fresh 25-word Monero seed phrase.
 /// Called by the frontend during onboarding (step 2).
 #[tauri::command]
@@ -474,12 +486,12 @@ async fn send_payment(
 /// Update a subscription's next_payment_at after a successful payment.
 #[tauri::command]
 async fn update_subscription_next_payment(
-    id: i64,
+    id: String,
     next_payment_at: String,
     db_state: tauri::State<'_, Mutex<Database>>,
 ) -> Result<(), String> {
     let db = db_state.lock().map_err(|e| e.to_string())?;
-    db.update_subscription_next_payment(id, &next_payment_at)
+    db.update_subscription_next_payment(&id, &next_payment_at)
         .map_err(|e| e.to_string())
 }
 
@@ -663,8 +675,9 @@ fn recompute_alerts(
 
     let balance_xmr = state.balance_atomic as f64 / 1e12;
 
-    // RED: wallet empty with active subscriptions
-    if balance_xmr == 0.0 && subs.iter().any(|s| s.status == SubscriptionStatus::Active) {
+    // RED: wallet empty with active subscriptions (only after at least one successful sync)
+    let has_synced = state.last_wallet_height > 0;
+    if has_synced && balance_xmr < 0.000001 && subs.iter().any(|s| s.status == SubscriptionStatus::Active) {
         alerts.push(AppAlert {
             level: AlertLevel::Red,
             kind: "BALANCE_EMPTY".into(),
@@ -1389,6 +1402,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_pending_deep_link,
+            lock_wallet,
             generate_seed,
             check_wallet_exists,
             create_wallet,

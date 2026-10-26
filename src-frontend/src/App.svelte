@@ -13,6 +13,23 @@
   let appState = "checking";
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
+  // ===== Auto-lock after 2 min of inactivity =====
+  const AUTO_LOCK_MS = 2 * 60 * 1000; // 2 minutes
+  let autoLockTimer = null;
+
+  function resetAutoLock() {
+    if (appState !== "dashboard") return;
+    if (autoLockTimer) clearTimeout(autoLockTimer);
+    autoLockTimer = setTimeout(async () => {
+      if (appState !== "dashboard") return;
+      try { await invoke("lock_wallet"); } catch(_) {}
+      appState = "unlock";
+      logInfo("Security", "Auto-lock: wallet locked after 2 min of inactivity");
+    }, AUTO_LOCK_MS);
+  }
+
+  $: if (appState === "dashboard") resetAutoLock();
+
   // Logs drawer
   let showLogs = false;
   let liveLogs = [];
@@ -104,6 +121,14 @@
     }
   }
 </script>
+
+<!-- Reset auto-lock on any user activity -->
+<svelte:window
+  on:mousemove={resetAutoLock}
+  on:keydown={resetAutoLock}
+  on:click={resetAutoLock}
+  on:scroll={resetAutoLock}
+/>
 
 <div class="app-root">
   {#if appState === "checking"}

@@ -782,8 +782,9 @@
     const balanceTimer = setInterval(refreshBalance, 2 * 60 * 1000);
     const agoTimer = setInterval(updateRefreshAgo, 30 * 1000);
 
-    // Payment scheduler: check every minute for due subscriptions
-    const paymentTimer = setInterval(checkDuePayments, 60 * 1000);
+    // NOTE: auto payment scheduling is handled by the Rust background scheduler.
+    // The frontend only handles manual triggers ("Déclencher maintenant").
+    // No frontend payment timer — prevents double-firing with Rust scheduler.
 
     // Fast ticker every 10s — forces reactive nextPayment banner to update
     const tickTimer = setInterval(() => { nowTick = Date.now(); }, 10 * 1000);
@@ -811,7 +812,7 @@
 
     return () => {
       clearInterval(balanceTimer); clearInterval(agoTimer);
-      clearInterval(paymentTimer); clearInterval(tickTimer); clearInterval(alertTimer);
+      clearInterval(tickTimer); clearInterval(alertTimer);
       unlistenPayment();
     };
   });
