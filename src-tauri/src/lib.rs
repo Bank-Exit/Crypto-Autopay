@@ -762,6 +762,29 @@ fn recompute_alerts(
     }
 }
 
+/// Debug: return raw subscription data from DB for a given id.
+#[tauri::command]
+async fn get_subscription_debug(
+    id: String,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<serde_json::Value, String> {
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    let subs = db.list_subscriptions().map_err(|e| e.to_string())?;
+    let found = subs.iter().find(|s| s.id == id || s.id.contains(&id));
+    match found {
+        Some(s) => Ok(serde_json::json!({
+            "id": s.id,
+            "label": s.label,
+            "status": format!("{:?}", s.status),
+            "payments_sent": s.payments_sent,
+            "next_payment_at": s.next_payment_at.map(|d| d.to_rfc3339()),
+            "schedule": s.schedule,
+            "amount": s.amount,
+        })),
+        None => Ok(serde_json::json!({"error": "not found", "all_ids": subs.iter().map(|s| &s.id).collect::<Vec<_>>()})),
+    }
+}
+
 /// Return last known wallet/daemon heights for sync progress display.
 #[tauri::command]
 async fn get_sync_info(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
@@ -1179,7 +1202,11 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     let period_min = cron_period_minutes(&sub.schedule);
                     let new_next = next + chrono::Duration::minutes(period_min);
                     if let Ok(db) = db_state.lock() {
-                        let _ = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1);
+                        if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {
+                            log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
+                        } else {
+                            log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", new_next.to_rfc3339(), sub_id);
+                        }
                     }
                 }
                 // Emit event so frontend can refresh balance and subscription list
@@ -1193,7 +1220,11 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     let retry_at = chrono::Utc::now() + chrono::Duration::minutes(25);
                     if let Some(db_rc) = app.try_state::<Mutex<Database>>() {
                         if let Ok(db) = db_rc.lock() {
-                            let _ = db.update_next_payment(&sub_id, Some(retry_at), sub.payments_sent);
+                            if let Err(e) = db.update_next_payment(&sub_id, Some(retry_at), sub.payments_sent) {
+                                log::error!("[Scheduler] DB retry-defer failed for sub {}: {}", sub_id, e);
+                            } else {
+                                log::info!("[Scheduler] next_payment_at deferred +25min to {} for sub {}", retry_at.to_rfc3339(), sub_id);
+                            }
                         }
                     }
                     // Orange alert: outputs locked, retry scheduled
@@ -1411,6 +1442,7 @@ pub fn run() {
             get_sync_info,
             get_alerts,
             save_subscription,
+            get_subscription_debug,
             get_balance,
             refresh_balance,
             sweep_all,

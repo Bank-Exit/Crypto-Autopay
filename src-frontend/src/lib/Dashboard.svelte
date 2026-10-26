@@ -54,6 +54,8 @@
   }
 
   let activeAlerts = [];
+  let showAlertsOverlay = false;
+  let sessionPayments = []; // in-memory payment log for history page
   async function refreshAlerts() {
     const alerts = await tauriInvoke("get_alerts");
     activeAlerts = alerts || [];
@@ -548,6 +550,14 @@
         if (wallets.length > 0) wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
       }
       showPaymentAnimation(); // fullscreen animation
+      // Log to in-session history
+      sessionPayments = [...sessionPayments, {
+        label: sub.label,
+        amount: sub.amount,
+        currency: sub.currency || 'XMR',
+        sent_at: new Date().toISOString(),
+        tx_hash: result.tx_hash || null,
+      }];
       const rawSched = sub._raw_schedule || sub.schedule;
       const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
       const nextIso = next instanceof Date ? next.toISOString() : new Date(next).toISOString();
@@ -742,11 +752,16 @@
         await pollSyncInfo(); // update after refresh completes
       }
     } catch (e) {
-      if (String(e).includes("RPC busy")) {
+      const errStr = String(e);
+      if (errStr.includes("RPC busy")) {
         logInfo("Dashboard", "Balance refresh skipped (paiement en cours)");
+      } else if (errStr.includes("Locked")) {
+        // Wallet locked (auto-lock), keep last balance as-is, don't flag RPC error
+        logInfo("Dashboard", "Balance refresh skipped (wallet verrouillé)");
+        balanceXmr = null; // show "-.----" since we can't trust old value
       } else {
         rpcOk = false;
-        rpcError = String(e);
+        rpcError = errStr;
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
@@ -796,8 +811,18 @@
       await refreshAlerts();
     });
 
-    const unlistenPayment = await tauriListen("payment-sent", async () => {
+    const unlistenPayment = await tauriListen("payment-sent", async (ev) => {
       logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
+      const payload = ev.payload || {};
+      if (payload.sub_id) {
+        const sub = subscriptions.find(s => s.id === payload.sub_id);
+        if (sub) {
+          sessionPayments = [...sessionPayments, {
+            label: sub.label, amount: sub.amount, currency: sub.currency || 'XMR',
+            sent_at: new Date().toISOString(), tx_hash: payload.tx_hash || null,
+          }];
+        }
+      }
       balanceLoading = true;
       setTimeout(async () => {
         await loadRpcState();
@@ -946,6 +971,13 @@
 
   // Total refill estimate
   $: totalRefillText = (tStr) => refillEstimate(totalBalance, totalMonthlyOut, tStr);
+  // Is refill urgent? (< 7 days remaining)
+  $: refillUrgent = (() => {
+    const bal = parseFloat(totalBalance);
+    if (!totalMonthlyOut || totalMonthlyOut <= 0) return false;
+    const daysLeft = (bal / totalMonthlyOut) * 30;
+    return daysLeft < 7;
+  })();
 
   // Animation subjects (network-aware via PaymentAnimation internals)
   const animSubjects = [
@@ -953,6 +985,39 @@
     { toLabel: "VPN",            xmrAmount: "0.012", btcAmount: "120 sats" },
   ];
 </script>
+
+<!-- Alerts detail overlay -->
+{#if showAlertsOverlay}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showAlertsOverlay = false} role="dialog" aria-modal="true">
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-panel alerts-overlay-panel" on:click|stopPropagation role="document" style="max-width:480px">
+      <div class="modal-header">
+        <h2 class="modal-title">
+          {activeAlerts.some(a => a.level === 'Red') ? '🔴 Alertes critiques' : '🟠 Avertissements'}
+        </h2>
+        <button class="modal-close" on:click={() => showAlertsOverlay = false} aria-label="Fermer">✕</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;padding:16px">
+        {#if activeAlerts.length === 0}
+          <p style="color:var(--text-muted);text-align:center">Aucune alerte active.</p>
+        {:else}
+          {#each activeAlerts as alert}
+            <div class="alert-detail-card" class:alert-detail-red={alert.level === 'Red'} class:alert-detail-orange={alert.level === 'Orange'}>
+              <div class="alert-detail-icon">{alert.level === 'Red' ? '🔴' : '🟠'}</div>
+              <div class="alert-detail-body">
+                <div class="alert-detail-kind">{alert.kind}</div>
+                <div class="alert-detail-msg">{alert.message}</div>
+                <div class="alert-detail-time">{new Date(alert.created_at * 1000).toLocaleTimeString()}</div>
+              </div>
+            </div>
+          {/each}
+        {/if}
+        <button class="btn-ghost" on:click={() => showAlertsOverlay = false} style="margin-top:8px">Fermer</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- Payment loading overlay (shows while payment RPC is running) -->
 {#if showPayLoader}
@@ -1002,10 +1067,14 @@
           <div class="tray-row">
             <span class="status-dot {activeAlerts.some(a => a.level === 'Red') ? 'red' : activeAlerts.some(a => a.level === 'Orange') ? 'orange' : trayStatus}"></span>
             {#if activeAlerts.length > 0}
-              <span class="alert-badge" class:badge-red={activeAlerts.some(a => a.level === 'Red')} class:badge-orange={!activeAlerts.some(a => a.level === 'Red')}>
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <span class="alert-badge" class:badge-red={activeAlerts.some(a => a.level === 'Red')} class:badge-orange={!activeAlerts.some(a => a.level === 'Red')}
+                style="cursor:pointer" on:click={() => showAlertsOverlay = true}>
                 {activeAlerts.length}
               </span>
-              <span class="tray-label" style="color:{activeAlerts.some(a=>a.level==='Red') ? '#ef4444' : '#f97316'}">{activeAlerts.some(a => a.level === 'Red') ? 'Alerte critique' : 'Avertissement'}</span>
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <span class="tray-label" style="color:{activeAlerts.some(a=>a.level==='Red') ? '#ef4444' : '#f97316'};cursor:pointer"
+                on:click={() => showAlertsOverlay = true}>{activeAlerts.some(a => a.level === 'Red') ? 'Alerte critique' : 'Avertissement'}</span>
             {:else}
               <span class="tray-label">OK</span>
             {/if}
@@ -1100,7 +1169,7 @@
       {/if}
 
         {#if balanceXmr === null}
-        <div class="balance-amount" style="font-size:13px;color:var(--text-muted)">{$t.balanceLoading || 'Chargement…'}</div>
+        <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
 
       {:else if rpcOk}
         <!-- Connected: just show the balance -->
@@ -1180,9 +1249,9 @@
       {/if}
 
       <!-- Refill estimate banner -->
-      <div class="refill-banner card">
+      <div class="refill-banner card" class:refill-urgent={refillUrgent}>
         <span class="text-muted">{$t.nextRefillLabel} :</span>
-        <strong>{$t.refillIn} {totalRefillText($t)}</strong>
+        <strong class:refill-urgent-text={refillUrgent}>{$t.refillIn} {totalRefillText($t)}</strong>
         <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <span class="refill-help-link" role="link" tabindex="0"
@@ -1367,8 +1436,40 @@
     {:else if page === "history"}
       <div class="page-header">
         <h1>{$t.navPaymentHistory}</h1>
+        <p class="text-muted" style="font-size:12px;margin-top:4px">Paiements envoyés cette session (en mémoire). L'historique complet sera en DB dans une prochaine version.</p>
       </div>
-      <p class="text-muted placeholder-msg">— {$t.navPaymentHistory} (à venir) —</p>
+      {#if sessionPayments.length === 0}
+        <div class="card" style="padding:24px;text-align:center;color:var(--text-muted)">
+          Aucun paiement envoyé durant cette session.
+        </div>
+      {:else}
+        <div class="history-list">
+          {#each [...sessionPayments].reverse() as p}
+            <div class="history-card card">
+              <div class="history-row">
+                <span class="history-label">{p.label}</span>
+                <span class="history-amount">{p.amount} {p.currency || 'XMR'}</span>
+              </div>
+              <div class="history-row history-meta">
+                <span class="text-muted">{new Date(p.sent_at).toLocaleString()}</span>
+                {#if p.tx_hash}
+                  <span class="history-tx">tx: {p.tx_hash.slice(0,16)}…</span>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+        <!-- Summary: total per sub from subscriptions list -->
+        <div class="card" style="margin-top:12px;padding:12px 16px">
+          <div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:8px">TOTAL PAR ABONNEMENT</div>
+          {#each subscriptions.filter(s => (s.payments_sent || 0) > 0) as sub}
+            <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;border-bottom:1px solid var(--border)">
+              <span>{sub.label}</span>
+              <span>{sub.payments_sent} envoi(s) · {(sub.payments_sent * parseFloat(sub.amount)).toFixed(4)} {sub.currency || 'XMR'}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
 
     <!-- ====== SETTINGS ====== -->
     {:else if page === "settings"}
@@ -1736,7 +1837,7 @@
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">{editingSubData ? "Modifier l'abonnement" : "Nouvel abonnement"}</h2>
+        <h2 class="modal-title">{editingSubData ? "Modifier l'abonnement" : "Nouvel abonnement"} <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
         <button class="modal-close" on:click={() => { showNewSubModal = false; editingSubData = null; }} aria-label="Fermer">✕</button>
       </div>
       <div class="modal-body">
@@ -1760,7 +1861,7 @@
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">Importer un code AutoPay</h2>
+        <h2 class="modal-title">Importer un code AutoPay <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
         <button class="modal-close" on:click={() => showImportModal = false} aria-label="Fermer">✕</button>
       </div>
       <div class="modal-body">
@@ -2008,6 +2109,35 @@
     align-items: center;
   }
 
+  /* Payment history */
+  .history-list { display: flex; flex-direction: column; gap: 8px; }
+  .history-card { padding: 12px 16px; }
+  .history-row { display: flex; justify-content: space-between; align-items: center; }
+  .history-label { font-weight: 600; font-size: 14px; }
+  .history-amount { font-weight: 700; color: var(--accent); font-size: 14px; }
+  .history-meta { margin-top: 4px; }
+  .history-tx { font-size: 10px; color: var(--text-muted); font-family: monospace; }
+
+  /* Alert overlay */
+  .alerts-overlay-panel { width: 100%; }
+  .alert-detail-card {
+    display: flex; gap: 10px; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .alert-detail-red { border-color: #ef444440; background: #ef444408; }
+  .alert-detail-orange { border-color: #f9731640; background: #f9731608; }
+  .alert-detail-icon { font-size: 18px; flex-shrink: 0; }
+  .alert-detail-body { display: flex; flex-direction: column; gap: 3px; }
+  .alert-detail-kind { font-size: 11px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.05em; }
+  .alert-detail-msg { font-size: 13px; color: var(--text); }
+  .alert-detail-time { font-size: 10px; color: var(--text-muted); }
+
+  .refill-urgent { border: 1px solid #f97316 !important; background: #f9731608 !important; }
+  .refill-urgent-text { color: #f97316 !important; animation: blink-orange 1.5s ease-in-out infinite; }
+  @keyframes blink-orange {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
   .next-banner, .refill-banner {
     display: flex;
     align-items: center;
