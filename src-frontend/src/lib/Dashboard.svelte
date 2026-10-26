@@ -53,6 +53,29 @@
     payAnimTimer = setTimeout(() => { showPayAnim = false; }, 4000);
   }
 
+  /** Translate Rust alert kind → human message in current language */
+  function translateAlertMsg(alert, tObj) {
+    // Extract numeric params from Rust message (e.g. "~3 jour(s)" → 3)
+    const numMatch = alert.message.match(/(\d+(?:\.\d+)?)/);
+    const num = numMatch ? Math.round(parseFloat(numMatch[1])) : null;
+    const threshMatch = alert.message.match(/seuil\s*:\s*(\d+)/);
+    const thresh = threshMatch ? parseInt(threshMatch[1]) : 7;
+    switch (alert.kind) {
+      case 'BALANCE_LOW':
+        if (num !== null && num < 1) return tObj.alertBalanceLowSoon || `${tObj.refillLessThanOneDay || 'moins de 1 jour'} (${tObj.alertThreshold || 'seuil'}: ${thresh}j)`;
+        return (tObj.alertBalanceLow || 'Portefeuille vide dans ~{n} jour(s) (seuil: {t}j)').replace('{n}', num ?? '?').replace('{t}', thresh);
+      case 'BALANCE_EMPTY': return tObj.alertBalanceEmpty || 'Solde nul — les paiements récurrents ne peuvent pas être envoyés';
+      case 'PAYMENT_FAILED': return tObj.alertPaymentFailed || 'Échec d\'un paiement';
+      case 'OUTPUTS_LOCKED': return tObj.alertOutputsLocked || 'Fonds verrouillés (confirmations en cours), nouvel essai dans 25 min';
+      case 'CANARY_EXPIRED': return tObj.alertCanaryExpired || 'Canary expiré pour un abonnement';
+      case 'CANARY_UNREACHABLE': return tObj.alertCanaryUnreachable || 'Canary inaccessible';
+      case 'PAYMENT_OVERDUE_SOFT': return tObj.alertOverdueSoft || 'Paiement en retard (dans la tolérance)';
+      case 'PAYMENT_OVERDUE_HARD': return tObj.alertOverdueHard || 'Paiement en retard critique — dépassement de la tolérance';
+      case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced || 'Wallet non synchronisé avec la blockchain';
+      default: return alert.message;
+    }
+  }
+
   let activeAlerts = [];
   let showAlertsOverlay = false;
   let sessionPayments = []; // in-memory payment log for history page
@@ -906,12 +929,8 @@
     { id: 2, name: "Wallet services",    desc: "VPN et hébergement",       balance: "1.21", color: "#2e7d32", monthlyOut: 0.04 },
   ];
 
-  // Keep wallet[0] balance + monthlyOut in sync with live data
-  $: if (balanceXmr !== null && wallets.length > 0) {
-    wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4), monthlyOut: totalMonthlyOut };
-    wallets = wallets; // trigger reactivity
-  }
-  $: totalBalance = wallets.length > 0 ? (balanceXmr ?? parseFloat(wallets[0].balance)).toFixed(3) : "0.000";
+  // Derive totalBalance directly — avoids wallets self-write loop
+  $: totalBalance = balanceXmr !== null ? balanceXmr.toFixed(3) : (wallets[0]?.balance ?? "0.000");
 
   // Compute monthly spending from REAL active subscriptions (not mock wallet data)
   $: totalMonthlyOut = (() => {
@@ -937,6 +956,7 @@
   // Computed from actual subscriptions (reactive, refreshed every 10s via nowTick)
   $: nextPayment = (() => {
     void nowTick; // declare dependency so Svelte re-runs when nowTick changes
+    const t_snap = $t; // track language changes
     const now = Date.now();
     const active = subscriptions.filter(s =>
       ["Active", "Actif"].includes(s.status) && s.next_payment_at
@@ -949,12 +969,14 @@
     const h = Math.floor(ms / 3600000);
     const m = Math.floor(ms / 60000);
     const s = Math.floor(ms / 1000);
+    const inPfx = t_snap.inPrefix || "dans";
+    const dSfx = t_snap.inDaysSuffix || "jours";
     let label_time;
-    if (s < 0) label_time = "maintenant";
-    else if (s < 60) label_time = `dans ${s}s`;
-    else if (m < 60) label_time = `dans ${m} min`;
-    else if (h < 24) label_time = `dans ${h}h`;
-    else label_time = `J-${days}`;
+    if (s <= 0) label_time = t_snap.now || "maintenant";
+    else if (s < 60) label_time = `${inPfx} ${s}s`;
+    else if (m < 60) label_time = `${inPfx} ${m} min`;
+    else if (h < 24) label_time = `${inPfx} ${h}h`;
+    else label_time = `${t_snap.dayMinus || 'J-'}${days}`;
     return { label: soonest.label, amount: soonest.amount, in_days: days, label_time, sub: soonest };
   })();
 
@@ -1051,7 +1073,7 @@
               <div class="alert-detail-icon">{alert.level === 'Red' ? '🔴' : '🟠'}</div>
               <div class="alert-detail-body">
                 <div class="alert-detail-kind">{alert.kind}</div>
-                <div class="alert-detail-msg">{alert.message}</div>
+                <div class="alert-detail-msg">{translateAlertMsg(alert, $t)}</div>
                 <div class="alert-detail-time">{new Date(alert.created_at * 1000).toLocaleTimeString()}</div>
               </div>
             </div>

@@ -36,19 +36,21 @@
     return Math.max(0, next - now);
   }
 
-  /** Human-readable countdown */
+  /** Human-readable countdown — uses i18n $t */
   function countdownText(sub, now) {
     const ms = remainingMs(sub, now);
     if (ms === null) return null;
-    if (ms <= 0) return "Maintenant";
+    const inPfx = $t.inPrefix || "dans";
+    const dayPfx = $t.dayMinus || "J-";
+    if (ms <= 0) return $t.now || "Maintenant";
     const s = Math.floor(ms / 1000);
-    if (s < 60) return `Dans ${s}s`;
+    if (s < 60) return `${inPfx} ${s}s`;
     const m = Math.floor(s / 60);
-    if (m < 60) return `Dans ${m}min`;
+    if (m < 60) return `${inPfx} ${m}min`;
     const h = Math.floor(m / 60);
-    if (h < 24) return `Dans ${h}h`;
+    if (h < 24) return `${inPfx} ${h}h`;
     const d = Math.floor(h / 24);
-    return `J-${d}`;
+    return `${dayPfx}${d}`;
   }
 
   /** Fraction of period elapsed (0 = just paid, 1 = due now), for pie chart.
