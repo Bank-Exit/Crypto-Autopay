@@ -826,7 +826,7 @@
       amount: String(s.amount || "0"),
       currency: s.currency || "XMR",
       schedule: scheduleToHuman(s.schedule, s.repeat_every || 1, $currentLang),
-      next_payment_at: s.next_payment_at ? s.next_payment_at.slice(0, 10) : null,
+      next_payment_at: s.next_payment_at || null, // keep full ISO timestamp — do NOT slice to date only
       status: s.status === "active" ? "Active" : s.status === "paused" ? "Paused" : (s.status || "Active"),
       canary_status: s.canary_url ? (s.last_canary_status || "Ok") : "NotConfigured",
       payments_sent: s.payments_sent || 0,
@@ -853,13 +853,30 @@
     { id: 2, name: "Wallet services",    desc: "VPN et hébergement",       balance: "1.21", color: "#2e7d32", monthlyOut: 0.04 },
   ];
 
-  // Keep wallet[0] balance in sync with the live RPC balance
+  // Keep wallet[0] balance + monthlyOut in sync with live data
   $: if (balanceXmr !== null && wallets.length > 0) {
-    wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
+    wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4), monthlyOut: totalMonthlyOut };
     wallets = wallets; // trigger reactivity
   }
-  $: totalBalance = wallets.reduce((s, w) => s + parseFloat(w.balance), 0).toFixed(3);
-  $: totalMonthlyOut = wallets.reduce((s, w) => s + (w.monthlyOut || 0), 0);
+  $: totalBalance = wallets.length > 0 ? (balanceXmr ?? parseFloat(wallets[0].balance)).toFixed(3) : "0.000";
+
+  // Compute monthly spending from REAL active subscriptions (not mock wallet data)
+  $: totalMonthlyOut = (() => {
+    const MINS_PER_MONTH = 43200;
+    return subscriptions
+      .filter(s => ["Active", "Actif"].includes(s.status))
+      .reduce((sum, s) => {
+        const amt = parseFloat(s.amount) || 0;
+        const raw = s._raw_schedule || s.schedule || "";
+        const parts = raw.trim().split(/\s+/);
+        const minField = parts.length >= 6 ? parts[1] : parts[0];
+        let periodMin = MINS_PER_MONTH; // default monthly
+        if (minField?.startsWith("*/")) periodMin = parseInt(minField.slice(2)) || MINS_PER_MONTH;
+        else if (minField === "0" && parts.length >= 3) periodMin = 60; // hourly
+        const sendsPerMonth = MINS_PER_MONTH / Math.max(1, periodMin);
+        return sum + amt * sendsPerMonth;
+      }, 0);
+  })();
 
   // Ticker updated every 10s by setInterval — forces nextPayment label to recompute
   let nowTick = Date.now();
