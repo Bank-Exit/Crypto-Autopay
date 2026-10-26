@@ -779,6 +779,11 @@
       const b = await tauriInvoke("refresh_balance");
       if (b) {
         balanceXmr = b.xmr;
+        // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
+        if (wallets.length > 0) {
+          wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
+          wallets = [...wallets];
+        }
         rpcOk = true;
         rpcError = null;
         lastBalanceRefresh = Date.now();
@@ -929,8 +934,18 @@
     { id: 2, name: "Wallet services",    desc: "VPN et hébergement",       balance: "1.21", color: "#2e7d32", monthlyOut: 0.04 },
   ];
 
-  // Derive totalBalance directly — avoids wallets self-write loop
+  // Derive totalBalance from live balanceXmr — pure read, no loop
   $: totalBalance = balanceXmr !== null ? balanceXmr.toFixed(3) : (wallets[0]?.balance ?? "0.000");
+
+  // Keep wallets[0].monthlyOut in sync using a guard to break the reactive loop
+  let _lastMonthlyOut = -1;
+  $: if (totalMonthlyOut !== _lastMonthlyOut) {
+    _lastMonthlyOut = totalMonthlyOut;
+    if (wallets.length > 0) {
+      wallets[0] = { ...wallets[0], monthlyOut: totalMonthlyOut };
+      wallets = [...wallets];
+    }
+  }
 
   // Compute monthly spending from REAL active subscriptions (not mock wallet data)
   $: totalMonthlyOut = (() => {
@@ -1355,8 +1370,8 @@
               <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
             </svg>
             <div>
-              <strong>Vie privée maximale</strong>
-              <p>Aucune donnée envoyée à l'extérieur par défaut. Zéro tracking, zéro analytics.</p>
+              <strong>{$t.featurePrivacyTitle || 'Vie privée maximale'}</strong>
+              <p>{$t.featurePrivacyDesc || 'Aucune donnée envoyée à l\'extérieur. Zéro tracking, zéro analytics.'}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -1364,8 +1379,8 @@
               <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
             </svg>
             <div>
-              <strong>Anonymat Monero</strong>
-              <p>Transactions confidentielles par protocole. Montants et identités masqués.</p>
+              <strong>{$t.featureMoneroTitle || 'Anonymat Monero'}</strong>
+              <p>{$t.featureMoneroDesc || 'Transactions confidentielles par protocole. Montants et identités masqués.'}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -1373,8 +1388,8 @@
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
             <div>
-              <strong>Seed chiffrée post-quantique</strong>
-              <p>Argon2id + AES-256-GCM. Résistant aux attaques quantiques futures.</p>
+              <strong>{$t.featureSeedTitle || 'Seed chiffrée post-quantique'}</strong>
+              <p>{$t.featureSeedDesc || 'Argon2id + AES-256-GCM. Résistant aux attaques quantiques.'}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -1382,12 +1397,12 @@
               <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
             </svg>
             <div>
-              <strong>Open source</strong>
-              <p>Code auditable. Pas de tiers de confiance. Vous contrôlez vos clés.</p>
+              <strong>{$t.featureOpenSourceTitle || 'Open source'}</strong>
+              <p>{$t.featureOpenSourceDesc || 'Code auditable. Pas de tiers de confiance. Vous contrôlez vos clés.'}</p>
             </div>
           </div>
         </div>
-        <p class="sub-footer-version">Crypto AutoPay v0.2 · 2026 · open source · <span class="sub-footer-tagline">Vos paiements, vos règles.</span></p>
+        <p class="sub-footer-version">Crypto AutoPay v0.2 · 2026 · open source · <span class="sub-footer-tagline">{$t.footerTagline || 'Vos paiements, vos règles.'}</span></p>
       </div>
 
     <!-- ====== WALLETS ====== -->
@@ -1814,8 +1829,8 @@
               <h2>{$t.sweepTitle || 'Vider le wallet'}</h2>
               <p class="sweep-warn">{$t.sweepWarning || '⚠️ Cette action est irréversible.'}</p>
               <p class="subs-subtitle">{$t.sweepDesc || 'Envoyer tous les fonds disponibles vers une autre adresse Monero.'}</p>
-              <label class="sweep-label">{$t.sweepDestLabel || 'Adresse de destination'}</label>
-              <input
+              <label class="sweep-label" for="sweep-dest">{$t.sweepDestLabel || 'Adresse de destination'}</label>
+              <input id="sweep-dest"
                 class="sweep-input"
                 type="text"
                 bind:value={sweepDest}

@@ -337,7 +337,9 @@
   .kebab-trigger { color: var(--accent); }
   .kebab-trigger:hover { background: var(--accent-light); }
 
-  .sub-actions { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; }
+  .sub-actions { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; flex-shrink: 0; }
+  /* Ensure sub-card is always a flex row */
+  .sub-card { display: flex !important; align-items: flex-start; }
 
   /* Kebab menu */
   .kebab-wrap { position: relative; }
