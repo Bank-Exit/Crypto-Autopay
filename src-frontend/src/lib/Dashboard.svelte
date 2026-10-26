@@ -426,7 +426,7 @@
 
   // ---- RPC settings state ----
   let rpcStatus = "stopped";
-  let rpcStatusLabel = "Arrêté";
+  let rpcStatusLabel = "";
   let rpcBinaryPath = null;
   let publicNodes = [];
   let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20, send_logs_enabled: false };
@@ -439,7 +439,7 @@
       tauriInvoke("get_public_nodes"),
     ]);
     rpcStatus = (typeof status === "string" ? status : status?.toString?.() ?? "stopped").toLowerCase();
-    rpcStatusLabel = rpcStatus === "running" ? "En marche" : rpcStatus === "starting" ? "Démarrage…" : rpcStatus === "stopped" ? "Arrêté" : "Erreur";
+    rpcStatusLabel = null; // computed via $t in template
     rpcBinaryPath = binary;
     publicNodes = nodes ?? [];
     logInfo("RPC", `Status: ${JSON.stringify(status)}, binary: ${binary ?? "not found"}, nodes: ${nodes?.length ?? 0}`);
@@ -781,7 +781,7 @@
         balanceXmr = b.xmr;
         // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
         if (wallets.length > 0) {
-          wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
+          wallets[0] = { ...wallets[0], balance: b.xmr.toFixed(4) };
           wallets = [...wallets];
         }
         rpcOk = true;
@@ -887,7 +887,8 @@
       }, 5000);
     });
 
-    // Refresh alerts periodically
+    // Refresh alerts immediately on balance update + periodically
+    await tauriListen("alerts-updated", () => refreshAlerts());
     await refreshAlerts();
     const alertTimer = setInterval(refreshAlerts, 60 * 1000);
 
@@ -930,8 +931,8 @@
 
   // Mock wallets with monthly spend estimates
   let wallets = [
-    { id: 1, name: "Wallet principal",   desc: "Médias & créateurs",       balance: "0.82", color: "#f26822", monthlyOut: 0.07 },
-    { id: 2, name: "Wallet services",    desc: "VPN et hébergement",       balance: "1.21", color: "#2e7d32", monthlyOut: 0.04 },
+    // Single real wallet — balance starts null (unknown), updated after first RPC refresh
+    { id: 1, name: "Wallet principal", desc: "", balance: null, color: "#f26822", monthlyOut: 0 },
   ];
 
   // Derive totalBalance from live balanceXmr — pure read, no loop
@@ -987,8 +988,13 @@
     const inPfx = t_snap.inPrefix || "dans";
     const dSfx = t_snap.inDaysSuffix || "jours";
     let label_time;
-    if (s <= 0) label_time = t_snap.now || "maintenant";
-    else if (s < 60) label_time = `${inPfx} ${s}s`;
+    if (s <= 0) {
+      const late = Math.abs(ms);
+      const lm = Math.floor(late / 60000);
+      const lh = Math.floor(lm / 60);
+      const ld = Math.floor(lh / 24);
+      label_time = ld >= 1 ? `J+${ld}` : lh >= 1 ? `+${lh}h` : lm >= 1 ? `+${lm}min` : (t_snap.now || 'maintenant');
+    } else if (s < 60) label_time = `${inPfx} ${s}s`;
     else if (m < 60) label_time = `${inPfx} ${m} min`;
     else if (h < 24) label_time = `${inPfx} ${h}h`;
     else label_time = `${t_snap.dayMinus || 'J-'}${days}`;
@@ -1445,9 +1451,14 @@
                   <button class="btn-ghost btn-sm" on:click={() => startEditWallet(w)}>{$t.walletEdit}</button>
                 </div>
                 <div class="wallet-balance">
-                  <span class="balance-num text-accent">{w.balance} {$currentNetwork.symbol}</span>
+                  {#if w.balance === null}
+                    <span class="balance-num" style="color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</span>
+                  {:else}
+                    <span class="balance-num text-accent">{w.balance} {$currentNetwork.symbol}</span>
+                  {/if}
                 </div>
               <div class="wallet-limit-warn">
+                {#if w.balance !== null}
                 <div class="limit-bar">
                   <div class="limit-fill" style="width:{Math.min(parseFloat(w.balance)/2*100,100)}%; background:{w.color}"></div>
                 </div>
@@ -1458,6 +1469,10 @@
                       {$t.walletRefillIn} {refillEstimate(w.balance, w.monthlyOut, $t)}
                     </span>
                   {/if}
+                </div>
+                {:else}
+                  <p style="font-size:11px;color:var(--text-muted);margin:4px 0">Solde en attente de synchronisation…</p>
+                {/if}
                 </div>
               </div>
               </div>
@@ -1671,29 +1686,33 @@
       <h2 class="section-title">Wallet RPC <span class="badge-v2">v0.2</span></h2>
       <div class="settings-section card">
         <div class="rpc-status-row">
-          <span class="setting-label">Statut wallet-rpc</span>
-          <span class="rpc-badge rpc-{rpcStatus}">{rpcStatusLabel}</span>
+          <span class="setting-label">{$t.rpcStatus || 'Statut wallet-rpc'}</span>
+          <span class="rpc-badge rpc-{rpcStatus}">
+            {rpcStatus === 'running' ? ($t.rpcRunning || 'En marche') :
+             rpcStatus === 'starting' ? ($t.rpcStarting || 'Démarrage…') :
+             rpcStatus === 'stopped' ? ($t.rpcStopped || 'Arrêté') : ($t.rpcError || 'Erreur')}
+          </span>
         </div>
         {#if rpcBinaryPath}
-          <p class="rpc-info">Binaire détecté : <code>{rpcBinaryPath}</code></p>
+          <p class="rpc-info">{$t.rpcBinaryFound || 'Binaire détecté'} : <code>{rpcBinaryPath}</code></p>
         {:else}
           <p class="rpc-warn">
-            ⚠ <code>monero-wallet-rpc</code> introuvable dans PATH.<br>
+            ⚠ <code>monero-wallet-rpc</code> {$t.rpcBinaryMissing || 'introuvable dans PATH'}.<br>
             <a class="rpc-link" href="https://www.getmonero.org/downloads/" on:click|preventDefault={() => openExternal("https://www.getmonero.org/downloads/")}>
-              Télécharger Monero CLI →
+              {$t.rpcDownload || 'Télécharger Monero CLI'} →
             </a>
-            ou renseigner le chemin ci-dessous.
+            {$t.rpcOrSetPath || 'ou renseigner le chemin ci-dessous.'}
           </p>
           <label class="field" style="margin-top:8px">
-            <span>Chemin du binaire (optionnel)</span>
+            <span>{$t.rpcBinaryPath || 'Chemin du binaire (optionnel)'}</span>
             <input type="text" bind:value={rpcConfig.binary_path} placeholder="/usr/bin/monero-wallet-rpc" />
           </label>
         {/if}
 
         <label class="field" style="margin-top:10px">
-          <span>Nœud Monero public</span>
+          <span>{$t.rpcPublicNode || 'Nœud Monero public'}</span>
           <select bind:value={rpcConfig.daemon_address} class="setting-select" style="width:100%">
-            <option value="">Automatique (premier nœud disponible)</option>
+            <option value="">{$t.rpcNodeAuto || 'Automatique (premier nœud disponible)'}</option>
             {#each publicNodes as node}
               <option value={node}>{node}</option>
             {/each}
@@ -1701,8 +1720,8 @@
         </label>
 
         <label class="field" style="margin-top:10px">
-          <span>Tolérance paiement <strong>{rpcConfig.tolerance_pct}%</strong>
-            <span class="text-muted" style="font-size:10px"> — ex: 20% = ±6j sur mensuel</span>
+          <span>{$t.rpcTolerance || 'Tolérance paiement'} <strong>{rpcConfig.tolerance_pct}%</strong>
+            <span class="text-muted" style="font-size:10px"> — {$t.rpcToleranceHint || 'ex: 20% = ±6j sur mensuel'}</span>
           </span>
           <input type="range" min="5" max="50" step="5" bind:value={rpcConfig.tolerance_pct} />
         </label>
@@ -2119,7 +2138,7 @@
   /* Receive page */
   .receive-page { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; gap: 20px; padding-top: 12px; }
   .qr-wrapper { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.12); }
-  .qr-wrapper svg { display: block; }
+  .qr-wrapper :global(svg) { display: block; }
   .receive-address-box { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 100%; }
   .receive-address { font-family: monospace; font-size: 12px; word-break: break-all; text-align: center; color: var(--text-muted); padding: 8px 12px; background: var(--surface); border-radius: 6px; border: 1px solid var(--border); width: 100%; box-sizing: border-box; }
   .btn-copy { padding: 8px 18px; background: var(--accent); color: #fff; border: none; border-radius: 7px; font-size: 13px; cursor: pointer; }

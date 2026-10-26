@@ -36,13 +36,25 @@
     return Math.max(0, next - now);
   }
 
-  /** Human-readable countdown — uses i18n $t */
+  /** Human-readable countdown — uses i18n $t.
+   *  Negative ms = overdue: shows how late (J+X / h+X). */
   function countdownText(sub, now) {
     const ms = remainingMs(sub, now);
     if (ms === null) return null;
     const inPfx = $t.inPrefix || "dans";
     const dayPfx = $t.dayMinus || "J-";
-    if (ms <= 0) return $t.now || "Maintenant";
+    if (ms <= 0) {
+      // Overdue — show delay
+      const late = Math.abs(new Date(sub.next_payment_at) - now);
+      const ls = Math.floor(late / 1000);
+      const lm = Math.floor(ls / 60);
+      const lh = Math.floor(lm / 60);
+      const ld = Math.floor(lh / 24);
+      if (ld >= 1) return `J+${ld}`;
+      if (lh >= 1) return `+${lh}h`;
+      if (lm >= 1) return `+${lm}min`;
+      return $t.now || 'maintenant';
+    }
     const s = Math.floor(ms / 1000);
     if (s < 60) return `${inPfx} ${s}s`;
     const m = Math.floor(s / 60);

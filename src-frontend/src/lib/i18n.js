@@ -171,6 +171,15 @@ const T = {
     back: "Retour",
     continue: "Continuer →",
 
+    // RPC settings
+    rpcStatus: "Statut wallet-rpc", rpcRunning: "En marche", rpcStarting: "Démarrage…",
+    rpcStopped: "Arrêté", rpcError: "Erreur",
+    rpcBinaryFound: "Binaire détecté", rpcBinaryMissing: "introuvable dans PATH",
+    rpcDownload: "Télécharger Monero CLI", rpcOrSetPath: "ou renseigner le chemin ci-dessous.",
+    rpcBinaryPath: "Chemin du binaire (optionnel)",
+    rpcPublicNode: "Nœud Monero public", rpcNodeAuto: "Automatique (premier nœud disponible)",
+    rpcTolerance: "Tolérance paiement", rpcToleranceHint: "ex: 20% = ±6j sur mensuel",
+
     // Subscription list footer features
     featurePrivacyTitle: "Vie privée maximale",
     featurePrivacyDesc: "Aucune donnée envoyée à l'extérieur. Zéro tracking, zéro analytics.",
@@ -397,6 +406,13 @@ const T = {
     back: "Back",
     continue: "Continue →",
 
+    rpcStatus: "Wallet-RPC status", rpcRunning: "Running", rpcStarting: "Starting…",
+    rpcStopped: "Stopped", rpcError: "Error",
+    rpcBinaryFound: "Binary detected", rpcBinaryMissing: "not found in PATH",
+    rpcDownload: "Download Monero CLI", rpcOrSetPath: "or set the path below.",
+    rpcBinaryPath: "Binary path (optional)",
+    rpcPublicNode: "Public Monero node", rpcNodeAuto: "Auto (first available node)",
+    rpcTolerance: "Payment tolerance", rpcToleranceHint: "e.g. 20% = ±6d on monthly",
     featurePrivacyTitle: "Maximum privacy",
     featurePrivacyDesc: "No data sent externally. Zero tracking, zero analytics.",
     featureMoneroTitle: "Monero anonymity",

@@ -548,7 +548,7 @@
           <span>{l("Nombre de paiements", "Number of payments")} <span class="hint">0 = {l("illimité","unlimited")}</span></span>
           <input type="number" bind:value={payload.number_of_payments} min="0" step="1" />
         </label>
-        {#if !startImmediately}
+        {#if startMode === 'wait'}
         <label class="field field-sm">
           <span>{l("Date de début", "Start date")}</span>
           <input type="date" bind:value={payload.start_date} />
@@ -1016,12 +1016,7 @@
   .schedule-human { font-weight: 600; color: var(--accent); }
   .schedule-cron { font-size: 10px; color: var(--text-muted); font-family: monospace; text-align: right; white-space: nowrap; }
 
-  /* iOS toggle */
-  .start-toggle-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    padding: 8px 0; border-top: 1px solid var(--border);
-  }
-  .start-toggle-label { font-size: 13px; color: var(--text); flex: 1; }
+  /* (start-toggle-row and start-toggle-label removed — replaced by start-mode-seg) */
   /* 3-state start mode selector */
   .start-mode-row { display: flex; flex-direction: column; gap: 6px; }
   .start-mode-label { font-size: 13px; font-weight: 600; }

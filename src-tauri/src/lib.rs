@@ -657,6 +657,24 @@ async fn refresh_balance(
         s.last_wallet_height = wallet_height;
         s.last_daemon_height = daemon_height;
     }
+
+    // Recompute alerts immediately after balance update — don't wait for scheduler cycle
+    if let (Some(state_rc), Some(db_rc)) = (
+        app_handle.try_state::<Mutex<AppState>>(),
+        app_handle.try_state::<Mutex<Database>>(),
+    ) {
+        if let (Ok(mut s), Ok(db)) = (state_rc.lock(), db_rc.lock()) {
+            if let Ok(subs) = db.list_subscriptions() {
+                let worst = recompute_alerts(&mut s, &subs, chrono::Utc::now().timestamp());
+                let count = s.alerts.len();
+                drop(s);
+                update_tray_icon(&app_handle, worst, count);
+            }
+        }
+        // Notify frontend to refresh alerts immediately
+        app_handle.emit("alerts-updated", ()).ok();
+    }
+
     Ok(BalanceResponse { xmr, atomic })
 }
 
@@ -674,7 +692,6 @@ fn recompute_alerts(
     subs: &[Subscription],
     now_ts: i64,
 ) -> Option<AlertLevel> {
-    use chrono::Utc;
     let mut alerts: Vec<AppAlert> = Vec::new();
 
     let balance_xmr = state.balance_atomic as f64 / 1e12;
@@ -1085,7 +1102,6 @@ fn cron_period_minutes(cron: &str) -> i64 {
 
 /// Update the system tray icon based on current alert level.
 fn update_tray_icon(app: &tauri::AppHandle, level: Option<AlertLevel>, alert_count: usize) {
-    use tauri::tray::TrayIconId;
     let icon_bytes: &[u8] = match level {
         Some(AlertLevel::Red)    => include_bytes!("../icons/tray-alert.png"),
         Some(AlertLevel::Orange) => include_bytes!("../icons/tray-warn.png"),
@@ -1445,7 +1461,7 @@ pub fn run() {
             // System tray: minimize-to-tray with alert icon
             let tray_icon_bytes = include_bytes!("../icons/tray-ok.png");
             if let Ok(img) = tauri::image::Image::from_bytes(tray_icon_bytes) {
-                let tray = tauri::tray::TrayIconBuilder::with_id("main")
+                let _tray = tauri::tray::TrayIconBuilder::with_id("main")
                     .icon(img)
                     .tooltip("Crypto AutoPay")
                     .on_tray_icon_event(|tray, event| {
