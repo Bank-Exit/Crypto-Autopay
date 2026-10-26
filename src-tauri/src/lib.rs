@@ -70,6 +70,10 @@ pub struct AppState {
     pub rpc_busy: Arc<AtomicBool>,
     /// RPC process manager.
     pub rpc: RpcManager,
+    /// Alert config: minimum days of runway before BALANCE_LOW fires (default 7).
+    pub balance_low_threshold_days: f64,
+    /// Alert preferences: which alert kinds are enabled (all enabled by default).
+    pub enabled_alerts: std::collections::HashSet<String>,
 }
 
 // ============================================================
@@ -699,15 +703,16 @@ fn recompute_alerts(
         amt * sends_per_month
     }).sum();
 
-    // ORANGE: balance will run out in < 30 days
+    // ORANGE: balance will run out before threshold (default 7 days)
+    let threshold_days = state.balance_low_threshold_days.max(1.0);
     if balance_xmr > 0.0 && monthly_xmr > 0.0 {
         let days_left = (balance_xmr / monthly_xmr) * 30.0;
-        if days_left < 30.0 && days_left >= 0.0 {
+        if days_left < threshold_days && days_left >= 0.0 {
             alerts.push(AppAlert {
                 level: AlertLevel::Orange,
                 kind: "BALANCE_LOW".into(),
                 sub_id: None,
-                message: format!("Wallet balance will run out in ~{:.0} days at current spending rate", days_left),
+                message: format!("Portefeuille vide dans ~{:.0} jour(s) au rythme actuel (seuil : {:.0}j)", days_left, threshold_days),
                 created_at: now_ts,
             });
         }
@@ -760,6 +765,23 @@ fn recompute_alerts(
     } else {
         None
     }
+}
+
+/// Update alert configuration (threshold and enabled kinds).
+#[tauri::command]
+async fn set_alert_config(
+    balance_low_threshold_days: Option<f64>,
+    enabled_alerts: Option<Vec<String>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    if let Some(days) = balance_low_threshold_days {
+        s.balance_low_threshold_days = days.max(1.0);
+    }
+    if let Some(kinds) = enabled_alerts {
+        s.enabled_alerts = kinds.into_iter().collect();
+    }
+    Ok(())
 }
 
 /// Debug: return raw subscription data from DB for a given id.
@@ -1351,6 +1373,16 @@ pub fn run() {
                 alerts: Vec::new(),
                 rpc_busy: Arc::new(AtomicBool::new(false)),
                 rpc: RpcManager::new(rpc_config),
+                balance_low_threshold_days: 7.0,
+                enabled_alerts: {
+                    let mut s = std::collections::HashSet::new();
+                    for k in &["BALANCE_LOW","BALANCE_EMPTY","PAYMENT_FAILED","CANARY_EXPIRED",
+                               "CANARY_UNREACHABLE","PAYMENT_OVERDUE_SOFT","PAYMENT_OVERDUE_HARD",
+                               "WALLET_NOT_SYNCED","OUTPUTS_LOCKED"] {
+                        s.insert(k.to_string());
+                    }
+                    s
+                },
             }));
 
             // Enable logging to both stdout and webview (always, not just debug)
@@ -1445,6 +1477,7 @@ pub fn run() {
             get_wallet_info,
             get_sync_info,
             get_alerts,
+            set_alert_config,
             save_subscription,
             get_subscription_debug,
             get_balance,

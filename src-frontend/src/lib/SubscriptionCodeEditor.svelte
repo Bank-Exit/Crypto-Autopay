@@ -94,8 +94,8 @@
 
   let schedulePresetId = "monthly";
   let multiYearN = 2;          // for biennial/triennial custom
-  // Start immediately vs wait for next occurrence
-  let startImmediately = true;
+  // Start mode: null = not chosen (blocks submit), 'now' = immediately, 'wait' = next occurrence
+  let startMode = null; // must be chosen by user
   let showAdvanced = false;
   let generatedCode = "";
   let generatedError = "";
@@ -185,7 +185,7 @@
     if (payload.number_of_payments > 0) clean.number_of_payments = payload.number_of_payments;
     if (payload.start_date) clean.start_date = payload.start_date;
     if (payload.canary_url.trim()) clean.canary_url = payload.canary_url.trim();
-    clean.start_immediately = startImmediately;
+    clean.start_immediately = startMode === 'now';
     return { payload: clean };
   }
 
@@ -556,22 +556,25 @@
         {/if}
       </div>
 
-      <!-- Start immediately toggle (mandatory, iPhone style) -->
-      <div class="start-toggle-row">
-        <span class="start-toggle-label">
-          {startImmediately
-            ? l("Commencer les envois immédiatement", "Start sending immediately")
-            : l("Attendre la prochaine occurrence", "Wait for next scheduled occurrence")}
-        </span>
-        <button
-          class="ios-toggle" class:on={startImmediately}
-          type="button"
-          on:click={() => startImmediately = !startImmediately}
-          aria-label="Toggle start mode"
-          title={startImmediately ? l("Cliquer pour attendre la prochaine occurrence","Click to wait for next occurrence") : l("Cliquer pour démarrer immédiatement","Click to start immediately")}
-        >
-          <span class="ios-thumb"></span>
-        </button>
+      <!-- Start mode selector (mandatory 3-state) -->
+      <div class="start-mode-row">
+        <span class="start-mode-label">{l("Quand démarrer ?", "When to start?")} <span style="color:#ef4444;font-size:11px">{startMode === null ? l('(obligatoire)', '(required)') : ''}</span></span>
+        <div class="start-mode-seg" role="group" aria-label={l("Mode de démarrage", "Start mode")}>
+          <button type="button" class="seg-btn" class:seg-active={startMode === 'wait'} on:click={() => startMode = 'wait'}>
+            ← {l("Attendre", "Wait")}
+          </button>
+          <div class="seg-dot" class:seg-dot-left={startMode === 'wait'} class:seg-dot-right={startMode === 'now'} title={startMode === null ? l("Choix obligatoire", "Required choice") : ''}>
+            {startMode === null ? '?' : ''}
+          </div>
+          <button type="button" class="seg-btn" class:seg-active={startMode === 'now'} on:click={() => startMode = 'now'}>
+            {l("Immédiatement", "Immediately")} →
+          </button>
+        </div>
+        {#if startMode === 'wait'}
+          <span class="start-mode-hint">{l("Premier envoi à la prochaine occurrence planifiée", "First send at the next scheduled occurrence")}</span>
+        {:else if startMode === 'now'}
+          <span class="start-mode-hint">{l("Envoi déclenché dès l'ajout de l'abonnement", "Send triggered as soon as subscription is added")}</span>
+        {/if}
       </div>
 
       <!-- Advanced fields (collapsible) -->
@@ -603,12 +606,18 @@
       {/if}
 
       {#if mode === "new"}
-        <button class="btn-primary btn-generate" type="button" on:click={addSubscriptionDirectly}>
-          ＋ {l("Ajouter à mes abonnements", "Add to my subscriptions")}
+        <button class="btn-primary btn-generate" type="button"
+          disabled={startMode === null}
+          title={startMode === null ? l("Choisissez quand démarrer les envois", "Choose when to start sending") : ''}
+          on:click={addSubscriptionDirectly}>
+          {startMode === null ? l("Choisir le mode de démarrage ↑", "Choose start mode ↑") : `＋ ${l("Ajouter à mes abonnements", "Add to my subscriptions")}`}
         </button>
       {:else}
-        <button class="btn-primary btn-generate" type="button" on:click={generate}>
-          {l("Générer le code AutoPay →", "Generate AutoPay code →")}
+        <button class="btn-primary btn-generate" type="button"
+          disabled={startMode === null}
+          title={startMode === null ? l("Choisissez quand démarrer les envois", "Choose when to start sending") : ''}
+          on:click={generate}>
+          {startMode === null ? l("Choisir le mode de démarrage ↑", "Choose start mode ↑") : l("Générer le code AutoPay →", "Generate AutoPay code →")}
         </button>
       {/if}
 
@@ -786,30 +795,37 @@
               </div>
             {/each}
           </dl>
-          <!-- Start immediately toggle — same as in manual form -->
-          <div class="start-toggle-row" style="margin-top:8px">
-            <span class="start-toggle-label">
-              {startImmediately
-                ? l("Commencer les envois immédiatement", "Start sending immediately")
-                : l("Attendre la prochaine occurrence", "Wait for next scheduled occurrence")}
-            </span>
-            <button
-              class="ios-toggle" class:on={startImmediately}
-              type="button"
-              on:click={() => startImmediately = !startImmediately}
-              aria-label="Toggle start mode"
-            >
-              <span class="ios-thumb"></span>
-            </button>
+          <!-- Start mode selector (mandatory 3-state) — same as in manual form -->
+          <div class="start-mode-row" style="margin-top:8px">
+            <span class="start-mode-label">{l("Quand démarrer ?", "When to start?")} <span style="color:#ef4444;font-size:11px">{startMode === null ? l('(obligatoire)', '(required)') : ''}</span></span>
+            <div class="start-mode-seg" role="group" aria-label={l("Mode de démarrage", "Start mode")}>
+              <button type="button" class="seg-btn" class:seg-active={startMode === 'wait'} on:click={() => startMode = 'wait'}>
+                ← {l("Attendre", "Wait")}
+              </button>
+              <div class="seg-dot" class:seg-dot-left={startMode === 'wait'} class:seg-dot-right={startMode === 'now'}>
+                {startMode === null ? '?' : ''}
+              </div>
+              <button type="button" class="seg-btn" class:seg-active={startMode === 'now'} on:click={() => startMode = 'now'}>
+                {l("Immédiatement", "Immediately")} →
+              </button>
+            </div>
+            {#if startMode === 'wait'}
+              <span class="start-mode-hint">{l("Premier envoi à la prochaine occurrence planifiée", "First send at next scheduled occurrence")}</span>
+            {:else if startMode === 'now'}
+              <span class="start-mode-hint">{l("Envoi déclenché dès l'ajout de l'abonnement", "Send triggered as soon as added")}</span>
+            {/if}
           </div>
 
-          <button class="btn-primary" type="button" on:click={() => {
+          <button class="btn-primary" type="button"
+            disabled={startMode === null}
+            title={startMode === null ? l("Choisissez quand démarrer les envois", "Choose when to start sending") : ''}
+            on:click={() => {
               dispatch("imported", {
                 code: importInput.trim(),
-                payload: { ...importResult.payload, start_immediately: startImmediately }
+                payload: { ...importResult.payload, start_immediately: startMode === 'now' }
               });
             }}>
-            {l("Ajouter cet abonnement →", "Add this subscription →")}
+            {startMode === null ? l("Choisir le mode de démarrage ↑", "Choose start mode ↑") : l("Ajouter cet abonnement →", "Add this subscription →")}
           </button>
         </div>
       {/if}
@@ -1006,6 +1022,28 @@
     padding: 8px 0; border-top: 1px solid var(--border);
   }
   .start-toggle-label { font-size: 13px; color: var(--text); flex: 1; }
+  /* 3-state start mode selector */
+  .start-mode-row { display: flex; flex-direction: column; gap: 6px; }
+  .start-mode-label { font-size: 13px; font-weight: 600; }
+  .start-mode-seg {
+    display: flex; align-items: center; background: var(--bg-alt, #1e1e2e);
+    border: 1px solid var(--border); border-radius: 999px; overflow: hidden;
+    width: 100%;
+  }
+  .seg-btn {
+    flex: 1; padding: 8px 14px; font-size: 12px; font-weight: 600;
+    background: transparent; border: none; color: var(--text-muted);
+    cursor: pointer; transition: all 0.15s; border-radius: 0;
+  }
+  .seg-btn.seg-active { background: var(--accent); color: #fff; border-radius: 999px; }
+  .seg-btn:hover:not(.seg-active) { background: var(--border); color: var(--text); }
+  .seg-dot {
+    width: 28px; text-align: center; font-size: 14px; font-weight: 700;
+    color: #ef4444; flex-shrink: 0; transition: all 0.2s;
+  }
+  .seg-dot.seg-dot-left, .seg-dot.seg-dot-right { color: var(--text-muted); font-size: 10px; }
+  .start-mode-hint { font-size: 11px; color: var(--text-muted); padding-left: 4px; }
+
   .ios-toggle {
     width: 46px; height: 26px; border-radius: 13px;
     background: var(--border); border: none; cursor: pointer;

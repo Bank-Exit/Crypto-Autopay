@@ -297,11 +297,17 @@
     const result = await tauriInvoke("save_subscription", { payload });
     if (result) {
       logInfo("Dashboard", `Sub saved to DB: ${result.id}`);
-      // Patch local sub with real DB id + computed next_payment_at
-      subscriptions = subscriptions.map(s => s.id === sub.id
-        ? { ...s, _db_id: result.id, id: result.id,
-            next_payment_at: result.next_payment_at || s.next_payment_at }
-        : s);
+      // Reload all subs from DB — ensures next_payment_at is fresh for ALL subs
+      // (avoids desync when Rust scheduler updated a sub while this await was pending)
+      const fresh = await tauriInvoke("get_subscriptions");
+      if (fresh) {
+        subscriptions = fresh.map(dbSubToUi);
+      } else {
+        subscriptions = subscriptions.map(s => s.id === sub.id
+          ? { ...s, _db_id: result.id, id: result.id,
+              next_payment_at: result.next_payment_at || s.next_payment_at }
+          : s);
+      }
     } else {
       logWarn("Dashboard", "Sub NOT persisted to DB (save_subscription failed)");
     }
@@ -370,12 +376,18 @@
       if (result) logInfo("Dashboard", `Sub persisted via payload fallback: ${result.id}`);
     }
     if (result) {
-      subscriptions = subscriptions.map(s =>
-        s._code === detail.code || s.id === sub.id
-          ? { ...s, _db_id: result.id, id: result.id,
-              next_payment_at: result.next_payment_at || s.next_payment_at }
-          : s
-      );
+      // Reload from DB to get fresh next_payment_at for ALL subs
+      const fresh = await tauriInvoke("get_subscriptions");
+      if (fresh) {
+        subscriptions = fresh.map(dbSubToUi);
+      } else {
+        subscriptions = subscriptions.map(s =>
+          s._code === detail.code || s.id === sub.id
+            ? { ...s, _db_id: result.id, id: result.id,
+                next_payment_at: result.next_payment_at || s.next_payment_at }
+            : s
+        );
+      }
     } else {
       logWarn("Dashboard", "Sub NOT persisted to DB — both add_subscription and save_subscription failed");
     }
@@ -959,7 +971,21 @@
   let notifSettings = {
     canary: true, lowBalance: true, paymentSent: true, paymentFailed: true,
     beforePayment: true, beforePaymentDays: 2,
+    lowBalanceThresholdDays: 7, // days of runway before BALANCE_LOW alert fires
   };
+
+  // Sync alert config to Rust backend when settings change
+  async function applyAlertConfig() {
+    const enabled = [];
+    if (notifSettings.lowBalance)    enabled.push("BALANCE_LOW", "BALANCE_EMPTY");
+    if (notifSettings.canary)        enabled.push("CANARY_EXPIRED", "CANARY_UNREACHABLE");
+    if (notifSettings.paymentFailed) enabled.push("PAYMENT_FAILED", "PAYMENT_OVERDUE_SOFT", "PAYMENT_OVERDUE_HARD");
+    enabled.push("OUTPUTS_LOCKED", "WALLET_NOT_SYNCED"); // always enabled
+    await tauriInvoke("set_alert_config", {
+      balanceLowThresholdDays: notifSettings.lowBalanceThresholdDays,
+      enabledAlerts: enabled,
+    }).catch(() => {});
+  }
 
   // UTC offset helper
   function getTimezoneDisplay() {
@@ -1565,19 +1591,29 @@
       <div class="settings-section card">
         <div class="setting-row">
           <span class="setting-label">{$t.notifCanary}</span>
-          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.canary}/><span class="slider"></span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.canary} on:change={applyAlertConfig}/><span class="slider"></span></label>
         </div>
         <div class="setting-row">
           <span class="setting-label">{$t.notifLowBalance}</span>
-          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.lowBalance}/><span class="slider"></span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.lowBalance} on:change={applyAlertConfig}/><span class="slider"></span></label>
         </div>
+        {#if notifSettings.lowBalance}
+        <div class="setting-row" style="padding-left:16px;gap:8px">
+          <span class="setting-label" style="font-size:12px;color:var(--text-muted)">Solde bas si moins de</span>
+          <input type="number" bind:value={notifSettings.lowBalanceThresholdDays}
+            on:change={applyAlertConfig}
+            min="1" max="60" step="1"
+            style="width:52px;padding:4px 6px;font-size:13px;text-align:center" />
+          <span class="text-muted" style="font-size:12px">jours de réserve</span>
+        </div>
+        {/if}
         <div class="setting-row">
           <span class="setting-label">{$t.notifPaymentSent}</span>
           <label class="toggle"><input type="checkbox" bind:checked={notifSettings.paymentSent}/><span class="slider"></span></label>
         </div>
         <div class="setting-row">
           <span class="setting-label">{$t.notifPaymentFailed}</span>
-          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.paymentFailed}/><span class="slider"></span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.paymentFailed} on:change={applyAlertConfig}/><span class="slider"></span></label>
         </div>
         <div class="setting-row">
           <span class="setting-label">{$t.notifBeforePayment}</span>
