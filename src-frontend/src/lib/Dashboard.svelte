@@ -1473,10 +1473,9 @@
                 {:else}
                   <p style="font-size:11px;color:var(--text-muted);margin:4px 0">Solde en attente de synchronisation…</p>
                 {/if}
-                </div>
-              </div>
-              </div>
-            </div>
+              </div><!-- /wallet-limit-warn -->
+            </div><!-- /wallet-body -->
+            </div><!-- /wallet-card -->
           {/each}
         </div>
       {/if}

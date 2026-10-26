@@ -1039,20 +1039,7 @@
   .seg-dot.seg-dot-left, .seg-dot.seg-dot-right { color: var(--text-muted); font-size: 10px; }
   .start-mode-hint { font-size: 11px; color: var(--text-muted); padding-left: 4px; }
 
-  .ios-toggle {
-    width: 46px; height: 26px; border-radius: 13px;
-    background: var(--border); border: none; cursor: pointer;
-    position: relative; transition: background 0.2s;
-    flex-shrink: 0;
-  }
-  .ios-toggle.on { background: var(--accent); }
-  .ios-thumb {
-    position: absolute; top: 3px; left: 3px;
-    width: 20px; height: 20px; border-radius: 50%;
-    background: white; box-shadow: 0 1px 4px #0004;
-    transition: transform 0.2s;
-  }
-  .ios-toggle.on .ios-thumb { transform: translateX(20px); }
+  /* ios-toggle styles removed — replaced by start-mode-seg 3-state control */
 
   /* Import result */
   .import-result { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
