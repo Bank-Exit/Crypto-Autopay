@@ -832,6 +832,74 @@ async fn add_subscription(
     serde_json::to_value(&sub).map_err(|e| e.to_string())
 }
 
+/// Save a manually-created subscription directly to DB (no code string needed).
+/// Called from frontend mode="new" form submissions.
+#[tauri::command]
+async fn save_subscription(
+    payload: serde_json::Value,
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<serde_json::Value, String> {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    let now = Utc::now();
+    let label = payload["custom_label"].as_str().unwrap_or("—").to_string();
+    let dest = payload["destination_address"].as_str().unwrap_or("").to_string();
+    let amount = payload["amount"].as_str().unwrap_or("0").to_string();
+    let currency = payload["currency"].as_str().unwrap_or("XMR").to_string();
+    let schedule = payload["schedule"].as_str().unwrap_or("0 0 9 1 * *").to_string();
+    let number_of_payments = payload["number_of_payments"].as_u64().unwrap_or(1);
+    let start_immediately = payload["start_immediately"].as_bool().unwrap_or(true);
+    let canary_url = payload["canary_url"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let description = payload["description"].as_str().unwrap_or("").to_string();
+
+    // next_payment_at: now if start_immediately, else use start_date or compute from schedule
+    let next_payment_at = if start_immediately {
+        Some(now)
+    } else if let Some(sd) = payload["start_date"].as_str().filter(|s| !s.is_empty()) {
+        chrono::DateTime::parse_from_rfc3339(sd).ok().map(|d| d.with_timezone(&Utc))
+            .or(Some(now + chrono::Duration::days(1)))
+    } else {
+        // Parse cron period for next occurrence
+        let period_min = cron_period_minutes(&schedule);
+        Some(now + chrono::Duration::minutes(period_min))
+    };
+
+    let sub = Subscription {
+        id: Uuid::new_v4().to_string(),
+        wallet_id: "default".to_string(),
+        label: label.clone(),
+        description: if description.is_empty() { None } else { Some(description) },
+        destination_address: dest,
+        payment_network: payload["network"].as_str().unwrap_or("monero").to_string(),
+        amount,
+        currency,
+        schedule,
+        number_of_payments,
+        payments_sent: 0,
+        next_payment_at,
+        status: SubscriptionStatus::Active,
+        grace_period_hours: 24,
+        canary_url,
+        merchant_pubkey: None,
+        last_canary_status: None,
+        canary_last_ok: None,
+        webhook_url: None,
+        created_at: now,
+        updated_at: now,
+        raw_code: None,
+        notes: None,
+    };
+
+    {
+        let db = db_state.lock().map_err(|e| e.to_string())?;
+        db.insert_subscription(&sub).map_err(|e| e.to_string())?;
+    }
+
+    log::info!("Subscription '{}' saved (id={}, start_immediately={})", sub.label, sub.id, start_immediately);
+    serde_json::to_value(&sub).map_err(|e| e.to_string())
+}
+
 /// Get the list of known public Monero nodes.
 #[tauri::command]
 fn get_public_nodes() -> Vec<String> {
@@ -1301,6 +1369,7 @@ pub fn run() {
             get_wallet_info,
             get_sync_info,
             get_alerts,
+            save_subscription,
             get_balance,
             refresh_balance,
             sweep_all,

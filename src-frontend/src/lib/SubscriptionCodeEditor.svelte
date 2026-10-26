@@ -94,6 +94,8 @@
 
   let schedulePresetId = "monthly";
   let multiYearN = 2;          // for biennial/triennial custom
+  // Start immediately vs wait for next occurrence
+  let startImmediately = true;
   let showAdvanced = false;
   let generatedCode = "";
   let generatedError = "";
@@ -183,6 +185,7 @@
     if (payload.number_of_payments > 0) clean.number_of_payments = payload.number_of_payments;
     if (payload.start_date) clean.start_date = payload.start_date;
     if (payload.canary_url.trim()) clean.canary_url = payload.canary_url.trim();
+    clean.start_immediately = startImmediately;
     return { payload: clean };
   }
 
@@ -545,10 +548,30 @@
           <span>{l("Nombre de paiements", "Number of payments")} <span class="hint">0 = {l("illimité","unlimited")}</span></span>
           <input type="number" bind:value={payload.number_of_payments} min="0" step="1" />
         </label>
+        {#if !startImmediately}
         <label class="field field-sm">
           <span>{l("Date de début", "Start date")}</span>
           <input type="date" bind:value={payload.start_date} />
         </label>
+        {/if}
+      </div>
+
+      <!-- Start immediately toggle (mandatory, iPhone style) -->
+      <div class="start-toggle-row">
+        <span class="start-toggle-label">
+          {startImmediately
+            ? l("Commencer les envois immédiatement", "Start sending immediately")
+            : l("Attendre la prochaine occurrence", "Wait for next scheduled occurrence")}
+        </span>
+        <button
+          class="ios-toggle" class:on={startImmediately}
+          type="button"
+          on:click={() => startImmediately = !startImmediately}
+          aria-label="Toggle start mode"
+          title={startImmediately ? l("Cliquer pour attendre la prochaine occurrence","Click to wait for next occurrence") : l("Cliquer pour démarrer immédiatement","Click to start immediately")}
+        >
+          <span class="ios-thumb"></span>
+        </button>
       </div>
 
       <!-- Advanced fields (collapsible) -->
@@ -953,9 +976,31 @@
   .captcha-error { color: #ef4444; font-size: 12px; margin: 0; }
 
   /* Schedule in import result */
-  .import-schedule { flex-direction: column; gap: 2px; }
+  /* Schedule display in import: human label left, CRON right on same line */
+  .import-schedule { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
   .schedule-human { font-weight: 600; color: var(--accent); }
-  .schedule-cron { font-size: 10px; color: var(--text-muted); font-family: monospace; text-align: right; }
+  .schedule-cron { font-size: 10px; color: var(--text-muted); font-family: monospace; text-align: right; white-space: nowrap; }
+
+  /* iOS toggle */
+  .start-toggle-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 8px 0; border-top: 1px solid var(--border);
+  }
+  .start-toggle-label { font-size: 13px; color: var(--text); flex: 1; }
+  .ios-toggle {
+    width: 46px; height: 26px; border-radius: 13px;
+    background: var(--border); border: none; cursor: pointer;
+    position: relative; transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .ios-toggle.on { background: var(--accent); }
+  .ios-thumb {
+    position: absolute; top: 3px; left: 3px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: white; box-shadow: 0 1px 4px #0004;
+    transition: transform 0.2s;
+  }
+  .ios-toggle.on .ios-thumb { transform: translateX(20px); }
 
   /* Import result */
   .import-result { padding: 14px; display: flex; flex-direction: column; gap: 10px; }

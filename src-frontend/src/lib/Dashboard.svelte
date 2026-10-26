@@ -27,6 +27,15 @@
     } catch (_) { return () => {}; }
   }
 
+  // Payment success animation
+  let showPayAnim = false;
+  let payAnimTimer = null;
+  function showPaymentAnimation() {
+    showPayAnim = true;
+    if (payAnimTimer) clearTimeout(payAnimTimer);
+    payAnimTimer = setTimeout(() => { showPayAnim = false; }, 4000);
+  }
+
   let activeAlerts = [];
   async function refreshAlerts() {
     const alerts = await tauriInvoke("get_alerts");
@@ -256,12 +265,25 @@
   }
 
   /** "Nouvel abonnement" mode="new" dispatches this */
-  function onSubNew({ detail }) {
+  async function onSubNew({ detail }) {
     logInfo("Dashboard", `onSubNew: label=${detail.payload?.custom_label || "?"}`);
-    const sub = payloadToSubscription({ ...detail.payload, _sourceCode: null });
+    const payload = detail.payload;
+    const sub = payloadToSubscription({ ...payload, _sourceCode: null });
     addOrConfirmDuplicate(sub);
     showNewSubModal = false;
     editingSubData = null;
+    // Persist to DB via save_subscription (no code string needed)
+    const result = await tauriInvoke("save_subscription", { payload });
+    if (result) {
+      logInfo("Dashboard", `Sub saved to DB: ${result.id}`);
+      // Patch local sub with real DB id + computed next_payment_at
+      subscriptions = subscriptions.map(s => s.id === sub.id
+        ? { ...s, _db_id: result.id, id: result.id,
+            next_payment_at: result.next_payment_at || s.next_payment_at }
+        : s);
+    } else {
+      logWarn("Dashboard", "Sub NOT persisted to DB (save_subscription failed)");
+    }
   }
 
   async function onSubEdit({ detail }) {
@@ -440,41 +462,59 @@
     paymentInProgress = false;
   }
 
-  async function processPayment(sub) {
+  async function processPayment(sub, retryOnBusy = true) {
     logInfo("Scheduler", `Processing payment for sub #${sub.id}`);
+
+    let result = null;
+    let invokeError = null;
     try {
-      const result = await tauriInvoke("send_payment", {
+      const { invoke } = await import("@tauri-apps/api/core");
+      result = await invoke("send_payment", {
         destinationAddress: sub.destination_address || sub.address || "",
         amountXmr: parseFloat(sub.amount),
         subscriptionId: sub.id,
       });
-      if (result?.tx_hash) {
-        logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${result.tx_hash.slice(0, 12)}...`);
-        lastPaymentSentAt = Date.now();
-        // Compute next occurrence from raw schedule
-        const rawSched = sub._raw_schedule || sub.schedule;
-        const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
-        const nextIso = next instanceof Date ? next.toISOString() : new Date(next).toISOString();
-        const idx = subscriptions.findIndex(s => s.id === sub.id);
-        if (idx !== -1) {
-          subscriptions[idx] = { ...subscriptions[idx], next_payment_at: nextIso, status: "Active", payments_sent: (sub.payments_sent || 0) + 1 };
-          subscriptions = [...subscriptions];
-        }
-        await tauriInvoke("update_subscription_next_payment", {
-          id: sub.id,
-          nextPaymentAt: nextIso
-        });
-        // Immediately show loading state for balance (XMR sent, balance will update)
-        balanceLoading = true;
-        // Refresh after 5s (transaction propagates, balance includes locked+unlocked)
-        setTimeout(async () => { await refreshBalance(); }, 5000);
-      } else {
-        // RPC returned but no tx_hash — unexpected, just log
-        logWarn("Scheduler", `[WARN] Reponse inattendue pour sub #${sub.id} — pas de tx_hash dans la reponse`);
-      }
     } catch (e) {
-      // Tauri command returned an Err() — log clearly, do NOT suspend the subscription
-      logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${e}`);
+      invokeError = String(e);
+    }
+
+    // RPC busy → wait 35s for balance refresh to finish, then retry once
+    if (invokeError?.includes("RPC busy") && retryOnBusy) {
+      logInfo("Scheduler", `RPC occupe — retry dans 35s pour sub #${sub.id}`);
+      await new Promise(r => setTimeout(r, 35000));
+      return processPayment(sub, false); // single retry
+    }
+
+    if (invokeError) {
+      const isLockedOutputs = invokeError.includes("rejected by daemon") || invokeError.includes("not enough money");
+      if (isLockedOutputs) {
+        logWarn("Scheduler", `[ATTENTE] Fonds verrouillee (confirmations en cours) pour sub #${sub.id} — attendez ~20 min`);
+      } else {
+        logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
+      }
+      return;
+    }
+
+    if (result?.tx_hash) {
+      logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${result.tx_hash.slice(0, 12)}...`);
+      lastPaymentSentAt = Date.now();
+      showPaymentAnimation(); // fullscreen animation
+      const rawSched = sub._raw_schedule || sub.schedule;
+      const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
+      const nextIso = next instanceof Date ? next.toISOString() : new Date(next).toISOString();
+      const idx = subscriptions.findIndex(s => s.id === sub.id);
+      if (idx !== -1) {
+        subscriptions[idx] = { ...subscriptions[idx], next_payment_at: nextIso, status: "Active", payments_sent: (sub.payments_sent || 0) + 1 };
+        subscriptions = [...subscriptions];
+      }
+      await tauriInvoke("update_subscription_next_payment", {
+        id: sub.id,
+        nextPaymentAt: nextIso
+      });
+      balanceLoading = true;
+      setTimeout(async () => { await refreshBalance(); }, 5000);
+    } else {
+      logWarn("Scheduler", `[WARN] Pas de tx_hash dans la reponse pour sub #${sub.id} — paiement non confirme`);
     }
   }
 
@@ -841,6 +881,27 @@
   ];
 </script>
 
+<!-- Payment success animation overlay -->
+{#if showPayAnim}
+  <div class="pay-anim-overlay" on:click={() => showPayAnim = false} role="presentation">
+    <svg class="pay-anim-svg" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+      <!-- Concentric ripple rings -->
+      <circle class="ripple r1" cx="200" cy="200" r="40" fill="none" stroke="var(--accent)" stroke-width="3"/>
+      <circle class="ripple r2" cx="200" cy="200" r="40" fill="none" stroke="var(--accent)" stroke-width="2" opacity="0.7"/>
+      <circle class="ripple r3" cx="200" cy="200" r="40" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.5"/>
+      <!-- Monero "M" arrows simplified -->
+      <circle cx="200" cy="200" r="36" fill="var(--accent)" opacity="0.15"/>
+      <!-- Checkmark -->
+      <polyline class="pay-check" points="184,202 196,214 218,190" fill="none" stroke="var(--accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <!-- Orbiting dots -->
+      <circle class="orbit-dot od1" cx="200" cy="164" r="5" fill="var(--accent)" opacity="0.9"/>
+      <circle class="orbit-dot od2" cx="200" cy="164" r="4" fill="var(--accent)" opacity="0.6"/>
+      <circle class="orbit-dot od3" cx="200" cy="164" r="3" fill="var(--accent)" opacity="0.4"/>
+    </svg>
+    <div class="pay-anim-label">Paiement envoyé</div>
+  </div>
+{/if}
+
 <div class="layout">
   <!-- Sidebar -->
   <aside class="sidebar">
@@ -942,12 +1003,15 @@
       {#if balanceLoading}
         <div class="refresh-ago sync-pulse">Synchro réseau en cours…</div>
         {#if syncInfo && syncInfo.blocks_behind > 10}
+          {@const pct = Math.max(2, Math.min(99, 100 - (syncInfo.blocks_behind / Math.max(syncInfo.daemon_height, 1)) * 100))}
           <div class="sync-progress-wrap">
-            <div class="sync-progress-bar" style="width:{Math.min(100, 100 - syncInfo.blocks_behind / Math.max(syncInfo.daemon_height, 1) * 100)}%"></div>
-            <span class="sync-progress-label">{syncInfo.blocks_behind.toLocaleString()} blocs restants</span>
+            <div class="sync-progress-bar" style="width:{pct}%"></div>
           </div>
+          <span class="sync-progress-label">{syncInfo.blocks_behind.toLocaleString()} blocs · ~{Math.ceil(syncInfo.blocks_behind * 2 / 60)} min</span>
         {:else if syncInfo && syncInfo.blocks_behind > 0}
           <div class="sync-progress-label-small">{syncInfo.blocks_behind} blocs restants</div>
+        {:else if !syncInfo}
+          <div class="sync-progress-label-small">Récupération de la hauteur daemon…</div>
         {/if}
       {:else if refreshAgoLabel}
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
@@ -1633,6 +1697,46 @@
 {/if}
 
 <style>
+  /* ===== Payment animation ===== */
+  .pay-anim-overlay {
+    position: fixed; inset: 0; z-index: 9000;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55); backdrop-filter: blur(4px);
+    animation: pay-fade-in 0.3s ease;
+    cursor: pointer;
+  }
+  .pay-anim-svg { width: 220px; height: 220px; overflow: visible; }
+  .pay-anim-label {
+    margin-top: 18px; font-size: 20px; font-weight: 700;
+    color: var(--accent); letter-spacing: 0.04em;
+    animation: pay-fade-in 0.5s ease 0.2s both;
+  }
+  /* Ripple expand */
+  .ripple { transform-origin: 200px 200px; }
+  .r1 { animation: ripple-out 1.8s ease-out 0s infinite; }
+  .r2 { animation: ripple-out 1.8s ease-out 0.4s infinite; }
+  .r3 { animation: ripple-out 1.8s ease-out 0.8s infinite; }
+  @keyframes ripple-out {
+    0%   { r: 36; opacity: 0.9; }
+    100% { r: 140; opacity: 0; }
+  }
+  /* Checkmark draw */
+  .pay-check {
+    stroke-dasharray: 50; stroke-dashoffset: 50;
+    animation: draw-check 0.5s ease 0.1s forwards;
+  }
+  @keyframes draw-check { to { stroke-dashoffset: 0; } }
+  /* Orbiting dots */
+  .orbit-dot { transform-origin: 200px 200px; }
+  .od1 { animation: orbit 1.4s linear infinite; }
+  .od2 { animation: orbit 1.4s linear 0.47s infinite; }
+  .od3 { animation: orbit 1.4s linear 0.94s infinite; }
+  @keyframes orbit {
+    from { transform: rotate(0deg) translateY(-70px) rotate(0deg); }
+    to   { transform: rotate(360deg) translateY(-70px) rotate(-360deg); }
+  }
+  @keyframes pay-fade-in { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+
   .layout {
     display: flex;
     flex-direction: row;   /* explicit — WebKitGTK sometimes needs this */
