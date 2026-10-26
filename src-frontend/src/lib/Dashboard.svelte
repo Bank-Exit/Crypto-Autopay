@@ -806,8 +806,18 @@
 
     // Listen for Rust background scheduler events
     await tauriListen("payment-locked", async (ev) => {
-      const { sub_id, retry_in_min } = ev.payload || {};
+      const { sub_id, retry_in_min, next_payment_at } = ev.payload || {};
       logWarn("Scheduler", `[ATTENTE] Fonds verrouilles pour sub #${sub_id} — retry automatique dans ${retry_in_min} min`);
+      // Update in-memory subscription so frontend shows correct next time (not "Maintenant")
+      if (sub_id && next_payment_at) {
+        subscriptions = subscriptions.map(s =>
+          s.id === sub_id ? { ...s, next_payment_at } : s
+        );
+      } else if (sub_id) {
+        // Reload from DB to get the deferred time
+        const fresh = await tauriInvoke("get_subscriptions");
+        if (fresh) subscriptions = fresh.map(dbSubToUi);
+      }
       await refreshAlerts();
     });
 
@@ -821,6 +831,12 @@
             label: sub.label, amount: sub.amount, currency: sub.currency || 'XMR',
             sent_at: new Date().toISOString(), tx_hash: payload.tx_hash || null,
           }];
+          // Update in-memory next_payment_at so frontend shows correct countdown
+          if (payload.next_payment_at) {
+            subscriptions = subscriptions.map(s =>
+              s.id === payload.sub_id ? { ...s, next_payment_at: payload.next_payment_at } : s
+            );
+          }
         }
       }
       balanceLoading = true;

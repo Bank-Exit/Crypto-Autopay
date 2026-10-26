@@ -1210,7 +1210,11 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     }
                 }
                 // Emit event so frontend can refresh balance and subscription list
-                app.emit("payment-sent", serde_json::json!({"sub_id": sub_id})).ok();
+                let new_next_iso = if let Some(next) = sub.next_payment_at {
+                    let p = cron_period_minutes(&sub.schedule);
+                    (next + chrono::Duration::minutes(p)).to_rfc3339()
+                } else { String::new() };
+                app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
             }
             Ok(Err(e)) => {
                 let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
@@ -1243,7 +1247,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                             update_tray_icon(app, Some(AlertLevel::Orange), count);
                         }
                     }
-                    app.emit("payment-locked", serde_json::json!({"sub_id": sub_id, "retry_in_min": 25})).ok();
+                    app.emit("payment-locked", serde_json::json!({"sub_id": sub_id, "retry_in_min": 25, "next_payment_at": retry_at.to_rfc3339()})).ok();
                 } else {
                     log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
                     if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
