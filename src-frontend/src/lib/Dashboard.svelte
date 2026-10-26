@@ -1008,7 +1008,7 @@
     if (weeks >= 2)   return `~${Math.round(weeks)} ${t.refillWeeks}`;
     const days = months * 30;
     if (days >= 1)    return `~${Math.round(days)} ${t.refillDays}`;
-    return `< 1 ${t.refillDays}`;
+    return t.refillLessThanOneDay || 'moins de 1 jour !';
   }
 
   // Total refill estimate
@@ -1036,13 +1036,15 @@
     <div class="modal-panel alerts-overlay-panel" on:click|stopPropagation role="document" style="max-width:480px">
       <div class="modal-header">
         <h2 class="modal-title">
-          {activeAlerts.some(a => a.level === 'Red') ? '🔴 Alertes critiques' : '🟠 Avertissements'}
+          {activeAlerts.some(a => a.level === 'Red')
+            ? `🔴 ${$t.alertOverlayCritical || 'Alertes critiques'}`
+            : `🟠 ${$t.alertOverlayWarning || 'Avertissements'}`}
         </h2>
-        <button class="modal-close" on:click={() => showAlertsOverlay = false} aria-label="Fermer">✕</button>
+        <button class="modal-close" on:click={() => showAlertsOverlay = false} aria-label={$t.alertOverlayClose || 'Fermer'}>✕</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;padding:16px">
         {#if activeAlerts.length === 0}
-          <p style="color:var(--text-muted);text-align:center">Aucune alerte active.</p>
+          <p style="color:var(--text-muted);text-align:center">{$t.alertOverlayNone || 'Aucune alerte active.'}</p>
         {:else}
           {#each activeAlerts as alert}
             <div class="alert-detail-card" class:alert-detail-red={alert.level === 'Red'} class:alert-detail-orange={alert.level === 'Orange'}>
@@ -1055,7 +1057,7 @@
             </div>
           {/each}
         {/if}
-        <button class="btn-ghost" on:click={() => showAlertsOverlay = false} style="margin-top:8px">Fermer</button>
+        <button class="btn-ghost" on:click={() => showAlertsOverlay = false} style="margin-top:8px">{$t.alertOverlayClose || 'Fermer'}</button>
       </div>
     </div>
   </div>
@@ -1165,7 +1167,7 @@
         {$t.navHowItWorks}
       </button>
       <button class="nav-item" class:active={page === "create-code"} on:click={() => page = "create-code"}>
-        🔗 Créer un code
+        🔗 {$t.navCreateCode || 'Créer un code'}
       </button>
       <button class="nav-item" class:active={page === "settings"} on:click={() => page = "settings"}>
         {$t.navSettings}
@@ -1218,7 +1220,7 @@
         <div class="balance-amount text-accent">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
         {#if balanceXmr === 0}
           <div class="balance-hint">{$t.balanceEmpty || 'Wallet vide — rechargez-le en Monero pour commencer.'}</div>
-          <button class="btn-receive" on:click={() => page = "receive"}>⬇ Recevoir XMR</button>
+          <button class="btn-receive" on:click={() => page = "receive"}>⬇ {$t.receiveTitle || 'Recharger le wallet'}</button>
         {/if}
 
       {:else if rpcOk === false}
@@ -1751,8 +1753,8 @@
     <!-- ====== CREATE CODE (full page, merchant / influencer) ====== -->
     {:else if page === "create-code"}
       <div class="page-header">
-        <h1>Créer un code AutoPay de partage</h1>
-        <p class="subs-subtitle">Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés</p>
+        <h1>{$t.createCodeTitle || 'Créer un code AutoPay de partage'}</h1>
+        <p class="subs-subtitle">{$t.createCodeSubtitle || 'Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés'}</p>
       </div>
       <div class="create-code-page">
         <SubscriptionCodeEditor
@@ -2184,11 +2186,11 @@
   .alert-detail-msg { font-size: 13px; color: var(--text); }
   .alert-detail-time { font-size: 10px; color: var(--text-muted); }
 
-  .refill-urgent { border: 1px solid #f97316 !important; background: #f9731608 !important; }
-  .refill-urgent-text { color: #f97316 !important; animation: blink-orange 1.5s ease-in-out infinite; }
-  @keyframes blink-orange {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+  .refill-urgent { border: 1px solid #f97316 !important; background: #f9731610 !important; }
+  .refill-urgent-text { color: #ef4444 !important; font-size: 15px !important; animation: blink-urgent 1.2s ease-in-out infinite; }
+  @keyframes blink-urgent {
+    0%, 100% { opacity: 1; color: #ef4444; }
+    50% { opacity: 0.55; color: #f97316; }
   }
   .next-banner, .refill-banner {
     display: flex;

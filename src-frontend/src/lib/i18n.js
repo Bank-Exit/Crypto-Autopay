@@ -184,8 +184,21 @@ const T = {
     refillMonths: "mois",
     refillWeeks: "semaine(s)",
     refillDays: "jour(s)",
+    refillLessThanOneDay: "moins de 1 jour !",
     inPrefix: "dans", inDaysSuffix: "jours",
     refillHours: "heure(s)",
+
+    // Create code page
+    navCreateCode: "Créer un code",
+    createCodeTitle: "Créer un code AutoPay de partage",
+    createCodeSubtitle: "Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés",
+
+    // Alerts overlay
+    alertOverlayTitle: "Alertes actives",
+    alertOverlayCritical: "Alertes critiques",
+    alertOverlayWarning: "Avertissements",
+    alertOverlayNone: "Aucune alerte active.",
+    alertOverlayClose: "Fermer",
 
     // Notifications settings
     notifTitle: "Notifications & alertes",
@@ -369,8 +382,19 @@ const T = {
     refillMonths: "month(s)",
     refillWeeks: "week(s)",
     refillDays: "day(s)",
+    refillLessThanOneDay: "less than 1 day!",
     inPrefix: "in", inDaysSuffix: "days",
     refillHours: "hour(s)",
+
+    navCreateCode: "Create a code",
+    createCodeTitle: "Create a shareable AutoPay code",
+    createCodeSubtitle: "For merchants, creators and influencers — share with your subscribers",
+
+    alertOverlayTitle: "Active alerts",
+    alertOverlayCritical: "Critical alerts",
+    alertOverlayWarning: "Warnings",
+    alertOverlayNone: "No active alerts.",
+    alertOverlayClose: "Close",
 
     notifTitle: "Notifications & alerts",
     notifCanary: "Canary expired alert",
@@ -436,7 +460,9 @@ const T = {
     walletPayFrom: "Von diesem Wallet zahlen",
     howItWorks: "Wie es funktioniert", back: "Zurück", continue: "Weiter →",
     dayMinus: "T-", myWallet: "Mein Wallet", vpnLabel: "VPN", animSuffix: "/Monat",
-    nextRefillLabel: "Nächste Wallet-Aufladung", refillIn: "in ca.", refillYears: "Jahr(e)", refillMonths: "Monat(e)", refillWeeks: "Woche(n)", refillDays: "Tag(e)", inPrefix: "in", inDaysSuffix: "Tagen", refillHours: "Stunde(n)",
+    nextRefillLabel: "Nächste Wallet-Aufladung", refillIn: "in ca.", refillYears: "Jahr(e)", refillMonths: "Monat(e)", refillWeeks: "Woche(n)", refillDays: "Tag(e)", refillLessThanOneDay: "weniger als 1 Tag!", inPrefix: "in", inDaysSuffix: "Tagen", refillHours: "Stunde(n)",
+    navCreateCode: "Code erstellen", createCodeTitle: "Teilbaren AutoPay-Code erstellen", createCodeSubtitle: "Für Händler, Ersteller und Influencer",
+    alertOverlayTitle: "Aktive Warnungen", alertOverlayCritical: "Kritische Warnungen", alertOverlayWarning: "Warnhinweise", alertOverlayNone: "Keine aktiven Warnungen.", alertOverlayClose: "Schließen",
     notifTitle: "Benachrichtigungen", notifCanary: "Canary abgelaufen", notifLowBalance: "Niedriges Guthaben", notifPaymentSent: "Zahlung gesendet", notifPaymentFailed: "Zahlung fehlgeschlagen", notifBeforePayment: "Erinnerung vor Zahlung", notifBeforePaymentDays: "Tage vorher",
     paymentModeTitle: "Zahlungsmodus", paymentModeSemiAuto: "Semi-auto", paymentModeAuto: "Auto", paymentModeSemiAutoDesc: "Manuelle Bestätigung vor jeder Zahlung.", paymentModeAutoDesc: "Zahlungen automatisch ohne Bestätigung.",
     addSubscriptionTitle: "Abonnement hinzufügen", addSubscriptionConfirm: "Hinzufügen",
@@ -487,7 +513,9 @@ const T = {
     walletPayFrom: "Pagar desde este wallet",
     howItWorks: "Cómo funciona", back: "Volver", continue: "Continuar →",
     dayMinus: "D-", myWallet: "Mi wallet", vpnLabel: "VPN", animSuffix: "/mes",
-    nextRefillLabel: "Próxima recarga de cartera", refillIn: "en aprox.", refillYears: "año(s)", refillMonths: "mes(es)", refillWeeks: "semana(s)", refillDays: "día(s)", inPrefix: "en", inDaysSuffix: "días", refillHours: "hora(s)",
+    nextRefillLabel: "Próxima recarga de cartera", refillIn: "en aprox.", refillYears: "año(s)", refillMonths: "mes(es)", refillWeeks: "semana(s)", refillDays: "día(s)", refillLessThanOneDay: "menos de 1 día!", inPrefix: "en", inDaysSuffix: "días", refillHours: "hora(s)",
+    navCreateCode: "Crear código", createCodeTitle: "Crear código AutoPay compartible", createCodeSubtitle: "Para comerciantes, creadores e influencers",
+    alertOverlayTitle: "Alertas activas", alertOverlayCritical: "Alertas críticas", alertOverlayWarning: "Advertencias", alertOverlayNone: "Sin alertas activas.", alertOverlayClose: "Cerrar",
     notifTitle: "Notificaciones y alertas", notifCanary: "Canary expirado", notifLowBalance: "Saldo bajo", notifPaymentSent: "Pago enviado", notifPaymentFailed: "Pago fallido", notifBeforePayment: "Recordatorio antes del pago", notifBeforePaymentDays: "días antes",
     paymentModeTitle: "Modo de pago", paymentModeSemiAuto: "Semi-auto", paymentModeAuto: "Auto", paymentModeSemiAutoDesc: "Confirmación manual antes de cada pago.", paymentModeAutoDesc: "Pagos automáticos sin confirmación.",
     addSubscriptionTitle: "Añadir suscripción", addSubscriptionConfirm: "Añadir",

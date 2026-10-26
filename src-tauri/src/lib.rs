@@ -712,7 +712,11 @@ fn recompute_alerts(
                 level: AlertLevel::Orange,
                 kind: "BALANCE_LOW".into(),
                 sub_id: None,
-                message: format!("Portefeuille vide dans ~{:.0} jour(s) au rythme actuel (seuil : {:.0}j)", days_left, threshold_days),
+                message: if days_left < 1.0 {
+                    format!("Portefeuille vide dans moins de 1 jour au rythme actuel (seuil : {:.0}j)", threshold_days)
+                } else {
+                    format!("Portefeuille vide dans ~{:.0} jour(s) au rythme actuel (seuil : {:.0}j)", days_left, threshold_days)
+                },
                 created_at: now_ts,
             });
         }
