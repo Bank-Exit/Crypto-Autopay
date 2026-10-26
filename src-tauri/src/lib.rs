@@ -388,7 +388,7 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
 async fn send_payment(
     destination_address: String,
     amount_xmr: f64,
-    subscription_id: i64,
+    subscription_id: String,
     state: tauri::State<'_, Mutex<AppState>>,
     app_handle: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
@@ -1173,22 +1173,49 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 app.emit("payment-sent", serde_json::json!({"sub_id": sub_id})).ok();
             }
             Ok(Err(e)) => {
-                log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
-                // Add orange alert for failed payment
-                if let Some(state) = app.try_state::<Mutex<AppState>>() {
-                    if let Ok(mut s) = state.lock() {
-                        s.alerts.retain(|a| a.kind != "PAYMENT_FAILED" || a.sub_id.as_deref() != Some(&sub_id));
-                        s.alerts.push(AppAlert {
-                            level: AlertLevel::Orange,
-                            kind: "PAYMENT_FAILED".into(),
-                            sub_id: Some(sub_id.clone()),
-                            message: format!("Payment failed for sub #{}", sub_id),
-                            created_at: chrono::Utc::now().timestamp(),
-                        });
-                        let count = s.alerts.len();
-                        let worst = if s.alerts.iter().any(|a| a.level == AlertLevel::Red) { Some(AlertLevel::Red) } else { Some(AlertLevel::Orange) };
-                        drop(s);
-                        update_tray_icon(app, worst, count);
+                let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
+                if is_locked {
+                    // Outputs locked: reschedule for 25 min later (one Monero block confirmation cycle)
+                    log::warn!("[Scheduler] Sub {} — outputs still locked, rescheduling +25min", sub_id);
+                    let retry_at = chrono::Utc::now() + chrono::Duration::minutes(25);
+                    if let Some(db_rc) = app.try_state::<Mutex<Database>>() {
+                        if let Ok(db) = db_rc.lock() {
+                            let _ = db.update_next_payment(&sub_id, Some(retry_at), sub.payments_sent);
+                        }
+                    }
+                    // Orange alert: outputs locked, retry scheduled
+                    if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+                        if let Ok(mut s) = state_rc.lock() {
+                            s.alerts.retain(|a| a.kind != "OUTPUTS_LOCKED" || a.sub_id.as_deref() != Some(&sub_id));
+                            s.alerts.push(AppAlert {
+                                level: AlertLevel::Orange,
+                                kind: "OUTPUTS_LOCKED".into(),
+                                sub_id: Some(sub_id.clone()),
+                                message: format!("Sub #{} — fonds verrouilles (confirmation en cours), retry dans 25 min", sub_id),
+                                created_at: chrono::Utc::now().timestamp(),
+                            });
+                            let count = s.alerts.len();
+                            drop(s);
+                            update_tray_icon(app, Some(AlertLevel::Orange), count);
+                        }
+                    }
+                    app.emit("payment-locked", serde_json::json!({"sub_id": sub_id, "retry_in_min": 25})).ok();
+                } else {
+                    log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
+                    if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+                        if let Ok(mut s) = state_rc.lock() {
+                            s.alerts.retain(|a| a.kind != "PAYMENT_FAILED" || a.sub_id.as_deref() != Some(&sub_id));
+                            s.alerts.push(AppAlert {
+                                level: AlertLevel::Orange,
+                                kind: "PAYMENT_FAILED".into(),
+                                sub_id: Some(sub_id.clone()),
+                                message: format!("Payment failed for sub #{}: {}", sub_id, e),
+                                created_at: chrono::Utc::now().timestamp(),
+                            });
+                            let count = s.alerts.len();
+                            drop(s);
+                            update_tray_icon(app, Some(AlertLevel::Orange), count);
+                        }
                     }
                 }
             }

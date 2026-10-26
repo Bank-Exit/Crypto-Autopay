@@ -786,9 +786,28 @@
               </div>
             {/each}
           </dl>
+          <!-- Start immediately toggle — same as in manual form -->
+          <div class="start-toggle-row" style="margin-top:8px">
+            <span class="start-toggle-label">
+              {startImmediately
+                ? l("Commencer les envois immédiatement", "Start sending immediately")
+                : l("Attendre la prochaine occurrence", "Wait for next scheduled occurrence")}
+            </span>
+            <button
+              class="ios-toggle" class:on={startImmediately}
+              type="button"
+              on:click={() => startImmediately = !startImmediately}
+              aria-label="Toggle start mode"
+            >
+              <span class="ios-thumb"></span>
+            </button>
+          </div>
+
           <button class="btn-primary" type="button" on:click={() => {
-              console.log("[SCE] 'Ajouter cet abonnement' clicked — dispatching imported event");
-              dispatch("imported", { code: importInput.trim(), payload: importResult.payload });
+              dispatch("imported", {
+                code: importInput.trim(),
+                payload: { ...importResult.payload, start_immediately: startImmediately }
+              });
             }}>
             {l("Ajouter cet abonnement →", "Add this subscription →")}
           </button>

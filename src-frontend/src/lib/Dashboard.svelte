@@ -111,7 +111,9 @@
       amount: String(payload.amount),
       currency: payload.currency || "XMR",
       schedule: scheduleToHuman(payload.schedule, payload.repeat_every || 1, $currentLang),
-      next_payment_at: payload.start_date || nextOccurrence(payload.schedule),
+      next_payment_at: payload.start_immediately === true
+        ? new Date().toISOString()
+        : (payload.start_date || nextOccurrence(payload.schedule)),
       status: "Active",
       canary_status: payload.canary_url ? "Ok" : "NotConfigured",
       payments_sent: 0,
@@ -518,9 +520,18 @@
     if (invokeError) {
       if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
       showPayLoader = false;
-      const isLockedOutputs = invokeError.includes("rejected by daemon") || invokeError.includes("not enough money");
+      const isLockedOutputs = invokeError.includes("rejected by daemon") || invokeError.includes("not enough") || invokeError.includes("unlocked");
       if (isLockedOutputs) {
-        logWarn("Scheduler", `[ATTENTE] Fonds verrouillee (confirmations en cours) pour sub #${sub.id} — attendez ~20 min`);
+        logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
+        // Defer next_payment_at by 25 min so the scheduler retries at the right time
+        const retryAt = new Date(Date.now() + 25 * 60 * 1000).toISOString();
+        const idx = subscriptions.findIndex(s => s.id === sub.id);
+        if (idx !== -1) {
+          subscriptions[idx] = { ...subscriptions[idx], next_payment_at: retryAt };
+          subscriptions = [...subscriptions];
+        }
+        await tauriInvoke("update_subscription_next_payment", { id: sub.id, nextPaymentAt: retryAt });
+        await refreshAlerts();
       } else {
         logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
       }
@@ -778,6 +789,12 @@
     const tickTimer = setInterval(() => { nowTick = Date.now(); }, 10 * 1000);
 
     // Listen for Rust background scheduler events
+    await tauriListen("payment-locked", async (ev) => {
+      const { sub_id, retry_in_min } = ev.payload || {};
+      logWarn("Scheduler", `[ATTENTE] Fonds verrouilles pour sub #${sub_id} — retry automatique dans ${retry_in_min} min`);
+      await refreshAlerts();
+    });
+
     const unlistenPayment = await tauriListen("payment-sent", async () => {
       logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
       balanceLoading = true;
