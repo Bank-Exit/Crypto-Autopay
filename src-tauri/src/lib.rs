@@ -2,6 +2,8 @@ use std::sync::{Mutex, Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use aes_gcm::{aead::{Aead, KeyInit, OsRng as AesOsRng}, Aes256Gcm, Key as AesKey, Nonce as AesNonce};
+use rand::RngCore;
 use tauri::{Manager, Emitter, Listener};
 
 // ============================================================
@@ -74,6 +76,14 @@ pub struct AppState {
     pub balance_low_threshold_days: f64,
     /// Alert preferences: which alert kinds are enabled (all enabled by default).
     pub enabled_alerts: std::collections::HashSet<String>,
+    /// AES-256-GCM key for payment history encryption (derived at unlock, cleared at lock).
+    pub history_key: Option<[u8; 32]>,
+    /// Path to the encrypted payment history file.
+    pub history_path: PathBuf,
+    /// Whether payment history recording is enabled.
+    pub history_enabled: bool,
+    /// Number of days to keep history entries (default: 365).
+    pub history_days: u32,
 }
 
 // ============================================================
@@ -96,6 +106,7 @@ async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Str
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = false;
     s.session_password = None;
+    s.history_key = None;  // clear derived key from memory
     // Keep wallet_address cached (it's in the .address file anyway)
     log::info!("[Security] Wallet locked (auto-lock or manual)");
     Ok(())
@@ -224,6 +235,7 @@ async fn unlock_wallet(
         if let Ok(mut s) = state.lock() {
             s.unlocked = true;
             s.session_password = Some(password.clone());
+            s.history_key = Some(derive_history_key(&password));
             s.wallet_address = Some(cached_addr.clone());
             s.wallet_file_path = wallet_file_path.clone();
             s.rpc_connected = false;
@@ -362,6 +374,7 @@ async fn unlock_wallet(
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
+    s.history_key = Some(derive_history_key(&password));
     s.session_password = Some(password);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
     s.balance_atomic = (balance_xmr * 1e12) as u64;
@@ -786,6 +799,164 @@ fn recompute_alerts(
     } else {
         None
     }
+}
+
+// ============================================================
+//  Payment history — encrypted storage
+// ============================================================
+
+/// A single payment history entry (stored encrypted).
+/// Security: no wallet address, tx hash truncated to 12 chars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: String,          // random UUID
+    pub sub_id: String,      // subscription internal ID
+    pub sub_label: String,   // human label from subscription
+    pub amount_xmr: f64,     // amount sent (user wants this visible)
+    pub sent_at: String,     // ISO 8601
+    pub tx_prefix: String,   // first 12 chars of tx_hash only
+}
+
+/// Derive a 32-byte AES key from the master password for history encryption.
+/// Uses Argon2id with lighter params (32MB, 2 iterations) since derived once at unlock.
+fn derive_history_key(password: &str) -> [u8; 32] {
+    use argon2::{Argon2, Params, Algorithm, Version};
+    const HISTORY_SALT: &[u8] = b"autopay-history-v1-salt-2025"; // fixed purpose salt
+    let params = Params::new(32_768, 2, 1, Some(32)).expect("valid params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2.hash_password_into(password.as_bytes(), HISTORY_SALT, &mut key)
+        .expect("Argon2id history key derivation failed");
+    key
+}
+
+/// Encrypt a JSON payload with AES-256-GCM. Returns base64(NONCE | CIPHERTEXT).
+fn aes_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<String, String> {
+    let cipher = Aes256Gcm::new(AesKey::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    AesOsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+    let ct = cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())?;
+    let mut blob = nonce_bytes.to_vec();
+    blob.extend_from_slice(&ct);
+    Ok(base64_encode(&blob))
+}
+
+/// Decrypt a base64(NONCE | CIPHERTEXT) AES-256-GCM blob.
+fn aes_decrypt(key: &[u8; 32], b64: &str) -> Result<Vec<u8>, String> {
+    let blob = base64_decode(b64).map_err(|e| e.to_string())?;
+    if blob.len() < 12 { return Err("history blob too short".to_string()); }
+    let (nonce_bytes, ct) = blob.split_at(12);
+    let cipher = Aes256Gcm::new(AesKey::<Aes256Gcm>::from_slice(key));
+    let nonce = AesNonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, ct).map_err(|_| "history decryption failed".to_string())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    use std::io::Write;
+    let mut enc = Vec::new();
+    {
+        let mut b64 = base64::write::EncoderWriter::new(&mut enc, &base64::engine::general_purpose::STANDARD);
+        b64.write_all(data).ok();
+    }
+    String::from_utf8(enc).unwrap_or_default()
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s)
+}
+
+/// Load and decrypt history entries from disk.
+fn load_history(key: &[u8; 32], path: &PathBuf) -> Vec<HistoryEntry> {
+    match std::fs::read_to_string(path) {
+        Ok(b64) if !b64.trim().is_empty() => {
+            match aes_decrypt(key, b64.trim()) {
+                Ok(plain) => serde_json::from_slice::<Vec<HistoryEntry>>(&plain)
+                    .unwrap_or_default(),
+                Err(e) => { log::error!("[History] Decrypt error: {}", e); vec![] }
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Encrypt and save history entries to disk.
+fn save_history(key: &[u8; 32], path: &PathBuf, entries: &[HistoryEntry]) -> Result<(), String> {
+    let json = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
+    let b64 = aes_encrypt(key, &json)?;
+    std::fs::write(path, b64).map_err(|e| e.to_string())
+}
+
+/// Configure payment history (enabled toggle + retention days).
+#[tauri::command]
+async fn set_history_config(
+    enabled: Option<bool>,
+    days: Option<u32>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    if let Some(v) = enabled { s.history_enabled = v; }
+    if let Some(d) = days { s.history_days = d.max(1).min(3650); }
+    Ok(())
+}
+
+/// Append a new payment entry to the encrypted history file.
+/// Called internally by the payment scheduler after a successful transfer.
+fn append_history_entry(state: &AppState, entry: HistoryEntry) {
+    if !state.history_enabled { return; }
+    let key = match &state.history_key { Some(k) => k, None => return };
+    let cutoff_days = state.history_days as i64;
+    let mut entries = load_history(key, &state.history_path);
+    // Prune old entries
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(cutoff_days);
+    entries.retain(|e| {
+        chrono::DateTime::parse_from_rfc3339(&e.sent_at)
+            .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
+            .unwrap_or(true)
+    });
+    entries.push(entry);
+    if let Err(e) = save_history(key, &state.history_path, &entries) {
+        log::error!("[History] Save error: {}", e);
+    }
+}
+
+/// Get the decrypted payment history (returns empty if locked or history disabled).
+#[tauri::command]
+async fn get_payment_history(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    if !s.history_enabled {
+        return Ok(serde_json::json!({ "enabled": false, "entries": [] }));
+    }
+    let key = match &s.history_key {
+        Some(k) => k,
+        None => return Ok(serde_json::json!({ "enabled": true, "entries": [], "locked": true })),
+    };
+    let entries = load_history(key, &s.history_path);
+    Ok(serde_json::json!({ "enabled": true, "entries": entries }))
+}
+
+/// Clear all payment history from disk.
+#[tauri::command]
+async fn clear_payment_history(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    if s.history_path.exists() {
+        std::fs::remove_file(&s.history_path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Get history config (enabled, days).
+#[tauri::command]
+async fn get_history_config(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "enabled": s.history_enabled, "days": s.history_days }))
 }
 
 /// Update alert configuration (threshold and enabled kinds).
@@ -1257,6 +1428,21 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     (next + chrono::Duration::minutes(p)).to_rfc3339()
                 } else { String::new() };
                 app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
+                // Append to encrypted payment history
+                if let Some(app_state) = app.try_state::<Mutex<AppState>>() {
+                    if let Ok(s) = app_state.lock() {
+                        let tx_prefix = if tx_hash.len() >= 12 { tx_hash[..12].to_string() } else { tx_hash.clone() };
+                        let entry = HistoryEntry {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            sub_id: sub_id.clone(),
+                            sub_label: sub.label.clone(),
+                            amount_xmr: sub.amount.parse::<f64>().unwrap_or(0.0),
+                            sent_at: chrono::Utc::now().to_rfc3339(),
+                            tx_prefix,
+                        };
+                        append_history_entry(&s, entry);
+                    }
+                }
             }
             Ok(Err(e)) => {
                 let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
@@ -1364,6 +1550,7 @@ pub fn run() {
             let vault_path      = data_dir.join("seed.vault");
             let wallet_file_path = data_dir.join("autopay_wallet");
             let db_path          = data_dir.join("subscriptions.db");
+            let history_path    = data_dir.join("history.vault");
 
             // Open the subscriptions SQLite database
             let db = Database::open(db_path.to_str().unwrap())
@@ -1403,6 +1590,10 @@ pub fn run() {
                     }
                     s
                 },
+                history_key: None,
+                history_path,
+                history_enabled: true,
+                history_days: 365,
             }));
 
             // Enable logging to both stdout and webview (always, not just debug)
@@ -1498,6 +1689,10 @@ pub fn run() {
             get_sync_info,
             get_alerts,
             set_alert_config,
+            set_history_config,
+            get_history_config,
+            get_payment_history,
+            clear_payment_history,
             save_subscription,
             get_subscription_debug,
             get_balance,

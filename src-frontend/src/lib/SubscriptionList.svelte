@@ -128,18 +128,19 @@
     openMenuId = null;
   }
 
-  export let archived = false;
+  export let archived = false; // kept for compat but no longer used externally
   export let wallets = [];
   // All subscriptions passed from parent (Dashboard manages the list)
   export let subscriptions = [];
 
   const SUSPENDED_STATUSES = ["Suspended", "Cancelled", "Expired"];
+  const ARCHIVED_STATUSES = ["Cancelled", "Expired"];
 
-  $: subs = subscriptions.filter(s =>
-    archived
-      ? ["Cancelled", "Expired"].includes(s.status)
-      : !["Cancelled", "Expired"].includes(s.status)
-  );
+  $: activeSubs = subscriptions.filter(s => !ARCHIVED_STATUSES.includes(s.status));
+  $: archivedSubs = subscriptions.filter(s => ARCHIVED_STATUSES.includes(s.status));
+
+  // Legacy: if used with archived=true prop, respect it
+  $: subs = archived ? archivedSubs : activeSubs;
 
   function walletName(id) {
     const w = wallets.find(w => w.id === id);
@@ -180,6 +181,12 @@
     return SUSPENDED_STATUSES.includes(sub.status);
   }
 
+  function archiveSub(sub, event) {
+    event.stopPropagation();
+    dispatch("archive-sub", { sub });
+    openMenuId = null;
+  }
+
   function formatDate(dateStr) {
     if (!dateStr) return null;
     return new Date(dateStr).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
@@ -189,14 +196,14 @@
 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
 <svelte:window on:click={closeMenu} />
 
-<div class="sub-list" class:archived-list={archived}>
-  {#if subs.length === 0}
+<div class="sub-list">
+  {#if activeSubs.length === 0 && archivedSubs.length === 0}
     <div class="empty-state card">
       <p>{$t.noSubscriptions}</p>
       <p class="text-muted">{$t.noSubscriptionsHint}</p>
     </div>
   {:else}
-    {#each subs as sub (sub.id)}
+    {#each activeSubs as sub (sub.id)}
       <div class="sub-card card" class:sub-archived={archived} class:sub-suspended={isSuspended(sub)}>
         <div class="sub-left">
           <span class="status-dot {statusDotColor(sub)}"></span>
@@ -282,7 +289,17 @@
                   <button class="kebab-item" on:click={e => togglePause(sub, e)}>
                     {sub.status === "Paused" ? "▶ Reprendre" : "⏸ Pause"}
                   </button>
+                  <div class="kebab-divider"></div>
+                  <button class="kebab-item kebab-warn" on:click={e => archiveSub(sub, e)}>
+                    📦 Archiver
+                  </button>
                 {/if}
+                {#if ARCHIVED_STATUSES.includes(sub.status)}
+                  <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ↩ Restaurer
+                  </button>
+                {/if}
+                <div class="kebab-divider"></div>
                 <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
                   Supprimer
                 </button>
@@ -292,6 +309,46 @@
         </div>
       </div>
     {/each}
+    {#if archivedSubs.length > 0}
+      <div class="archived-divider">
+        <span class="archived-divider-label">{$t.navArchived || 'Archivés'}</span>
+      </div>
+      {#each archivedSubs as sub (sub.id)}
+        <div class="sub-card card sub-archived sub-suspended">
+          <div class="sub-left">
+            <span class="status-dot grey"></span>
+          </div>
+          <div class="sub-body">
+            <div class="sub-header">
+              <span class="sub-label">{sub.label}</span>
+              <span class="badge badge-grey">{statusLabel(sub, $t)}</span>
+            </div>
+            <div class="sub-meta">
+              <span class="sub-amount"><strong>{sub.amount}</strong> {$currentNetwork.symbol}</span>
+              <span class="sep">·</span>
+              <span class="sub-schedule text-muted">{sub.schedule}</span>
+            </div>
+          </div>
+          <div class="sub-actions">
+            <div class="kebab-wrap">
+              <button class="btn-ghost btn-sm" on:click={e => toggleMenu(sub.id, e)}>⋯</button>
+              {#if openMenuId === sub.id}
+                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                <div class="kebab-menu" on:click|stopPropagation>
+                  <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ↩ Restaurer
+                  </button>
+                  <div class="kebab-divider"></div>
+                  <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
+                    Supprimer
+                  </button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        </div>
+      {/each}
+    {/if}
   {/if}
 </div>
 
@@ -378,5 +435,16 @@
   .kebab-item:hover { background: var(--bg-card-hover); }
   .kebab-danger { color: #ef4444; }
   .kebab-danger:hover { background: #ef444410; }
+  .kebab-warn { color: #f97316; }
+  .kebab-warn:hover { background: #f9731610; }
+  .kebab-divider { height: 1px; background: var(--border); margin: 4px 0; }
+  .archived-divider {
+    display: flex; align-items: center; gap: 8px;
+    margin: 16px 0 8px; color: var(--text-muted); font-size: 11px;
+  }
+  .archived-divider::before, .archived-divider::after {
+    content: ""; flex: 1; height: 1px; background: var(--border);
+  }
+  .archived-divider-label { padding: 0 8px; white-space: nowrap; }
   .btn-sm { padding: 5px 10px; font-size: 13px; }
 </style>

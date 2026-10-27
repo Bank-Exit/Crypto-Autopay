@@ -78,7 +78,10 @@
 
   let activeAlerts = [];
   let showAlertsOverlay = false;
-  let sessionPayments = []; // in-memory payment log for history page
+  let sessionPayments = []; // in-memory payment log for current session (superset of historyEntries)
+  let historyEntries = [];  // loaded from encrypted DB vault
+  let historyEnabled = true;
+  let historyDays = 365;
   async function refreshAlerts() {
     const alerts = await tauriInvoke("get_alerts");
     activeAlerts = alerts || [];
@@ -468,6 +471,9 @@
   // Sync progress (from get_sync_info after each refresh)
   let syncInfo = null; // { wallet_height, daemon_height, blocks_behind, synced }
   let syncPollTimer = null;
+  let isOffline = false;          // true when network is unreachable
+  // Monero blockchain is ~3.3M blocks (2026). If daemon reports 0 height it can't reach peers.
+  const OFFLINE_BLOCKS_THRESHOLD = 500_000; // >500k behind = almost certainly offline
 
   // Receive / QR state
   let copiedAddr = false;
@@ -710,13 +716,16 @@
         actionLabel: "Réessayer",
       };
     }
-    if (err.includes("connect") || err.includes("TCP") || err.includes("Connexion refusée")) {
+    if (err.includes("connect") || err.includes("TCP") || err.includes("Connexion refusée")
+        || err.includes("Network") || err.includes("network") || err.includes("ENETUNREACH")
+        || err.includes("No route") || err.includes("unreachable") || err.includes("offline")) {
       return {
-        icon: "🟠", level: "warn",
-        title: "Connexion au nœud Monero impossible",
-        detail: "Impossible de joindre le nœud distant. Vérifiez votre connexion internet ou changez de nœud dans les Paramètres.",
-        action: "settings",
-        actionLabel: "Changer de nœud",
+        icon: "📡", level: "warn",
+        title: "Hors ligne — pas de connexion Internet",
+        detail: "Le nœud Monero est inaccessible. Vérifiez votre connexion réseau. Le solde affiché est celui de la dernière synchronisation.",
+        action: "retry",
+        actionLabel: "Réessayer",
+        offline: true,
       };
     }
     if (err.includes("Task spawn") || err.includes("Internal task")) {
@@ -735,6 +744,36 @@
       action: "settings",
       actionLabel: "Voir Paramètres",
     };
+  }
+
+  async function loadHistoryConfig() {
+    try {
+      const cfg = await tauriInvoke("get_history_config");
+      historyEnabled = cfg.enabled ?? true;
+      historyDays = cfg.days ?? 365;
+    } catch(e) { logWarn("Dashboard", `History config load failed: ${e}`); }
+  }
+
+  async function loadHistoryEntries() {
+    try {
+      const res = await tauriInvoke("get_payment_history");
+      historyEntries = res.entries ?? [];
+    } catch(e) { logWarn("Dashboard", `History load failed: ${e}`); }
+  }
+
+  async function saveHistoryConfig() {
+    await tauriInvoke("set_history_config", { enabled: historyEnabled, days: historyDays });
+  }
+
+  async function toggleHistoryEnabled() {
+    historyEnabled = !historyEnabled;
+    await saveHistoryConfig();
+  }
+
+  async function clearHistory() {
+    if (!confirm("Effacer tout l'historique ? Cette action est irréversible.")) return;
+    await tauriInvoke("clear_payment_history");
+    historyEntries = [];
   }
 
   async function loadWalletInfo() {
@@ -765,7 +804,13 @@
   async function pollSyncInfo() {
     try {
       const info = await tauriInvoke("get_sync_info");
-      if (info) syncInfo = info;
+      if (info) {
+        syncInfo = info;
+        // Detect offline: daemon_height = 0 OR blocks_behind absurdly large
+        const behind = info.blocks_behind ?? 0;
+        const daemonH = info.daemon_height ?? 0;
+        isOffline = (daemonH === 0 && info.wallet_height > 0) || behind > OFFLINE_BLOCKS_THRESHOLD;
+      }
     } catch(_) {}
   }
 
@@ -796,12 +841,17 @@
       if (errStr.includes("RPC busy")) {
         logInfo("Dashboard", "Balance refresh skipped (paiement en cours)");
       } else if (errStr.includes("Locked")) {
-        // Wallet locked (auto-lock), keep last balance as-is, don't flag RPC error
         logInfo("Dashboard", "Balance refresh skipped (wallet verrouillé)");
-        balanceXmr = null; // show "-.----" since we can't trust old value
+        balanceXmr = null;
       } else {
         rpcOk = false;
         rpcError = errStr;
+        // Detect offline from error message
+        if (errStr.includes("connect") || errStr.includes("ENETUNREACH") ||
+            errStr.includes("Network") || errStr.includes("No route") ||
+            errStr.includes("unreachable") || errStr.includes("timed out")) {
+          isOffline = true;
+        }
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
@@ -828,6 +878,9 @@
 
     // Load basic wallet info (address, cached balance) — fast, no sync
     await loadWalletInfo();
+    // Load history config and entries from encrypted vault
+    await loadHistoryConfig();
+    await loadHistoryEntries();
     updateRefreshAgo();
 
     // Immediately trigger a background sync without blocking the UI
@@ -884,6 +937,7 @@
         await loadRpcState();
         await refreshBalance();
         await refreshAlerts();
+        await loadHistoryEntries(); // reload encrypted history after payment
       }, 5000);
     });
 
@@ -1141,13 +1195,17 @@
   <aside class="sidebar">
     <div class="sidebar-header">
       <div class="sidebar-logo">
-        <svg width="24" height="24" viewBox="0 0 72 72" fill="none">
-          <path d="M36 8 A28 28 0 1 1 8 36" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" fill="none"/>
-          <polyline points="6,24 8,36 20,34" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-          <circle cx="24" cy="36" r="5" fill="var(--accent)" opacity="0.9"/>
-          <circle cx="48" cy="36" r="5" fill="var(--accent)" opacity="0.5"/>
-          <line x1="31" y1="36" x2="41" y2="36" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
-          <polyline points="38,32 42,36 38,40" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <!-- AutoPay logo: circular repeat arrow + upward send arrow -->
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+          <!-- Circular arc ~300° (recurring cycle), clockwise -->
+          <path d="M14 3 A11 11 0 1 1 5.5 21.5" stroke="var(--accent)" stroke-width="2.6" stroke-linecap="round"/>
+          <!-- Arrow tip on the arc tail (bottom-left) -->
+          <polyline points="3,18.5 5.5,21.5 8.5,19.5" stroke="var(--accent)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- Inner: upward arrow = sending a payment -->
+          <line x1="14" y1="17" x2="14" y2="11" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"/>
+          <polyline points="11,13.5 14,11 17,13.5" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- Small base line = coin/table -->
+          <line x1="11" y1="17" x2="17" y2="17" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
         </svg>
         <div>
           <div class="sidebar-appname">Monero AutoPay</div>
@@ -1178,18 +1236,14 @@
       <button class="nav-item" class:active={page === "subscriptions"} on:click={() => page = "subscriptions"}>
         {$t.navSubscriptions}
       </button>
-      <button class="nav-item" class:active={page === "receive"} on:click={() => page = "receive"}>
-        {$t.receiveTitle || 'Recevoir XMR'}
-      </button>
+      <!-- receive moved into wallet card -->
       <button class="nav-item" class:active={page === "wallets"} on:click={() => page = "wallets"}>
         {$t.navWallets}
       </button>
       <button class="nav-item" class:active={page === "history"} on:click={() => page = "history"}>
         {$t.navPaymentHistory}
       </button>
-      <button class="nav-item" class:active={page === "archived"} on:click={() => page = "archived"}>
-        {$t.navArchived}
-      </button>
+      <!-- archived moved inline in subscription list -->
       <button class="nav-item find-nav" class:active={page === "find"} on:click={() => page = "find"}>
         {$t.findSubscriptions}
       </button>
@@ -1210,11 +1264,20 @@
         {$t.navHowItWorks}
       </button>
       <button class="nav-item" class:active={page === "create-code"} on:click={() => page = "create-code"}>
-        🔗 {$t.navCreateCode || 'Créer un code'}
+        🔗 {$t.navCreateCode || 'Créer un code AutoPay'}
       </button>
       <button class="nav-item" class:active={page === "settings"} on:click={() => page = "settings"}>
         {$t.navSettings}
       </button>
+      <!-- Lock button — centered below settings -->
+      <div style="display:flex;justify-content:center;padding:10px 0 4px">
+        <button class="lock-nav-btn" title="Verrouiller la session" on:click={() => tauriInvoke('lock_wallet').then(() => { appState = 'locked'; })}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </button>
+      </div>
     </nav>
 
     <!-- Balance card: arbre complet des états RPC -->
@@ -1238,7 +1301,12 @@
           </svg>
         </button>
       </div>
-      {#if balanceLoading}
+      {#if isOffline}
+        <div class="offline-banner">
+          📡 Hors ligne — connectez-vous à Internet pour synchroniser
+          <button class="btn-inline" on:click={() => { isOffline = false; refreshBalance(); }}>Réessayer</button>
+        </div>
+      {:else if balanceLoading}
         <div class="refresh-ago sync-pulse">Synchro réseau en cours…</div>
         {#if syncInfo && syncInfo.blocks_behind > 10}
           {@const pct = Math.max(2, Math.min(99, 100 - (syncInfo.blocks_behind / Math.max(syncInfo.daemon_height, 1)) * 100))}
@@ -1255,7 +1323,13 @@
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
       {/if}
 
-        {#if balanceXmr === null}
+        {#if isOffline && balanceXmr !== null}
+          <!-- Offline but we have a cached balance: show it greyed -->
+          <div class="balance-amount" style="color:var(--text-muted)">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
+          <div class="balance-hint" style="color:var(--text-muted);font-size:11px">Solde de la dernière synchro — non actualisé</div>
+        {:else if isOffline}
+          <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
+        {:else if balanceXmr === null}
         <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
 
       {:else if rpcOk}
@@ -1367,6 +1441,16 @@
         }}
         on:trigger-now={e => triggerNow(e.detail.sub)}
         on:edit-sub={e => openEditSubModal(e.detail.sub)}
+        on:archive-sub={async e => {
+          const sub = e.detail.sub;
+          subscriptions = subscriptions.map(s => s.id === sub.id ? { ...s, status: "Cancelled" } : s);
+          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: true });
+        }}
+        on:restore-sub={async e => {
+          const sub = e.detail.sub;
+          subscriptions = subscriptions.map(s => s.id === sub.id ? { ...s, status: "Paused" } : s);
+          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: false });
+        }}
       />
       <!-- Footer marketing + bottom spacer -->
       <div class="sub-footer">
@@ -1448,7 +1532,13 @@
                     <div class="wallet-name">{w.name}</div>
                     {#if w.desc}<div class="wallet-desc text-muted">{w.desc}</div>{/if}
                   </div>
-                  <button class="btn-ghost btn-sm" on:click={() => startEditWallet(w)}>{$t.walletEdit}</button>
+                  <div style="display:flex;gap:6px">
+                    <button class="btn-ghost btn-sm" on:click={() => { page = 'receive'; }}
+                      title={$t.receiveTitle || 'Recharger le wallet'}>
+                      ⬇ {$t.receiveTitle || 'Recharger'}
+                    </button>
+                    <button class="btn-ghost btn-sm" on:click={() => startEditWallet(w)}>{$t.walletEdit}</button>
+                  </div>
                 </div>
                 <div class="wallet-balance">
                   {#if w.balance === null}
@@ -1529,40 +1619,79 @@
 
     <!-- ====== HISTORY ====== -->
     {:else if page === "history"}
-      <div class="page-header">
-        <h1>{$t.navPaymentHistory}</h1>
-        <p class="text-muted" style="font-size:12px;margin-top:4px">Paiements envoyés cette session (en mémoire). L'historique complet sera en DB dans une prochaine version.</p>
+      <div class="page-header" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <h1>{$t.navPaymentHistory}</h1>
+          <p class="text-muted" style="font-size:12px;margin-top:4px">
+            {historyEnabled ? `Chiffré · ${historyDays} jours de rétention` : 'Historique désactivé (vie privée)'}
+          </p>
+        </div>
+        <!-- iOS-style toggle for history -->
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:12px;color:var(--text-muted)">{historyEnabled ? 'Activé' : 'Désactivé'}</span>
+          <button class="ios-toggle-btn" class:ios-on={historyEnabled}
+            on:click={toggleHistoryEnabled} title="Activer/désactiver l'enregistrement de l'historique">
+            <span class="ios-thumb-btn"></span>
+          </button>
+        </div>
       </div>
-      {#if sessionPayments.length === 0}
-        <div class="card" style="padding:24px;text-align:center;color:var(--text-muted)">
-          Aucun paiement envoyé durant cette session.
+
+      {#if historyEnabled}
+        <!-- Retention setting -->
+        <div class="card" style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <span style="font-size:13px">Durée de conservation</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" min="7" max="3650" bind:value={historyDays}
+              on:change={() => saveHistoryConfig()}
+              style="width:60px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:13px;text-align:center"/>
+            <span style="font-size:12px;color:var(--text-muted)">jours</span>
+          </div>
         </div>
+
+        {#if historyEntries.length === 0}
+          <div class="card" style="padding:24px;text-align:center;color:var(--text-muted)">
+            Aucun paiement enregistré.
+          </div>
+        {:else}
+          <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
+            <button class="btn-ghost btn-sm" style="color:#ef4444;font-size:11px"
+              on:click={clearHistory}>Effacer l'historique</button>
+          </div>
+          <div class="history-list">
+            {#each [...historyEntries].reverse() as p}
+              <div class="history-card card">
+                <div class="history-row">
+                  <span class="history-label">{p.sub_label}</span>
+                  <span class="history-amount">{p.amount_xmr.toFixed(4)} XMR</span>
+                </div>
+                <div class="history-row history-meta">
+                  <span class="text-muted">{new Date(p.sent_at).toLocaleString()}</span>
+                  {#if p.tx_prefix}
+                    <span class="history-tx">tx: {p.tx_prefix}…</span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+          <!-- Totals by sub -->
+          <div class="card" style="margin-top:12px;padding:12px 16px">
+            <div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:8px">TOTAUX (HISTORIQUE CHIFFRÉ)</div>
+            {#each Object.entries(historyEntries.reduce((acc, p) => {
+              acc[p.sub_label] = (acc[p.sub_label] || 0) + p.amount_xmr; return acc;
+            }, {})) as [label, total]}
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;border-bottom:1px solid var(--border)">
+                <span>{label}</span>
+                <span>{total.toFixed(4)} XMR</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {:else}
-        <div class="history-list">
-          {#each [...sessionPayments].reverse() as p}
-            <div class="history-card card">
-              <div class="history-row">
-                <span class="history-label">{p.label}</span>
-                <span class="history-amount">{p.amount} {p.currency || 'XMR'}</span>
-              </div>
-              <div class="history-row history-meta">
-                <span class="text-muted">{new Date(p.sent_at).toLocaleString()}</span>
-                {#if p.tx_hash}
-                  <span class="history-tx">tx: {p.tx_hash.slice(0,16)}…</span>
-                {/if}
-              </div>
-            </div>
-          {/each}
-        </div>
-        <!-- Summary: total per sub from subscriptions list -->
-        <div class="card" style="margin-top:12px;padding:12px 16px">
-          <div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:8px">TOTAL PAR ABONNEMENT</div>
-          {#each subscriptions.filter(s => (s.payments_sent || 0) > 0) as sub}
-            <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;border-bottom:1px solid var(--border)">
-              <span>{sub.label}</span>
-              <span>{sub.payments_sent} envoi(s) · {(sub.payments_sent * parseFloat(sub.amount)).toFixed(4)} {sub.currency || 'XMR'}</span>
-            </div>
-          {/each}
+        <div class="card" style="padding:24px;text-align:center">
+          <p style="font-size:20px;margin-bottom:8px">🔒</p>
+          <p style="color:var(--text-muted);font-size:13px">
+            L'enregistrement de l'historique est désactivé.<br/>Réactivez-le pour enregistrer les paiements futurs.
+          </p>
         </div>
       {/if}
 
@@ -2219,6 +2348,17 @@
   }
 
   /* Payment history */
+  .ios-toggle-btn {
+    width: 46px; height: 26px; border-radius: 13px; border: none; cursor: pointer;
+    background: var(--border); position: relative; transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .ios-toggle-btn.ios-on { background: var(--accent); }
+  .ios-thumb-btn {
+    position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; transition: left 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .ios-toggle-btn.ios-on .ios-thumb-btn { left: 23px; }
   .history-list { display: flex; flex-direction: column; gap: 8px; }
   .history-card { padding: 12px 16px; }
   .history-row { display: flex; justify-content: space-between; align-items: center; }
@@ -2241,6 +2381,17 @@
   .alert-detail-msg { font-size: 13px; color: var(--text); }
   .alert-detail-time { font-size: 10px; color: var(--text-muted); }
 
+  .offline-banner {
+    background: #1e3a5f; border: 1px solid #3b82f6; border-radius: 8px;
+    padding: 8px 12px; font-size: 12px; color: #93c5fd;
+    display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+  }
+  .lock-nav-btn {
+    background: none; border: 1px solid var(--border); border-radius: 50%;
+    width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: var(--text-muted); transition: all 0.15s;
+  }
+  .lock-nav-btn:hover { background: var(--bg-card-hover); color: var(--accent); border-color: var(--accent); }
   .refill-urgent { border: 1px solid #f97316 !important; background: #f9731610 !important; }
   .refill-urgent-text { color: #ef4444 !important; font-size: 15px !important; animation: blink-urgent 1.2s ease-in-out infinite; }
   @keyframes blink-urgent {

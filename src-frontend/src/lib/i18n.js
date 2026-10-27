@@ -212,7 +212,7 @@ const T = {
     refillHours: "heure(s)",
 
     // Create code page
-    navCreateCode: "Créer un code",
+    navCreateCode: "Créer un code AutoPay",
     createCodeTitle: "Créer un code AutoPay de partage",
     createCodeSubtitle: "Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés",
 
@@ -438,7 +438,7 @@ const T = {
     inPrefix: "in", inDaysSuffix: "days",
     refillHours: "hour(s)",
 
-    navCreateCode: "Create a code",
+    navCreateCode: "Create an AutoPay code",
     createCodeTitle: "Create a shareable AutoPay code",
     createCodeSubtitle: "For merchants, creators and influencers — share with your subscribers",
 

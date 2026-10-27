@@ -2539,11 +2539,15 @@ dependencies = [
 name = "monero-autopay"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "autopay-core",
  "autopay-crypto",
  "autopay-rpc",
+ "base64 0.22.1",
  "chrono",
  "log",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

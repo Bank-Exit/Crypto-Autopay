@@ -31,5 +31,9 @@ reqwest.workspace = true
 autopay-core  = { path = "../crates/autopay-core" }
 autopay-crypto = { path = "../crates/autopay-crypto" }
 autopay-rpc   = { path = "../crates/autopay-rpc" }
+aes-gcm.workspace = true
+argon2.workspace = true
+rand.workspace = true
+base64.workspace = true
 tauri-plugin-deep-link = "=2.3.0"
 tauri-plugin-single-instance = "2.5.4"
