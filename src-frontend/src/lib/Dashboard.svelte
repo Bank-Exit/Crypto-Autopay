@@ -159,6 +159,45 @@
   let historyEntries = [];  // loaded from encrypted DB vault
   let historyEnabled = true;
   let historyDays = 365;
+
+  // Treasurer mode
+  let treasurerMode = false;
+  let pvJson = "";
+  let pvDoc = null;        // parsed PV document
+  let pvError = "";        // parse/validate error
+  let pvExecuting = false; // payment in progress
+  let pvResults = {};      // paymentId → { status: 'ok'|'error', tx?: string, msg?: string }
+
+  async function loadTreasurerMode() {
+    const v = await tauriInvoke("get_treasurer_mode");
+    if (v !== null) treasurerMode = !!v;
+  }
+  async function toggleTreasurerMode(enabled) {
+    treasurerMode = enabled;
+    await tauriInvoke("set_treasurer_mode", { enabled }).catch(() => {});
+  }
+  async function validatePv() {
+    pvError = ""; pvDoc = null; pvResults = {};
+    try {
+      const doc = await tauriInvoke("validate_pv", { pvJson });
+      if (doc) { pvDoc = doc; }
+      else { pvError = "Réponse vide du backend."; }
+    } catch (e) { pvError = String(e); }
+  }
+  async function executePvPayment(payment) {
+    if (!confirm(($t.treasurerConfirmMsg || 'Confirmer le paiement de {amount} XMR à {recipient} ?')
+      .replace('{amount}', payment.amount_xmr).replace('{recipient}', payment.recipient))) return;
+    pvExecuting = true;
+    pvResults = { ...pvResults, [payment.id]: { status: 'pending' } };
+    try {
+      const tx = await tauriInvoke("execute_pv_payment", { paymentJson: JSON.stringify(payment) });
+      pvResults = { ...pvResults, [payment.id]: { status: 'ok', tx } };
+    } catch (e) {
+      pvResults = { ...pvResults, [payment.id]: { status: 'error', msg: String(e) } };
+    } finally {
+      pvExecuting = false;
+    }
+  }
   async function refreshAlerts() {
     const alerts = await tauriInvoke("get_alerts");
     activeAlerts = alerts || [];
@@ -972,6 +1011,8 @@
     // Load history config and entries from encrypted vault
     await loadHistoryConfig();
     await loadHistoryEntries();
+    // Load treasurer mode
+    await loadTreasurerMode();
 
     // Sync payment mode with Rust backend (source of truth for semi-auto enforcement)
     try {
@@ -1429,13 +1470,18 @@
       <button class="nav-item" class:active={page === "settings"} on:click={() => page = "settings"}>
         {$t.navSettings}
       </button>
+      {#if treasurerMode}
+        <button class="nav-item nav-item-treasurer" class:active={page === "treasurer"} on:click={() => page = "treasurer"}>
+          ⚖ {$t.treasurerNavItem || 'Trésorier'}
+        </button>
+      {/if}
       <!-- Lock button — centered below settings -->
       <div style="display:flex;justify-content:center;padding:12px 0 4px">
         <button class="lock-nav-btn" title="Verrouiller la session"
           on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock')).catch(() => dispatch('lock'))}>
-          <!-- Same padlock as unlock screen — standard 24×24 viewBox, stroke-based, always visible -->
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-               stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <!-- Padlock SVG — use style= for CSS vars (WebKitGTK doesn't resolve vars in presentation attrs) -->
+          <svg width="20" height="20" viewBox="0 0 24 24"
+               style="fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;stroke-linejoin:round">
             <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
             <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
           </svg>
@@ -1791,12 +1837,14 @@
         <div>
           <h1>{$t.navPaymentHistory}</h1>
           <p class="text-muted" style="font-size:12px;margin-top:4px">
-            {historyEnabled ? `Chiffré · ${historyDays} jours de rétention` : 'Historique désactivé (vie privée)'}
+            {historyEnabled
+              ? ($t.historyEncryptedLabel || 'Chiffré · {days} jours de rétention').replace('{days}', historyDays)
+              : ($t.historyDisabledLabel || 'Historique désactivé (vie privée)')}
           </p>
         </div>
         <!-- iOS-style toggle for history -->
         <div style="display:flex;align-items:center;gap:10px">
-          <span style="font-size:12px;color:var(--text-muted)">{historyEnabled ? 'Activé' : 'Désactivé'}</span>
+          <span style="font-size:12px;color:var(--text-muted)">{historyEnabled ? ($t.historyEnabled || 'Activé') : ($t.historyDisabled || 'Désactivé')}</span>
           <button class="ios-toggle-btn" class:ios-on={historyEnabled}
             on:click={toggleHistoryEnabled} title="Activer/désactiver l'enregistrement de l'historique">
             <span class="ios-thumb-btn"></span>
@@ -1807,18 +1855,18 @@
       {#if historyEnabled}
         <!-- Retention setting -->
         <div class="card" style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <span style="font-size:13px">Durée de conservation</span>
+          <span style="font-size:13px">{$t.historyRetentionLabel || 'Durée de conservation'}</span>
           <div style="display:flex;align-items:center;gap:8px">
             <input type="number" min="7" max="3650" bind:value={historyDays}
               on:change={() => saveHistoryConfig()}
               style="width:60px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:13px;text-align:center"/>
-            <span style="font-size:12px;color:var(--text-muted)">jours</span>
+            <span style="font-size:12px;color:var(--text-muted)">{$t.historyRetentionUnit || 'jours'}</span>
           </div>
         </div>
 
         {#if historyEntries.length === 0}
           <div class="card" style="padding:24px;text-align:center;color:var(--text-muted)">
-            Aucun paiement enregistré.
+            {$t.historyEmpty || 'Aucun paiement enregistré.'}
           </div>
         {:else}
           <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
@@ -1937,6 +1985,22 @@
         </div>
         <p class="mode-desc">
           {$paymentMode === "semi-auto" ? $t.paymentModeSemiAutoDesc : $t.paymentModeAutoDesc}
+        </p>
+      </div>
+
+      <!-- Treasurer mode section -->
+      <h2 class="section-title">⚖ {$t.treasurerModeLabel || 'Mode Trésorier (PV)'}</h2>
+      <div class="settings-section card">
+        <div class="setting-row">
+          <span class="setting-label">{$t.treasurerModeLabel || 'Mode Trésorier'}</span>
+          <label class="toggle">
+            <input type="checkbox" bind:checked={treasurerMode}
+              on:change={e => toggleTreasurerMode(e.target.checked)} />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="mode-desc" style="font-size:12px;color:var(--text-muted)">
+          {$t.treasurerModeDesc || 'Importer et exécuter des ordres de paiement issus d\'un Procès-Verbal.'}
         </p>
       </div>
 
@@ -2174,6 +2238,97 @@
           <div class="balance-hint">Adresse non disponible — déverrouillez le wallet d'abord.</div>
         {/if}
       </div>
+
+    <!-- ====== TREASURER ====== -->
+    {:else if page === "treasurer"}
+      <div class="page-header">
+        <h1>⚖ {$t.treasurerPageTitle || 'Trésorier — Procès-Verbal'}</h1>
+      </div>
+      <div class="card" style="padding:16px;margin-bottom:16px">
+        <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px">
+          {$t.treasurerFormatHint || 'Format JSON standardisé : version, id, created_at, committee, resolution_number, description, payments[].'}
+        </p>
+        <label class="field">
+          <span>{$t.treasurerImportLabel || 'Importer un PV (JSON)'}</span>
+          <textarea bind:value={pvJson} rows="8"
+            placeholder={$t.treasurerImportPlaceholder || 'Collez ici le JSON du Procès-Verbal…'}
+            style="font-family:monospace;font-size:12px;width:100%;resize:vertical;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-card);color:var(--text)">
+          </textarea>
+        </label>
+        {#if pvError}
+          <p style="color:#ef4444;font-size:13px;margin:8px 0 0">⚠ {pvError}</p>
+        {/if}
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="btn-primary" on:click={validatePv} disabled={!pvJson.trim()}>
+            {$t.treasurerValidateBtn || 'Valider le PV'}
+          </button>
+          {#if pvDoc}
+            <button class="btn-ghost" on:click={() => { pvDoc = null; pvJson = ""; pvResults = {}; }}>
+              Effacer
+            </button>
+          {/if}
+        </div>
+      </div>
+
+      {#if pvDoc}
+        <div class="card" style="padding:16px">
+          <div style="margin-bottom:12px">
+            <div style="font-size:15px;font-weight:700">{pvDoc.committee}</div>
+            <div style="font-size:12px;color:var(--text-muted)">
+              Résolution #{pvDoc.resolution_number} · {pvDoc.created_at?.slice(0,10)}
+            </div>
+            <div style="font-size:13px;margin-top:6px">{pvDoc.description}</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            {#each pvDoc.payments as payment}
+              {@const result = pvResults[payment.id]}
+              <div class="card" style="padding:12px;border:1px solid var(--border)">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <div>
+                    <div style="font-weight:700;font-size:14px">{payment.recipient}</div>
+                    <div style="font-size:20px;font-weight:800;color:var(--accent)">
+                      {payment.amount_xmr} {payment.currency}
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted)">
+                      {payment.execution === 'immediate' ? 'Exécution immédiate' : `Différée : ${payment.execution}`}
+                    </div>
+                    {#if payment.note}
+                      <div style="font-size:12px;font-style:italic;color:var(--text-muted)">{payment.note}</div>
+                    {/if}
+                  </div>
+                  <div style="text-align:right">
+                    {#if result?.status === 'ok'}
+                      <span style="color:#22c55e;font-size:12px">✓ Envoyé</span>
+                    {:else if result?.status === 'error'}
+                      <span style="color:#ef4444;font-size:12px">✗ Erreur</span>
+                    {:else if result?.status === 'pending'}
+                      <span style="color:var(--text-muted);font-size:12px">En cours…</span>
+                    {:else}
+                      <button class="btn-primary" style="font-size:12px;padding:6px 12px"
+                        disabled={pvExecuting || payment.currency !== 'XMR'}
+                        on:click={() => executePvPayment(payment)}>
+                        {$t.treasurerExecuteBtn || 'Exécuter'}
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+                {#if result?.status === 'ok'}
+                  <div style="font-size:11px;color:var(--text-muted);font-family:monospace;word-break:break-all">
+                    tx: {result.tx}
+                  </div>
+                {:else if result?.status === 'error'}
+                  <div style="font-size:11px;color:#ef4444">{result.msg}</div>
+                {/if}
+                {#if payment.currency !== 'XMR'}
+                  <div style="font-size:11px;color:#f97316;margin-top:4px">
+                    ⚠ Bitcoin non encore supporté dans cette version.
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
 
     <!-- ====== HOW IT WORKS ====== -->
     {:else if page === "howto"}
@@ -2417,6 +2572,7 @@
   }
   .nav-item:hover { background: var(--bg-card-hover); color: var(--text); }
   .nav-item.active { background: var(--accent-light); color: var(--accent); font-weight: 600; }
+  .nav-item-treasurer { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
   .nav-divider { height: 1px; background: var(--border); margin: 5px 0; }
 
   /* Balance card at bottom */

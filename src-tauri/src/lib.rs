@@ -92,6 +92,10 @@ pub struct AppState {
     pub pending_approvals: std::collections::HashMap<String, PendingApproval>,
     /// Payments approved by the user this session (scheduler picks these up).
     pub approved_payments: std::collections::HashSet<String>,
+    /// Unix timestamp of last unlock — scheduler skips 45s after unlock to let initial sync complete.
+    pub last_unlock_at: i64,
+    /// Treasurer mode: allows importing and executing one-time PV (Procès-Verbal) payments.
+    pub treasurer_mode: bool,
 }
 
 /// A payment pending user confirmation (semi-auto mode).
@@ -251,6 +255,7 @@ async fn unlock_wallet(
         log::info!("[Unlock] Fast path: using cached address {}…", &cached_addr[..12]);
         if let Ok(mut s) = state.lock() {
             s.unlocked = true;
+            s.last_unlock_at = chrono::Utc::now().timestamp();
             s.session_password = Some(password.clone());
             s.history_key = Some(derive_history_key(&password));
             s.wallet_address = Some(cached_addr.clone());
@@ -391,6 +396,7 @@ async fn unlock_wallet(
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
+    s.last_unlock_at = chrono::Utc::now().timestamp();
     s.history_key = Some(derive_history_key(&password));
     s.session_password = Some(password);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
@@ -1396,6 +1402,145 @@ fn update_tray_icon(app: &tauri::AppHandle, level: Option<AlertLevel>, alert_cou
     }
 }
 
+// ============================================================
+//  Treasurer mode commands
+// ============================================================
+
+#[tauri::command]
+async fn set_treasurer_mode(
+    state: tauri::State<'_, Mutex<AppState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.treasurer_mode = enabled;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_treasurer_mode(
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(s.treasurer_mode)
+}
+
+/// A Procès-Verbal payment order (JSON imported by the user).
+/// Only XMR is supported in v1; Bitcoin address is stored for future.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PvPayment {
+    pub id: String,
+    pub recipient: String,          // human-readable label
+    pub address: String,            // Monero address
+    pub amount_xmr: f64,
+    pub currency: String,           // "XMR" only for now
+    pub execution: String,          // "immediate" or ISO-8601 datetime
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PvDocument {
+    pub version: u32,
+    pub id: String,
+    pub created_at: String,
+    pub committee: String,
+    pub resolution_number: String,
+    pub description: String,
+    pub payments: Vec<PvPayment>,
+}
+
+/// Validate a PV JSON string and return parsed document (does NOT execute payments).
+#[tauri::command]
+async fn validate_pv(pv_json: String) -> Result<PvDocument, String> {
+    serde_json::from_str::<PvDocument>(&pv_json)
+        .map_err(|e| format!("Invalid PV format: {e}"))
+}
+
+/// Execute a single payment from a PV document (XMR only).
+/// Returns the tx prefix hash.
+#[tauri::command]
+async fn execute_pv_payment(
+    state: tauri::State<'_, Mutex<AppState>>,
+    app: tauri::AppHandle,
+    payment_json: String,
+) -> Result<String, String> {
+    let payment: PvPayment = serde_json::from_str(&payment_json)
+        .map_err(|e| format!("Invalid payment JSON: {e}"))?;
+
+    if payment.currency != "XMR" {
+        return Err("Only XMR payments are supported in this version.".to_string());
+    }
+
+    let (wallet_name, wallet_dir, password, rpc_busy) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if !s.unlocked { return Err("Wallet is locked.".to_string()); }
+        if !s.treasurer_mode { return Err("Treasurer mode is not enabled.".to_string()); }
+        let busy = Arc::clone(&s.rpc_busy);
+        let pw = s.session_password.clone().ok_or("No session password")?;
+        let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let name = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        (name, dir, pw, busy)
+    };
+
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("RPC busy — another operation is in progress. Try again in a moment.".to_string());
+    }
+
+    struct RpcGuard(Arc<AtomicBool>);
+    impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+    let _guard = RpcGuard(rpc_busy);
+
+    let wallet_file = wallet_dir.join(&wallet_name);
+    let rpc_config = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.rpc.config.clone()
+    };
+
+    let mut rpc = crate::rpc_manager::RpcManager::new(rpc_config);
+    rpc.start(&wallet_file, &password)
+        .map_err(|e| format!("Failed to start RPC: {e}"))?;
+
+    let amount_pico = (payment.amount_xmr * 1e12) as u64;
+    let rpc_url = rpc.rpc_url();
+
+    // Open wallet
+    let _ = rpc_manager::ureq_post_json_pub(&rpc_url, &serde_json::json!({
+        "jsonrpc": "2.0", "id": "1", "method": "open_wallet",
+        "params": { "filename": wallet_name, "password": password }
+    }));
+
+    // Refresh wallet (sync with daemon)
+    let _ = rpc_manager::ureq_post_json_long(&rpc_url, &serde_json::json!({
+        "jsonrpc": "2.0", "id": "1", "method": "refresh", "params": {}
+    }), 120);
+
+    let result = rpc_manager::ureq_post_json_pub(&rpc_url, &serde_json::json!({
+        "jsonrpc": "2.0", "id": "1", "method": "transfer",
+        "params": {
+            "destinations": [{ "amount": amount_pico, "address": payment.address }],
+            "priority": 0,
+            "ring_size": 16,
+            "get_tx_key": false,
+        }
+    }));
+
+    rpc.stop();
+
+    match result {
+        Ok(v) => {
+            let tx_hash = v["result"]["tx_hash"].as_str()
+                .or_else(|| v["result"]["tx_hash_list"][0].as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            // Log without amount or address for security
+            let prefix_len = std::cmp::min(8, tx_hash.len());
+            log::info!("[Treasurer] PV payment executed: id={} tx_prefix={}…", payment.id, &tx_hash[..prefix_len]);
+            Ok(tx_hash)
+        }
+        Err(e) => Err(format!("Payment failed: {e}")),
+    }
+}
+
 /// Minimum interval between Monero sends (10 confirmations ≈ 20 min, use 25 min safely).
 const MONERO_MIN_SEND_INTERVAL_SECS: u64 = 25 * 60;
 
@@ -1414,6 +1559,14 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             Err(_) => return,
         };
         if !s.unlocked { return; }
+        // Grace period: skip first 45s after unlock so the initial balance sync completes first
+        if s.last_unlock_at > 0 {
+            let since_unlock = Utc::now().timestamp() - s.last_unlock_at;
+            if since_unlock < 45 {
+                log::debug!("[Scheduler] Grace period: {}s since unlock, skipping this cycle", since_unlock);
+                return;
+            }
+        }
         let pw = match &s.session_password {
             Some(p) => p.clone(),
             None => return,
@@ -1747,6 +1900,8 @@ pub fn run() {
                 semi_auto_mode: true, // safe default: require user confirmation
                 pending_approvals: std::collections::HashMap::new(),
                 approved_payments: std::collections::HashSet::new(),
+                last_unlock_at: 0,
+                treasurer_mode: false,
             }));
 
             // Enable logging to both stdout and webview (always, not just debug)
@@ -1879,6 +2034,10 @@ pub fn run() {
             approve_payment,
             reject_payment,
             get_pending_approvals,
+            set_treasurer_mode,
+            get_treasurer_mode,
+            validate_pv,
+            execute_pv_payment,
             save_subscription,
             get_subscription_debug,
             get_balance,

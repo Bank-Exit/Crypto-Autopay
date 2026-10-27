@@ -61,7 +61,7 @@ pub enum RpcStatus {
 }
 
 pub struct RpcManager {
-    config: RpcConfig,
+    pub config: RpcConfig,
     process: Option<Child>,
     pub status: RpcStatus,
 }
@@ -130,7 +130,8 @@ impl RpcManager {
                 "--wallet-file", wallet_file.to_str().unwrap_or(""),
                 "--password", wallet_password,
                 "--disable-rpc-login",   // localhost only, no login needed
-                "--log-level", "1",
+                "--log-level", "0",      // suppress logs
+                "--log-file", "/dev/null", // prevent 100MB+ log files in project dir
                 "--non-interactive",
             ])
             .stdout(Stdio::null())
@@ -210,7 +211,8 @@ impl RpcManager {
             "--rpc-bind-port", &port.to_string(),
             "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
             "--disable-rpc-login",
-            "--log-level", "1",
+            "--log-level", "0",        // suppress logs
+            "--log-file", "/dev/null", // prevent 100MB+ log files in project dir
             "--non-interactive",
         ];
         log::info!("[RPC] Spawning: {:?} {:?}", binary, args);

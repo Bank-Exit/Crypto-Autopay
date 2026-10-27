@@ -256,6 +256,31 @@ const T = {
     // Wallet refill estimate
     walletRefillIn: "À recharger dans ~",
     walletMonthlyOut: "dépenses/mois",
+
+    // Payment history page
+    historyTitle: "Historique des paiements",
+    historyEncryptedLabel: "Chiffré · {days} jours de rétention",
+    historyDisabledLabel: "Historique désactivé (vie privée)",
+    historyEnabled: "Activé",
+    historyDisabled: "Désactivé",
+    historyRetentionLabel: "Durée de conservation",
+    historyRetentionUnit: "jours",
+    historyEmpty: "Aucun paiement enregistré.",
+    historyClearBtn: "Effacer l'historique",
+    historyClearConfirm: "Effacer tout l'historique ? Cette action est irréversible.",
+
+    // Treasurer mode
+    treasurerNavItem: "Trésorier",
+    treasurerModeLabel: "Mode Trésorier (PV)",
+    treasurerModeDesc: "Importer et exécuter des ordres de paiement issus d'un Procès-Verbal d'assemblée.",
+    treasurerPageTitle: "Trésorier — Procès-Verbal",
+    treasurerImportLabel: "Importer un PV (JSON)",
+    treasurerImportPlaceholder: "Collez ici le JSON du Procès-Verbal…",
+    treasurerValidateBtn: "Valider le PV",
+    treasurerExecuteBtn: "Exécuter ce paiement",
+    treasurerConfirmMsg: "Confirmer le paiement de {amount} XMR à {recipient} ?",
+    treasurerSuccess: "Paiement exécuté — tx: {tx}",
+    treasurerFormatHint: "Format JSON standardisé : version, id, created_at, committee, resolution_number, description, payments[].",
   },
 
   en: {
@@ -479,6 +504,31 @@ const T = {
 
     walletRefillIn: "Top up in ~",
     walletMonthlyOut: "spend/month",
+
+    // Payment history page
+    historyTitle: "Payment history",
+    historyEncryptedLabel: "Encrypted · {days}-day retention",
+    historyDisabledLabel: "History disabled (privacy mode)",
+    historyEnabled: "Enabled",
+    historyDisabled: "Disabled",
+    historyRetentionLabel: "Retention period",
+    historyRetentionUnit: "days",
+    historyEmpty: "No payments recorded.",
+    historyClearBtn: "Clear history",
+    historyClearConfirm: "Clear all history? This cannot be undone.",
+
+    // Treasurer mode
+    treasurerNavItem: "Treasurer",
+    treasurerModeLabel: "Treasurer mode (PV)",
+    treasurerModeDesc: "Import and execute payment orders from a formal meeting resolution (Procès-Verbal).",
+    treasurerPageTitle: "Treasurer — Resolution payments",
+    treasurerImportLabel: "Import PV (JSON)",
+    treasurerImportPlaceholder: "Paste the Procès-Verbal JSON here…",
+    treasurerValidateBtn: "Validate PV",
+    treasurerExecuteBtn: "Execute this payment",
+    treasurerConfirmMsg: "Confirm payment of {amount} XMR to {recipient}?",
+    treasurerSuccess: "Payment executed — tx: {tx}",
+    treasurerFormatHint: "Standardised JSON format: version, id, created_at, committee, resolution_number, description, payments[].",
   },
 
   de: {
