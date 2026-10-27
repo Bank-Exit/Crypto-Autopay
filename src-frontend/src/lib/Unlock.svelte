@@ -85,7 +85,7 @@
   <div class="unlock-card card">
     <!-- Logo -->
     <div class="lock-logo">
-      <img src="/logo.png" alt="Crypto AutoPay" width="72" height="72" style="border-radius:12px;display:block;margin:0 auto 12px"/>
+      <img src="/logo.png" alt="Crypto AutoPay" width="140" height="140" style="border-radius:20px;display:block;margin:0 auto 16px"/>
       <div>
         <div class="lock-hint">{$t.unlockHint || "Entrez votre mot de passe pour déverrouiller"}</div>
       </div>

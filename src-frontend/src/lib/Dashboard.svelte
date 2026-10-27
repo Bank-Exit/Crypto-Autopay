@@ -118,6 +118,8 @@
 
   let activeAlerts = [];
   let showAlertsOverlay = false;
+  // Semi-auto mode: pending confirmation modal
+  let pendingPaymentModal = null; // { sub_id, sub_label, amount_xmr } | null
   let sessionPayments = []; // in-memory payment log for current session (superset of historyEntries)
   let historyEntries = [];  // loaded from encrypted DB vault
   let historyEnabled = true;
@@ -512,7 +514,9 @@
   let syncInfo = null; // { wallet_height, daemon_height, blocks_behind, synced }
   let syncPollTimer = null;
   let isOffline = false;          // true when network is unreachable
-  // Monero blockchain is ~3.3M blocks (2026). If daemon reports 0 height it can't reach peers.
+  let offlineConsecutive = 0;    // require N consecutive offline readings before showing banner
+  const OFFLINE_CONFIRM_COUNT = 3; // 3 × 5s = 15s before declaring offline
+  // Monero blockchain is ~3.8M blocks (2026). daemon_height=0 can also mean local RPC is restarting.
   const OFFLINE_BLOCKS_THRESHOLD = 500_000; // >500k behind = almost certainly offline
 
   // Receive / QR state
@@ -846,12 +850,24 @@
       const info = await tauriInvoke("get_sync_info");
       if (info) {
         syncInfo = info;
-        // Detect offline: daemon_height = 0 OR blocks_behind absurdly large
+        // Detect offline: daemon_height = 0 AND wallet is supposedly synced,
+        // OR blocks_behind > 500k (impossible unless daemon can't reach peers).
+        // Require OFFLINE_CONFIRM_COUNT consecutive readings to avoid false positives
+        // from the local RPC restarting (which briefly returns daemonH=0).
         const behind = info.blocks_behind ?? 0;
         const daemonH = info.daemon_height ?? 0;
-        isOffline = (daemonH === 0 && info.wallet_height > 0) || behind > OFFLINE_BLOCKS_THRESHOLD;
+        const looksOffline = (daemonH === 0 && (info.wallet_height ?? 0) > 100_000) || behind > OFFLINE_BLOCKS_THRESHOLD;
+        if (looksOffline) {
+          offlineConsecutive++;
+          if (offlineConsecutive >= OFFLINE_CONFIRM_COUNT) isOffline = true;
+        } else {
+          offlineConsecutive = 0;
+          isOffline = false; // clear offline when sync info looks normal again
+        }
       }
-    } catch(_) {}
+    } catch(_) {
+      // get_sync_info failed = RPC restarting, not necessarily offline
+    }
   }
 
   async function refreshBalance() {
@@ -886,12 +902,9 @@
       } else {
         rpcOk = false;
         rpcError = errStr;
-        // Detect offline from error message
-        if (errStr.includes("connect") || errStr.includes("ENETUNREACH") ||
-            errStr.includes("Network") || errStr.includes("No route") ||
-            errStr.includes("unreachable") || errStr.includes("timed out")) {
-          isOffline = true;
-        }
+        // NOTE: Do NOT detect offline from "Connexion refusée" — that is the LOCAL
+        // wallet-rpc (127.0.0.1:18083) restarting, not an internet connectivity issue.
+        // isOffline is set exclusively by pollSyncInfo() via daemon_height / blocks_behind.
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
@@ -921,6 +934,18 @@
     // Load history config and entries from encrypted vault
     await loadHistoryConfig();
     await loadHistoryEntries();
+
+    // Sync payment mode with Rust backend (source of truth for semi-auto enforcement)
+    try {
+      const isSemiAuto = await tauriInvoke("get_payment_mode");
+      paymentMode.set(isSemiAuto ? "semi-auto" : "auto");
+    } catch(e) { logWarn("Dashboard", `get_payment_mode failed: ${e}`); }
+
+    // Restore any pending approvals that survived across sessions (e.g. after unlock)
+    try {
+      const pending = await tauriInvoke("get_pending_approvals");
+      if (pending?.length > 0) pendingPaymentModal = pending[0];
+    } catch(e) { /* noop */ }
     updateRefreshAgo();
 
     // Immediately trigger a background sync without blocking the UI
@@ -952,6 +977,13 @@
         if (fresh) subscriptions = fresh.map(dbSubToUi);
       }
       await refreshAlerts();
+    });
+
+    // Semi-auto: show modal when payment needs user approval
+    const unlistenPending = await tauriListen("payment-pending", (ev) => {
+      const p = ev.payload || {};
+      logInfo("Scheduler", `[Semi-auto] Payment queued for approval: ${p.sub_label} — ${p.amount_xmr} XMR`);
+      pendingPaymentModal = p;
     });
 
     const unlistenPayment = await tauriListen("payment-sent", async (ev) => {
@@ -1165,6 +1197,41 @@
   ];
 </script>
 
+<!-- Semi-auto: payment confirmation modal -->
+{#if pendingPaymentModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-panel" on:click|stopPropagation role="document" style="max-width:400px;text-align:center">
+      <div style="font-size:36px;margin-bottom:12px">🔔</div>
+      <h2 style="margin:0 0 6px;font-size:18px">Paiement en attente</h2>
+      <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
+        Mode semi-auto — confirmez avant envoi
+      </p>
+      <div class="card" style="padding:14px 18px;margin-bottom:18px;text-align:left">
+        <div style="font-size:14px;font-weight:700;margin-bottom:4px">{pendingPaymentModal.sub_label}</div>
+        <div style="font-size:22px;font-weight:800;color:var(--accent)">{pendingPaymentModal.amount_xmr} XMR</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Monero — paiement automatique planifié</div>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center">
+        <button class="btn-ghost" style="flex:1;padding:10px"
+          on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; }}>
+          Passer / Reporter
+        </button>
+        <button class="btn-primary" style="flex:1;padding:10px;font-size:15px"
+          on:click={async () => {
+            await tauriInvoke("approve_payment", { subId: pendingPaymentModal.sub_id });
+            pendingPaymentModal = null;
+            // Trigger immediate scheduler cycle
+            setTimeout(() => refreshBalance(), 2000);
+          }}>
+          Confirmer l'envoi
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- Alerts detail overlay -->
 {#if showAlertsOverlay}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
@@ -1235,7 +1302,7 @@
   <aside class="sidebar">
     <div class="sidebar-header">
       <div class="sidebar-logo">
-        <img src="/logo.png" alt="Crypto AutoPay" width="34" height="34" style="border-radius:6px;flex-shrink:0"/>
+        <img src="/logo.png" alt="Crypto AutoPay" width="52" height="52" style="border-radius:8px;flex-shrink:0"/>
         <div>
           <div class="sidebar-appname">Monero AutoPay</div>
           <div class="tray-row">
@@ -1301,11 +1368,14 @@
         {$t.navSettings}
       </button>
       <!-- Lock button — centered below settings -->
-      <div style="display:flex;justify-content:center;padding:10px 0 4px">
-        <button class="lock-nav-btn" title="Verrouiller la session" on:click={() => tauriInvoke('lock_wallet').then(() => { appState = 'locked'; })}>
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      <div style="display:flex;justify-content:center;padding:12px 0 4px">
+        <button class="lock-nav-btn" title="Verrouiller la session"
+          on:click={() => tauriInvoke('lock_wallet').then(() => { appState = 'locked'; })}>
+          <!-- Padlock: body (rect) + shackle (path), filled for visibility in dark mode -->
+          <svg width="16" height="16" viewBox="0 0 20 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="1" y="10" width="18" height="12" rx="2.5" fill="var(--accent)" opacity="0.9"/>
+            <path d="M5 10V7a5 5 0 0 1 10 0v3" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+            <circle cx="10" cy="16" r="1.6" fill="#fff"/>
           </svg>
         </button>
       </div>
@@ -1315,7 +1385,9 @@
     <div class="sidebar-balance card">
       <div class="balance-label">
         <!-- RPC status dot -->
-        {#if rpcOk === null}
+        {#if isOffline}
+          <span class="rpc-dot dot-offline" title="Hors ligne">●</span>
+        {:else if rpcOk === null}
           <span class="rpc-dot dot-unknown" title="Vérification en cours…">●</span>
         {:else if rpcOk}
           <span class="rpc-dot dot-ok" title="Connecté au réseau Monero">●</span>
@@ -1787,7 +1859,11 @@
           <label class="toggle toggle-xl">
             <input type="checkbox"
               checked={$paymentMode === "auto"}
-              on:change={e => paymentMode.set(e.target.checked ? "auto" : "semi-auto")}
+              on:change={e => {
+                const mode = e.target.checked ? "auto" : "semi-auto";
+                paymentMode.set(mode);
+                tauriInvoke("set_payment_mode", { semiAuto: mode === "semi-auto" }).catch(() => {});
+              }}
             />
             <span class="slider"></span>
           </label>
@@ -2331,6 +2407,7 @@
   .dot-unknown { color: #9ca3af; }
   .dot-ok { color: #22c55e; }
   .dot-err { color: #f59e0b; animation: pulse-dot 2s ease-in-out infinite; }
+  .dot-offline { color: #64748b; animation: pulse-dot 3s ease-in-out infinite; }
   @keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
   /* RPC diagnosis panel */
@@ -2429,11 +2506,11 @@
     display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
   }
   .lock-nav-btn {
-    background: none; border: 1px solid var(--border); border-radius: 50%;
-    width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
-    cursor: pointer; color: var(--text-muted); transition: all 0.15s;
+    background: none; border: 2px solid var(--accent); border-radius: 50%;
+    width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all 0.15s; opacity: 0.7;
   }
-  .lock-nav-btn:hover { background: var(--bg-card-hover); color: var(--accent); border-color: var(--accent); }
+  .lock-nav-btn:hover { background: rgba(242,104,34,0.12); opacity: 1; transform: scale(1.08); }
   .refill-urgent { border: 1px solid #f97316 !important; background: #f9731610 !important; }
   .refill-urgent-text { color: #ef4444 !important; font-size: 15px !important; animation: blink-urgent 1.2s ease-in-out infinite; }
   @keyframes blink-urgent {

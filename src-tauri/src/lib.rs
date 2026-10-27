@@ -84,6 +84,21 @@ pub struct AppState {
     pub history_enabled: bool,
     /// Number of days to keep history entries (default: 365).
     pub history_days: u32,
+    /// Semi-auto mode: if true, scheduler queues payments and waits for user approval.
+    pub semi_auto_mode: bool,
+    /// Payments awaiting user approval (semi-auto mode).
+    pub pending_approvals: std::collections::HashMap<String, PendingApproval>,
+    /// Payments approved by the user this session (scheduler picks these up).
+    pub approved_payments: std::collections::HashSet<String>,
+}
+
+/// A payment pending user confirmation (semi-auto mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub sub_id: String,
+    pub sub_label: String,
+    pub amount_xmr: String,
+    pub queued_at: String, // ISO 8601
 }
 
 // ============================================================
@@ -888,6 +903,68 @@ fn save_history(key: &[u8; 32], path: &PathBuf, entries: &[HistoryEntry]) -> Res
     std::fs::write(path, b64).map_err(|e| e.to_string())
 }
 
+// ============================================================
+//  Payment mode (semi-auto / auto)
+// ============================================================
+
+/// Set the payment mode. "semi-auto" = queue pending, "auto" = send directly.
+#[tauri::command]
+async fn set_payment_mode(
+    semi_auto: bool,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    s.semi_auto_mode = semi_auto;
+    log::info!("[PaymentMode] Mode set to {}", if semi_auto { "semi-auto" } else { "auto" });
+    Ok(())
+}
+
+/// Get current payment mode.
+#[tauri::command]
+async fn get_payment_mode(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<bool, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    Ok(s.semi_auto_mode)
+}
+
+/// Approve a queued payment (semi-auto mode). Removes from pending list.
+/// The scheduler will pick it up on its next cycle as approved.
+#[tauri::command]
+async fn approve_payment(
+    sub_id: String,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    // Remove from pending — scheduler will treat it as approved on next run
+    // by checking `approved_payments` set
+    s.pending_approvals.remove(&sub_id);
+    s.approved_payments.insert(sub_id.clone());
+    log::info!("[PaymentMode] Payment approved by user for sub {}", &sub_id[..8.min(sub_id.len())]);
+    Ok(())
+}
+
+/// Reject a queued payment (semi-auto mode). Defers it to next occurrence.
+#[tauri::command]
+async fn reject_payment(
+    sub_id: String,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    s.pending_approvals.remove(&sub_id);
+    log::info!("[PaymentMode] Payment rejected by user for sub {}", &sub_id[..8.min(sub_id.len())]);
+    Ok(())
+}
+
+/// Get all payments currently pending user approval.
+#[tauri::command]
+async fn get_pending_approvals(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<Vec<PendingApproval>, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    Ok(s.pending_approvals.values().cloned().collect())
+}
+
 /// Configure payment history (enabled toggle + retention days).
 #[tauri::command]
 async fn set_history_config(
@@ -1360,10 +1437,42 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
     if due.is_empty() { return; }
     log::info!("[Scheduler] {} subscription(s) due", due.len());
 
+    // Read semi-auto state once before the loop
+    let (semi_auto, approved_ids) = {
+        if let Some(state) = app.try_state::<Mutex<AppState>>() {
+            if let Ok(mut s) = state.lock() {
+                let semi = s.semi_auto_mode;
+                let approved: std::collections::HashSet<String> = s.approved_payments.drain().collect();
+                (semi, approved)
+            } else { (false, Default::default()) }
+        } else { (false, Default::default()) }
+    };
+
     for sub in due {
         let dest = sub.destination_address.clone();
         let amount_pico = (sub.amount.parse::<f64>().unwrap_or(0.0) * 1e12) as u64;
         let sub_id = sub.id.clone();
+
+        // Semi-auto mode: queue for user approval unless already approved this session
+        if semi_auto && !approved_ids.contains(&sub_id) {
+            log::info!("[Scheduler] Semi-auto: queuing payment for sub {} — awaiting user approval", &sub_id[..8.min(sub_id.len())]);
+            if let Some(state) = app.try_state::<Mutex<AppState>>() {
+                if let Ok(mut s) = state.lock() {
+                    s.pending_approvals.insert(sub_id.clone(), PendingApproval {
+                        sub_id: sub_id.clone(),
+                        sub_label: sub.label.clone(),
+                        amount_xmr: sub.amount.clone(),
+                        queued_at: Utc::now().to_rfc3339(),
+                    });
+                }
+            }
+            app.emit("payment-pending", serde_json::json!({
+                "sub_id": sub_id,
+                "sub_label": sub.label,
+                "amount_xmr": sub.amount,
+            })).ok();
+            continue; // skip to next sub — scheduler will retry next cycle
+        }
 
         log::info!("[Scheduler] Sending payment for sub {}", sub_id);
 
@@ -1594,6 +1703,9 @@ pub fn run() {
                 history_path,
                 history_enabled: true,
                 history_days: 365,
+                semi_auto_mode: true, // safe default: require user confirmation
+                pending_approvals: std::collections::HashMap::new(),
+                approved_payments: std::collections::HashSet::new(),
             }));
 
             // Enable logging to both stdout and webview (always, not just debug)
@@ -1693,6 +1805,11 @@ pub fn run() {
             get_history_config,
             get_payment_history,
             clear_payment_history,
+            set_payment_mode,
+            get_payment_mode,
+            approve_payment,
+            reject_payment,
+            get_pending_approvals,
             save_subscription,
             get_subscription_debug,
             get_balance,
