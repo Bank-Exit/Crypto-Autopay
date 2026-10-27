@@ -1,199 +1,66 @@
-# Crypto AutoPay — TODO & Roadmap
+# TODO — Crypto AutoPay
 
-> **Titre logiciel** : Crypto AutoPay (fenêtre OS) / Monero AutoPay (défaut, modifiable)
-> **Dernière mise à jour** : 2026-10-24
-
----
-
-## Dépendances — notes de version
-
-- **`tauri-plugin-deep-link`** : pinné à `=2.3.0` car la v2.6.2 ne compile pas (bug #upstream : `ini::ParseOption` manque les champs `enabled_indented_mutiline_value` + `enabled_preserve_key_leading_whitespace`).
-  - Surveiller les releases sur https://github.com/tauri-apps/plugins-workspace
-  - Quand le bug sera corrigé : retirer le `=` dans `Cargo.toml` et faire `cargo update -p tauri-plugin-deep-link`
-  - → Signaler sur GitHub : https://github.com/tauri-apps/plugins-workspace/issues
+Items ordered by priority. Check `docs/` for detailed specs on implemented features.
 
 ---
 
-## Domaine / URL officielle
-- [x] URL provisoire : `autopay.libre-market.com`
-- [ ] Héberger le canal de mise à jour signé sur ce domaine
-- [ ] Page landing minimaliste avec lien de téléchargement + empreinte GPG
+## Critical / UX (grand public)
 
-## Site web / Générateur de code (`web/`)
-- [x] Dossier `web/` — Vite + Svelte, partage `SubscriptionCodeEditor` avec le wallet via alias `$lib`
-- [ ] Déployer sur `autopay.libre-market.com`
-- [ ] Génération QR code dans le générateur (`qr-creator` lib)
-- [ ] Aperçu animé du code généré (PaymentAnimation réutilisé)
-- [ ] Page `/spec/v1` qui sert `SPEC.md` en HTML
-- [ ] DNS TXT `_autopay.autopay.libre-market.com` → découverte marchande
+- [ ] **RPC error UX**: All 10 error cases from `docs/RPC_states.md` must have friendly, actionable messages for non-technical users. Currently some show raw error strings. See Case A–J in RPC_states.md.
+- [ ] **Tray zombie on crash**: If the app is force-killed (`kill -9`), the tray icon may remain. Add a PID lockfile or use the single-instance plugin's cleanup hook to remove the tray on startup if a stale one exists.
+- [ ] **Window restore**: Single-instance plugin now correctly calls `show() + unminimize() + set_focus()`. Verify on all 3 platforms (Linux, Windows, macOS) that clicking the tray icon always brings the window to front.
+- [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
+- [ ] **monero-wallet-rpc bundled**: Currently users must download and configure the binary separately. Bundle it inside the installer for one-click setup. Legal check: MIT license of monero-wallet-rpc allows bundling.
 
 ---
 
-## Phase 0 — Fondations & Standard ✅ (partiellement)
+## Security
 
-### Standard crypto-autopay:1: ✅
-- [x] Rédiger la spec complète du standard `crypto-autopay:1:` (SPEC.md)
-- [x] Champ `token` + `token_contract` pour tokens sur EVM/Solana/Tron
-- [x] Champ `repeat_every` pour récurrences pluriannuelles (2 ans, 3 ans…)
-- [x] `number_of_payments` : limitation d'occurrences avec compteur wallet-side
-- [x] Section post-quantique (ML-DSA-65 / Dilithium) dans la spec
-- [x] Section agents IA (terms_url, meta_url, ai_tags, rate limit) dans la spec
-- [x] Découverte DNS (`_autopay.merchant.com TXT`)
-- [x] URI scheme + MIME type documentés
-- [x] Implémenter le parser Rust (lit aussi `monero-request:1:` pour compatibilité)
-- [x] Valider le schéma JSON avec serde
-- [x] Implémenter la vérification de signature Ed25519 sur le payload
-- [x] Implémenter le checksum BLAKE3
-- [x] Champs avancés : pay_window, occurrence_note_url, cancel, max_conversion_fee_pct, proportional_amount
-- [ ] Tests unitaires du parser (round-trip encode/decode)
-- [ ] Publier la spec sur le site
-
-### Architecture Tauri 2 ✅
-- [x] Init projet Tauri 2 (Rust backend + Svelte frontend)
-- [x] Workspace Cargo multi-crates : autopay-core, autopay-crypto, autopay-rpc, src-tauri
-- [x] Frontend Svelte 4 + Vite 5 (sans SvelteKit)
-- [ ] CI/CD : build multiplateforme (Windows x64, macOS arm64+x64) via GitHub Actions
-- [ ] Signing des binaires
-
-### Frontend UX ✅
-- [x] Thème clair warm par défaut (grand public)
-- [x] Dark mode toggle (persistant localStorage)
-- [x] i18n : FR/EN/DE/ES auto-détecté + sélecteur globe
-- [x] Sélecteur de réseau (Monero / Bitcoin) dans le titre
-- [x] Écran de bienvenue avec animation de paiement (J-3/J-2/J-1, cycle Le Média Libre ↔ VPN)
-- [x] Onboarding 3 étapes avec vérification du mot de seed (style Monero GUI)
-- [x] Bouton Précédent sur chaque étape
-- [x] Mode Restauration (import seed existante, retour vers Welcome)
-- [x] Dashboard avec sidebar, page Abonnements, Wallets, Historique, Archivés
-- [x] Bannière "Prochain rechargement de portefeuille" avec calcul automatique
-- [x] Page Wallets avec nom/description/barre de remplissage/estimation rechargement
-- [x] Abonnements : badge wallet source, date NEXT (masquée si suspendu), canary status
-- [x] Page "Trouver des souscriptions" avec démos grisées IVPN/Mullvad
-- [x] Page "Comment ça marche" avec animation
-- [x] Paramètres : langue, thème, fuseau (UTC+XX:XX), réseau, notifications/alertes (5 toggles)
-- [x] Fenêtre 1050×550px, scrollable, responsive mobile
+- [ ] **No amount/address in logs**: Already implemented — verify no regression with new code paths (scheduler, sweep, send_payment).
+- [ ] **History encryption key rotation**: Currently the history key is derived from the master password (fixed salt). If the user changes their password, the history key changes and old entries become unreadable. Plan: re-encrypt on password change.
+- [ ] **Post-quantum consideration**: Current encryption is AES-256-GCM + Argon2id. AES-256 is considered quantum-resistant. For the future: evaluate CRYSTALS-Kyber (ML-KEM) for key encapsulation if a threat model requires it.
+- [ ] **Audit**: Before any public release with real funds, a security audit of `autopay-crypto` crate is strongly recommended.
 
 ---
 
-## Phase 1 — V1 Core (Monero uniquement) 🚧 EN COURS
+## Features (planned)
 
-### Seed Vault & Wallet Management 🚧
-- [ ] **[NEXT]** Commande Tauri `generate_seed()` → vraie seed 25 mots Monero (wordlist intégrée)
-- [ ] **[NEXT]** Commande Tauri `create_wallet(seed, password)` → SeedVault chiffré (Argon2id + AES-GCM)
-- [ ] **[NEXT]** Commande Tauri `unlock_wallet(password)` → déchiffre seed, ouvre wallet-rpc
-- [ ] Persistance wallet dans app data dir (pas dans le bundle)
-- [ ] Commande `check_wallet_exists()` → switch Welcome / Dashboard au démarrage
-- [ ] Support multi-wallets avec master password unique (style Keepass)
-- [ ] Warning automatique si solde wallet ≥ 1.5 XMR (orange) ou ≥ 2 XMR (rouge/bloquant)
-- [ ] Zeroization mémoire après usage (Zeroizing<String>)
-
-### Monero Wallet RPC Adapter 🚧
-- [ ] **[NEXT]** Spawn du processus monero-wallet-rpc local depuis Tauri
-- [ ] Client JSON-RPC Rust (méthodes : get_balance, get_address, transfer, open_wallet) ✅ codebase
-- [ ] Gestion des subaddresses (une par abonnement côté récepteur)
-- [ ] Téléchargement optionnel du binaire monero-wallet-rpc si absent
-- [ ] Mode remote node (connexion à un noeud Monero tiers ou local)
-
-### Scheduler & Subscription Engine 🚧
-- [ ] Moteur de scheduling (tokio-cron-scheduler) ✅ codebase
-- [ ] Persistance locale des abonnements (SQLite via rusqlite) ✅ codebase
-- [ ] Commande Tauri `add_subscription(code)` → parse monero-autopay:1:
-- [ ] Commande Tauri `get_subscriptions()` → liste pour le frontend
-- [ ] Commande Tauri `pause_subscription(id)` / `resume_subscription(id)`
-- [ ] Commande Tauri `tick()` → appelée toutes les X minutes
-- [ ] États : active, paused, past_due, cancelled, expired, suspended ✅ models
-- [ ] Report automatique si app offline au moment du paiement ✅ scheduler
-
-### Canary System 🚧
-- [ ] Fetch périodique du canary JSON (signé Ed25519) ✅ codebase
-- [ ] Commande Tauri `check_canary(subscription_id)`
-- [ ] Suspension automatique si canary invalide/expiré ✅ scheduler
-
-### UI ↔ Backend Bridge
-- [ ] Remplacer les mocks frontend par de vrais appels `invoke()` Tauri
-- [ ] Gestion des erreurs Tauri → affichage dans l'UI
-- [ ] Spinner / état de chargement pour les opérations longues
+- [ ] **Android build**: Port to Android using `monero-rs` crate (Rust-native, no subprocess). Replace `monero-wallet-rpc` with direct Monero cryptography. Estimated effort: 10–15 focused sessions. See `docs/ANDROID_BUILD.md`.
+- [ ] **Canary URL support**: Merchants can publish a signed canary file. If it expires or is unreachable, the subscription is suspended with a RED alert. Spec exists, integration partially done.
+- [ ] **Max payments per subscription**: Field exists in DB schema (`grace_period_hours` repurposed), proper `max_payments` field needed. UI: show "X / Y payments done" progress bar.
+- [ ] **Multi-wallet**: Currently only one wallet (principal). Architecture supports multiple wallets (wallets table in DB). UI: add/remove wallets, assign subs to wallets.
+- [ ] **FIAT display**: Show XMR amounts alongside approximate FIAT value (using a privacy-respecting price API with caching). Already drafted in `docs/fiat-comparison.md`.
+- [ ] **Export/import subscriptions**: Export subscription list as encrypted JSON. Import from another device. Useful for migration.
+- [ ] **Payment retry config**: Currently fixed at 25-min retry for locked outputs. Allow user to configure retry interval and max retry count.
 
 ---
 
-## Phase 2 — V2 Améliorations
+## Developer / Infrastructure
 
-### Occurrence Note
-- [ ] Fetch `occurrence_note_url` avant chaque paiement
-- [ ] Si `new_amount` differ → dialog de confirmation bloquante
-- [ ] Signature optionnelle de la note par le créateur
-
-### UX avancée
-- [ ] Import via QR code (scanner avec Tauri camera API ou parser URL)
-- [ ] Export/import de la config des abonnements (backup chiffré)
-- [ ] Historique des paiements persistant avec détails tx
-- [ ] Notifications système OS (via tauri-plugin-notification)
-- [ ] Mode systray discret (icône, tooltip solde, pause/resume rapide)
-- [ ] Page d'archivage avec historique complet
-- [ ] Gestion fuseau horaire pour affichage vs scheduling (UTC interne)
-
-### Standard
-- [ ] Soumettre une PR au repo monero-request de lukeprofits pour compatibilité
-- [ ] Publier la spec monero-autopay:1: sur un domaine stable (IPFS + Tor)
+- [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
+- [ ] **macOS code signing**: Set `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` secrets in GitHub repo settings. Without signing, macOS shows Gatekeeper warning.
+- [ ] **Windows code signing**: Set `TAURI_SIGNING_PRIVATE_KEY` in GitHub secrets. Without signing, Windows Defender flags the installer.
+- [ ] **Automated tests**: Add integration tests for the payment scheduler (mock monero-wallet-rpc HTTP server). Add unit tests for `recompute_alerts`.
+- [ ] **Clippy clean**: Run `cargo clippy -D warnings` in CI and fix any remaining lint warnings.
+- [ ] **DB migration system**: Currently schema is created fresh if DB doesn't exist. Need versioned migrations for schema updates (e.g. adding `max_payments` column).
 
 ---
 
-## Phase 3 — V3 Multi-réseau (Bitcoin + Lightning)
+## Known bugs / Regressions to verify
 
-### Architecture multi-réseau (décision de design)
-> **Principe** : chaque réseau est complètement cloisonné — wallets séparés, abonnements séparés.
-> Un abonnement Monero n'est pas disponible en Bitcoin (sauf si le marchand l'a publié dans les deux formats).
-> Un utilisateur peut avoir 0, 1 ou N wallets par réseau, avec des soldes totalement indépendants.
-
-**Vue souhaitée :**
-- Onglet par réseau (Monero | Bitcoin | Tout)
-- L'onglet "Tout" affiche TOUS les abonnements, groupés par réseau avec leur couleur
-- Au démarrage, l'app ouvre sur le réseau qui a le plus d'activité récente
-- Les wallets sont tagués par réseau — un wallet Monero ne peut pas payer un abonnement Bitcoin
-
-- [ ] Adapter PaymentAdapter trait pour Bitcoin on-chain (PSBT)
-- [ ] Adapter PaymentAdapter trait pour Lightning (BOLT 12 quand stable)
-- [ ] UI : onglets par réseau (Monero | Bitcoin | Tout) dans la sidebar ou le header
-- [ ] Wallets taggés par réseau (`network: "monero" | "bitcoin"`)
-- [ ] Abonnements filtrés par réseau actif, onglet "Tout" = vue combinée
-- [ ] Canary multi-réseau
-- [ ] Tests intégration multi-adapter
+- [ ] **DEV bypass mode**: After `Ctrl+Shift+D` (dev bypass), `refresh_balance` fails with "Locked" because `session_password` is not set in Rust. This is expected in dev mode but confusing. Consider adding a dev-only mock balance.
+- [ ] **Offline banner false positive**: Fixed in `5479a26` (now requires 3 consecutive `daemon_height=0` readings). Verify no regression after scheduler kills wallet-rpc.
+- [ ] **Balance 0.0000 after lock/re-unlock**: Fixed in `04e1ebf`. Verify displayed as `-.----` until first successful refresh.
+- [ ] **Tray icon color**: `tray-ok.png` / `tray-warn.png` / `tray-alert.png` use the old placeholder SVG colors. Replace with logo-derived icons once final logo is confirmed.
 
 ---
 
-## Décisions en attente
-- [ ] Nom de domaine définitif
-- [ ] Licence des icônes/artwork
-- [ ] Stratégie de distribution (GitHub Releases + site auto-hébergé vs. stores)
-- [ ] Monero wordlist à inclure : EN officielle (1626 mots) ? + FR/DE/ES ?
+## Documentation
 
----
-
-## Implémenté récemment (2026-10-24)
-
-- **3 flux d'entrée distincts** : "Nouvel abonnement" (formulaire manuel → mode=new), "Importer un code" (modal mode=import), "Créer un code de partage" (pleine page, pas de modal, mode=create)
-- **Détection de doublons** : `duplicateKey(sub)` = address + raw cron. Popup SVG camembert 5s, bouton Non par défaut. Faux positifs filtrés (adresse vide = pas de comparaison).
-- **AppLogger.js** : log in-memory, AUCUN montant ni adresse. Section Logs dans Paramètres (filtre info/warn/error). Logs d'envoi opt-in (localStorage, id interne uniquement, pas de montant/destinataire).
-- **tauri-plugin-shell** : initialisé + capability `shell:allow-open` pour liens externes (lien "Comment se procurer du Monero ?").
-- **Fix deep link même URL** : `pendingDeepLinkCode = null → await tick() → set` pour forcer la réactivité Svelte sur la même chaîne.
-- **Fix parseImport** : ne dispatche plus `imported` automatiquement, seulement via bouton "Ajouter cet abonnement".
-- **Prévisualisation bouton HTML** : rendu live cliquable dans la page Créer un code (non-modal).
-- **Champ fiat opt-in** : conversion XMR→€ via LibreMonero.com API, désactivé par défaut, popup avertissement privacy.
-- **Icône Coller** (📋) dans l'import + auto-décodage.
-- **Incrément montant** : step=0.01 XMR.
-- **En-tête "Mes abonnements en {réseau}"** : sous-titre avec compteur + "Doublons : X" en orange.
-- **Padding 70px** sous la liste des abonnements.
-- **Lien refill** "Comment se procurer du Monero ?" → `https://libre-market.com/m/epicerie/tutorial`.
-
-## Notes à faire (suites)
-- [ ] Implémenter vraie API LibreMonero.com pour conversion fiat (endpoint à confirmer)
-- [ ] Logs d'envoi : brancher sur le vrai moteur de paiement quand implémenté
-- [ ] HTML preview dans Créer un code : tester deep link depuis l'aperçu (nécessite app installée)
-- [ ] `tauri-plugin-deep-link` toujours pinné à `=2.3.0` (voir note Dépendances ci-dessous)
-
-## Notes techniques
-- Seed mock actuelle (25 mots) = placeholder, sera remplacé par vraie génération Rust
-- `color-scheme: light dark` sur les `<select>` pour dark mode natif
-- `data-network="bitcoin"` sur `<html>` pour override couleur accent (#f7931a)
-- PaymentAnimation.svelte : cycle 7s CSS pur, labels reactifs JS
-- i18n via store Svelte `derived(currentLang, ...)`, localStorage persist
+- [x] `docs/ALERTS.md` — all alert kinds, semi-auto mode, offline logic
+- [x] `docs/RPC_states.md` — full state diagram, all error cases
+- [x] `docs/WINDOWS_BUILD.md` — build options for Windows
+- [x] `docs/ANDROID_BUILD.md` — Android architecture options
+- [ ] `docs/ONBOARDING.md` — user guide for first setup (wallet creation, monero-wallet-rpc install, first subscription)
+- [ ] `docs/SECURITY_MODEL.md` — threat model, key derivation, what is encrypted, what is in plaintext
+- [ ] `CHANGELOG.md` — release notes per version

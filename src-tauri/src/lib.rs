@@ -1682,8 +1682,10 @@ pub fn run() {
                         app.emit("autopay://open-subscription", arg.clone()).ok();
                     }
                 }
-                // Bring the existing window to focus
+                // Bring the existing window to front (show if hidden, then focus)
                 if let Some(win) = app.get_webview_window("main") {
+                    win.show().ok();
+                    win.unminimize().ok();
                     win.set_focus().ok();
                 }
             })
@@ -1803,19 +1805,47 @@ pub fn run() {
             // System tray: minimize-to-tray with alert icon
             let tray_icon_bytes = include_bytes!("../icons/tray-ok.png");
             if let Ok(img) = tauri::image::Image::from_bytes(tray_icon_bytes) {
+                // Build tray menu: Open + Quit
+                use tauri::menu::{MenuBuilder, MenuItemBuilder};
+                let menu_open = MenuItemBuilder::with_id("open", "Ouvrir Crypto AutoPay").build(app)?;
+                let menu_quit = MenuItemBuilder::with_id("quit", "Quitter").build(app)?;
+                let tray_menu = MenuBuilder::new(app)
+                    .item(&menu_open)
+                    .separator()
+                    .item(&menu_quit)
+                    .build()?;
+
                 let _tray = tauri::tray::TrayIconBuilder::with_id("main")
                     .icon(img)
                     .tooltip("Crypto AutoPay")
+                    .menu(&tray_menu)
+                    .on_menu_event(|app, event| {
+                        match event.id().as_ref() {
+                            "open" => {
+                                if let Some(win) = app.get_webview_window("main") {
+                                    win.show().ok();
+                                    win.unminimize().ok();
+                                    win.set_focus().ok();
+                                }
+                            }
+                            "quit" => {
+                                log::info!("[Tray] User requested quit via tray menu");
+                                app.exit(0);
+                            }
+                            _ => {}
+                        }
+                    })
                     .on_tray_icon_event(|tray, event| {
                         if let tauri::tray::TrayIconEvent::Click { .. } = event {
                             if let Some(win) = tray.app_handle().get_webview_window("main") {
-                                let _ = win.show();
-                                let _ = win.set_focus();
+                                win.show().ok();
+                                win.unminimize().ok();
+                                win.set_focus().ok();
                             }
                         }
                     })
                     .build(app)?;
-                log::info!("[Tray] System tray initialized");
+                log::info!("[Tray] System tray initialized with menu");
             } else {
                 log::warn!("[Tray] Could not load tray icon — tray not available");
             }
