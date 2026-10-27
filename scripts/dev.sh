@@ -11,6 +11,9 @@ pkill -f 'target/release/monero-autopay' 2>/dev/null && sleep 0.5 || true
 echo "▶ Freeing port 5173 if busy…"
 lsof -ti:5173 | xargs kill -9 2>/dev/null && echo "  Killed stale vite on :5173" || true
 
+echo "▶ Clearing Vite cache (prevents stale CSS after multiple rebuilds)…"
+rm -rf "$ROOT/src-frontend/node_modules/.vite" 2>/dev/null && echo "  Vite cache cleared" || true
+
 # Wait briefly for processes to die
 sleep 0.5
 
