@@ -1432,12 +1432,12 @@
       <!-- Lock button — centered below settings -->
       <div style="display:flex;justify-content:center;padding:12px 0 4px">
         <button class="lock-nav-btn" title="Verrouiller la session"
-          on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock'))}>
-          <!-- Padlock: body (rect) + shackle (path), filled for visibility in dark mode -->
-          <svg width="16" height="16" viewBox="0 0 20 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect x="1" y="10" width="18" height="12" rx="2.5" fill="var(--accent)" opacity="0.9"/>
-            <path d="M5 10V7a5 5 0 0 1 10 0v3" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
-            <circle cx="10" cy="16" r="1.6" fill="#fff"/>
+          on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock')).catch(() => dispatch('lock'))}>
+          <!-- Same padlock as unlock screen — standard 24×24 viewBox, stroke-based, always visible -->
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+               stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
           </svg>
         </button>
       </div>
@@ -2572,11 +2572,11 @@
     display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
   }
   .lock-nav-btn {
-    background: none; border: 2px solid var(--accent); border-radius: 50%;
-    width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
-    cursor: pointer; transition: all 0.15s; opacity: 0.7;
+    background: none; border: 2px solid var(--accent); border-radius: 8px;
+    width: 42px; height: 36px; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all 0.15s; opacity: 0.75;
   }
-  .lock-nav-btn:hover { background: rgba(242,104,34,0.12); opacity: 1; transform: scale(1.08); }
+  .lock-nav-btn:hover { background: rgba(242,104,34,0.15); opacity: 1; transform: scale(1.05); }
   .refill-urgent { border: 1px solid #f97316 !important; background: #f9731610 !important; }
   .refill-urgent-text { color: #ef4444 !important; font-size: 15px !important; animation: blink-urgent 1.2s ease-in-out infinite; }
   @keyframes blink-urgent {
