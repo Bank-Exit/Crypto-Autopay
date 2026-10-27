@@ -1,0 +1,124 @@
+name: Release
+
+# Triggered manually or on version tag push
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.2.0)'
+        required: false
+        default: 'v0.2.0-dev'
+
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Desktop: Linux (AppImage + deb), Windows (nsis + msi), macOS (dmg + app)
+  # ─────────────────────────────────────────────
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            args: '--target x86_64-unknown-linux-gnu'
+
+          # Windows x64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            args: '--target x86_64-pc-windows-msvc'
+
+          # macOS Apple Silicon
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            args: '--target aarch64-apple-darwin'
+
+          # macOS Intel
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            label: macos-x64
+            args: '--target x86_64-apple-darwin'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Node + pnpm ──────────────────────────
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps
+        working-directory: src-frontend
+        run: npm ci
+
+      # ── Rust toolchain ────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # ── Linux system deps ─────────────────────
+      - name: Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      # ── Build Tauri app ───────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code signing (optional — set in repo secrets)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows code signing (optional)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Crypto AutoPay ${{ github.ref_name }}'
+          releaseBody: |
+            ## Crypto AutoPay ${{ github.ref_name }}
+
+            ### Téléchargements / Downloads
+            | Plateforme | Fichier |
+            |---|---|
+            | 🐧 Linux | `.AppImage` (portable) ou `.deb` |
+            | 🪟 Windows | `.msi` (recommandé) ou `.exe` (NSIS) |
+            | 🍎 macOS Apple Silicon | `.dmg` (M1/M2/M3) |
+            | 🍎 macOS Intel | `.dmg` (x86_64) |
+
+            ### Changelog
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md)
+          releaseDraft: true
+          prerelease: false
+          projectPath: '.'
+          args: ${{ matrix.args }}
