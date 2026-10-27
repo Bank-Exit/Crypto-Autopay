@@ -2252,8 +2252,7 @@
           <span>{$t.treasurerImportLabel || 'Importer un PV (JSON)'}</span>
           <textarea bind:value={pvJson} rows="8"
             placeholder={$t.treasurerImportPlaceholder || 'Collez ici le JSON du Procès-Verbal…'}
-            style="font-family:monospace;font-size:12px;width:100%;resize:vertical;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-card);color:var(--text)">
-          </textarea>
+            style="font-family:monospace;font-size:12px;width:100%;resize:vertical;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-card);color:var(--text)"></textarea>
         </label>
         {#if pvError}
           <p style="color:#ef4444;font-size:13px;margin:8px 0 0">⚠ {pvError}</p>
