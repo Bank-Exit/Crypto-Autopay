@@ -1,5 +1,6 @@
 <script>
-  import { tick, onMount } from "svelte";
+  import { tick, onMount, createEventDispatcher } from "svelte";
+  const dispatch = createEventDispatcher();
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
@@ -109,6 +110,11 @@
           : (tObj.alertPaymentFailed || 'Échec d\'un paiement');
       }
       case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced || 'Wallet non synchronisé avec la blockchain';
+      case 'OFFLINE_WITH_PENDING': {
+        const hoursMatch = alert.message.match(/(\d+)h/);
+        const h = hoursMatch ? hoursMatch[1] : '?';
+        return (tObj.alertOfflineWithPending || 'Hors ligne depuis {h}h — paiements prevus dans 7 j').replace('{h}', h);
+      }
       default: {
         // Strip any "Sub #<uuid>" prefix from raw Rust messages
         return alert.message.replace(/Sub #[0-9a-f-]{36}\s*[—–-]?\s*/i, '').trim();
@@ -119,7 +125,36 @@
   let activeAlerts = [];
   let showAlertsOverlay = false;
   // Semi-auto mode: pending confirmation modal
-  let pendingPaymentModal = null; // { sub_id, sub_label, amount_xmr } | null
+  let pendingPaymentModal = null; // { sub_id, sub_label, amount_xmr, schedule, payments_sent, last_payment_at }
+
+  function formatRelativeDate(isoStr) {
+    if (!isoStr) return null;
+    const d = new Date(isoStr);
+    if (isNaN(d)) return null;
+    const diffMs = Date.now() - d.getTime();
+    const diffMin = Math.round(diffMs / 60000);
+    const diffH = Math.round(diffMs / 3600000);
+    const diffD = Math.round(diffMs / 86400000);
+    if (diffMin < 2) return "a l'instant";
+    if (diffMin < 60) return `il y a ${diffMin} min`;
+    if (diffH < 24) return `il y a ${diffH}h`;
+    if (diffD < 31) return `il y a ${diffD} j`;
+    return `il y a ${Math.round(diffD / 30)} mois`;
+  }
+
+  function scheduleLabel(sched) {
+    if (!sched) return sched;
+    const m = sched.match(/(\d+)\s*min/i);
+    if (m) return `Toutes les ${m[1]} min`;
+    const h = sched.match(/(\d+)\s*h(?!eure)/i);
+    if (h) return `Toutes les ${h[1]}h`;
+    const d = sched.match(/(\d+)\s*(day|jour)/i);
+    if (d) return `Tous les ${d[1]} j`;
+    const w = sched.match(/(\d+)\s*(week|semaine)/i);
+    if (w) return `Toutes les ${w[1]} semaines`;
+    if (/month|mois/i.test(sched)) return 'Mensuel';
+    return sched;
+  }
   let sessionPayments = []; // in-memory payment log for current session (superset of historyEntries)
   let historyEntries = [];  // loaded from encrypted DB vault
   let historyEnabled = true;
@@ -825,7 +860,10 @@
     try {
       const info = await tauriInvoke("get_wallet_info");
       if (info) {
-        balanceXmr = info.balance_xmr ?? 0;
+        // Only use cached balance if RPC is connected; otherwise show -.---- (unknown)
+        balanceXmr = (info.rpc_connected && (info.balance_xmr ?? 0) > 0)
+          ? info.balance_xmr
+          : (info.rpc_connected ? 0 : null);
         rpcOk = info.rpc_connected;
         rpcError = info.rpc_last_error ?? null;
         walletAddress = info.address ?? null;
@@ -980,11 +1018,20 @@
     });
 
     // Semi-auto: show modal when payment needs user approval
+    // Queue the payload and show only when sync is done (balance known)
+    let _pendingQueue = [];
     const unlistenPending = await tauriListen("payment-pending", (ev) => {
       const p = ev.payload || {};
       logInfo("Scheduler", `[Semi-auto] Payment queued for approval: ${p.sub_label} — ${p.amount_xmr} XMR`);
-      pendingPaymentModal = p;
+      _pendingQueue.push(p);
     });
+
+    // Check every 3s if we should display a queued pending payment
+    const pendingFlushTimer = setInterval(() => {
+      if (_pendingQueue.length > 0 && !balanceLoading && balanceXmr !== null && !isOffline) {
+        pendingPaymentModal = _pendingQueue.shift();
+      }
+    }, 3000);
 
     const unlistenPayment = await tauriListen("payment-sent", async (ev) => {
       logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
@@ -1209,9 +1256,24 @@
         Mode semi-auto — confirmez avant envoi
       </p>
       <div class="card" style="padding:14px 18px;margin-bottom:18px;text-align:left">
-        <div style="font-size:14px;font-weight:700;margin-bottom:4px">{pendingPaymentModal.sub_label}</div>
-        <div style="font-size:22px;font-weight:800;color:var(--accent)">{pendingPaymentModal.amount_xmr} XMR</div>
-        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Monero — paiement automatique planifié</div>
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">{pendingPaymentModal.sub_label}</div>
+        <div style="font-size:24px;font-weight:800;color:var(--accent);margin-bottom:8px">{pendingPaymentModal.amount_xmr} XMR</div>
+        <div style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text-muted)">
+          {#if pendingPaymentModal.schedule}
+            <div>Cadence : <strong style="color:var(--text)">{scheduleLabel(pendingPaymentModal.schedule)}</strong></div>
+          {/if}
+          {#if pendingPaymentModal.payments_sent > 0}
+            <div>Envois precedents : <strong style="color:var(--text)">{pendingPaymentModal.payments_sent}</strong></div>
+          {:else}
+            <div style="color:#f97316">Premier envoi</div>
+          {/if}
+          {#if pendingPaymentModal.last_payment_at && pendingPaymentModal.payments_sent > 0}
+            {@const rel = formatRelativeDate(pendingPaymentModal.last_payment_at)}
+            {#if rel}
+              <div>Dernier envoi : <strong style="color:var(--text)">{rel}</strong></div>
+            {/if}
+          {/if}
+        </div>
       </div>
       <div style="display:flex;gap:10px;justify-content:center">
         <button class="btn-ghost" style="flex:1;padding:10px"
@@ -1370,7 +1432,7 @@
       <!-- Lock button — centered below settings -->
       <div style="display:flex;justify-content:center;padding:12px 0 4px">
         <button class="lock-nav-btn" title="Verrouiller la session"
-          on:click={() => tauriInvoke('lock_wallet').then(() => { appState = 'locked'; })}>
+          on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock'))}>
           <!-- Padlock: body (rect) + shackle (path), filled for visibility in dark mode -->
           <svg width="16" height="16" viewBox="0 0 20 22" fill="none" xmlns="http://www.w3.org/2000/svg">
             <rect x="1" y="10" width="18" height="12" rx="2.5" fill="var(--accent)" opacity="0.9"/>
@@ -1444,8 +1506,12 @@
         {/if}
 
       {:else if rpcOk === false}
-        <!-- RPC failed: show balance anyway + diagnosis -->
-        <div class="balance-amount" style="color:var(--text-muted)">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
+        <!-- RPC failed: show balance if known, otherwise -.---- -->
+        {#if balanceXmr !== null && balanceXmr > 0}
+          <div class="balance-amount" style="color:var(--text-muted)">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
+        {:else}
+          <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
+        {/if}
         {#if rpcError}
           {@const diag = rpcDiagnosis(rpcError)}
           {#if diag}

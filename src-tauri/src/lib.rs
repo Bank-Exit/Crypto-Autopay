@@ -66,6 +66,8 @@ pub struct AppState {
     pub last_wallet_height: u64,
     /// Last known daemon height (from get_daemon_block_height).
     pub last_daemon_height: u64,
+    /// Unix timestamp of the last successful daemon contact (for offline alert).
+    pub last_daemon_contact_at: Option<i64>,
     /// Active alerts — recomputed after each scheduler run / refresh.
     pub alerts: Vec<AppAlert>,
     /// RPC busy flag — only one command can use the wallet RPC at a time (port 18083).
@@ -684,6 +686,9 @@ async fn refresh_balance(
         s.balance_atomic = atomic;
         s.last_wallet_height = wallet_height;
         s.last_daemon_height = daemon_height;
+        if daemon_height > 0 {
+            s.last_daemon_contact_at = Some(chrono::Utc::now().timestamp());
+        }
     }
 
     // Recompute alerts immediately after balance update — don't wait for scheduler cycle
@@ -799,6 +804,29 @@ fn recompute_alerts(
                     kind: "PAYMENT_OVERDUE_SOFT".into(),
                     sub_id: Some(sub.id.clone()),
                     message: format!("Sub #{} overdue by >1h", sub.id),
+                    created_at: now_ts,
+                });
+            }
+        }
+    }
+
+    // RED: offline >24h AND payments due in next 7 days
+    if let Some(last_contact) = state.last_daemon_contact_at {
+        let offline_secs = now_ts - last_contact;
+        if offline_secs > 86_400 {
+            let upcoming_in_7d = subs.iter().any(|s| {
+                s.status == SubscriptionStatus::Active &&
+                s.next_payment_at.map(|next| (next.timestamp() - now_ts) < 7 * 86_400).unwrap_or(false)
+            });
+            if upcoming_in_7d {
+                alerts.push(AppAlert {
+                    level: AlertLevel::Red,
+                    kind: "OFFLINE_WITH_PENDING".into(),
+                    sub_id: None,
+                    message: format!(
+                        "Hors ligne depuis {}h — paiements prevus dans les 7 prochains jours",
+                        offline_secs / 3600
+                    ),
                     created_at: now_ts,
                 });
             }
@@ -1466,10 +1494,20 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     });
                 }
             }
+            // Compute last_payment human-readable
+            let last_payment_iso = sub.next_payment_at
+                .map(|next| {
+                    let period = cron_period_minutes(&sub.schedule);
+                    (next - chrono::Duration::minutes(period)).to_rfc3339()
+                })
+                .unwrap_or_default();
             app.emit("payment-pending", serde_json::json!({
                 "sub_id": sub_id,
                 "sub_label": sub.label,
                 "amount_xmr": sub.amount,
+                "schedule": sub.schedule,
+                "payments_sent": sub.payments_sent,
+                "last_payment_at": last_payment_iso,
             })).ok();
             continue; // skip to next sub — scheduler will retry next cycle
         }
@@ -1686,6 +1724,7 @@ pub fn run() {
                 last_payment_sent_at: None,
                 last_wallet_height: 0,
                 last_daemon_height: 0,
+                last_daemon_contact_at: None,
                 alerts: Vec::new(),
                 rpc_busy: Arc::new(AtomicBool::new(false)),
                 rpc: RpcManager::new(rpc_config),
@@ -1694,7 +1733,7 @@ pub fn run() {
                     let mut s = std::collections::HashSet::new();
                     for k in &["BALANCE_LOW","BALANCE_EMPTY","PAYMENT_FAILED","CANARY_EXPIRED",
                                "CANARY_UNREACHABLE","PAYMENT_OVERDUE_SOFT","PAYMENT_OVERDUE_HARD",
-                               "WALLET_NOT_SYNCED","OUTPUTS_LOCKED"] {
+                               "WALLET_NOT_SYNCED","OUTPUTS_LOCKED","OFFLINE_WITH_PENDING"] {
                         s.insert(k.to_string());
                     }
                     s

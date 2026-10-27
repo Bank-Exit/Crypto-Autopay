@@ -220,7 +220,6 @@
     display: flex; align-items: center; gap: 12px;
     margin-bottom: 4px;
   }
-  .app-name { font-size: 16px; font-weight: 700; }
   .lock-hint { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
   .lock-icon-row {

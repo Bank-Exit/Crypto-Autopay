@@ -227,6 +227,7 @@ const T = {
     alertOverdueSoft: "Paiement en retard : {label} (dans la tolérance)",
     alertOverdueHard: "Retard critique : {label} — tolérance dépassée",
     alertNotSynced: "Wallet non synchronisé avec la blockchain",
+    alertOfflineWithPending: "Hors ligne depuis {h}h — des paiements sont prévus dans les 7 prochains jours",
     alertThreshold: "seuil",
     // Alerts overlay
     alertOverlayTitle: "Alertes actives",
@@ -452,6 +453,7 @@ const T = {
     alertOverdueSoft: "Overdue: {label}",
     alertOverdueHard: "Critical overdue: {label}",
     alertNotSynced: "Wallet not synced with the blockchain",
+    alertOfflineWithPending: "Offline for {h}h — payments are due in the next 7 days",
     alertThreshold: "threshold",
     alertOverlayTitle: "Active alerts",
     alertOverlayCritical: "Critical alerts",

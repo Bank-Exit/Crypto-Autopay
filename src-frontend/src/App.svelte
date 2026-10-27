@@ -178,7 +178,7 @@
     />
 
   {:else}
-    <Dashboard externalCode={pendingDeepLinkCode} />
+    <Dashboard externalCode={pendingDeepLinkCode} on:lock={() => { appState = "unlock"; }} />
   {/if}
 
   <!-- Floating Logs button (always visible, bottom-right) -->
