@@ -18,6 +18,16 @@ fi
 echo "▶ Installing frontend dependencies…"
 (cd src-frontend && npm ci)
 
+# On Linux: ensure libayatana-appindicator3-dev is installed (required for tray icon)
+if [[ "$(uname)" == "Linux" ]]; then
+  if ! dpkg -s libayatana-appindicator3-dev &>/dev/null && ! dpkg -s libappindicator3-dev &>/dev/null; then
+    echo "▶ Installing appindicator library (required for tray icon)…"
+    sudo apt-get install -y libayatana-appindicator3-dev 2>/dev/null \
+      || sudo apt-get install -y libappindicator3-dev 2>/dev/null \
+      || echo "Warning: could not install appindicator library — tray icon may not work"
+  fi
+fi
+
 echo "▶ Building Tauri release${TARGET:+ for $TARGET}…"
 cargo tauri build $ARGS
 

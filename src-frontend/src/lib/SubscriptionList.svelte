@@ -291,12 +291,12 @@
                   </button>
                   <div class="kebab-divider"></div>
                   <button class="kebab-item kebab-warn" on:click={e => archiveSub(sub, e)}>
-                    📦 Archiver
+                    Archiver
                   </button>
                 {/if}
                 {#if ARCHIVED_STATUSES.includes(sub.status)}
                   <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
-                    ↩ Restaurer
+                    Restaurer
                   </button>
                 {/if}
                 <div class="kebab-divider"></div>
@@ -336,7 +336,7 @@
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="kebab-menu" on:click|stopPropagation>
                   <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
-                    ↩ Restaurer
+                    Restaurer
                   </button>
                   <div class="kebab-divider"></div>
                   <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>

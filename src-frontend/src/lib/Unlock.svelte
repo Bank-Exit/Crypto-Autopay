@@ -85,16 +85,8 @@
   <div class="unlock-card card">
     <!-- Logo -->
     <div class="lock-logo">
-      <svg width="36" height="36" viewBox="0 0 72 72" fill="none">
-        <path d="M36 8 A28 28 0 1 1 8 36" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" fill="none"/>
-        <polyline points="6,24 8,36 20,34" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-        <circle cx="24" cy="36" r="5" fill="var(--accent)" opacity="0.9"/>
-        <circle cx="48" cy="36" r="5" fill="var(--accent)" opacity="0.5"/>
-        <line x1="31" y1="36" x2="41" y2="36" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
-        <polyline points="38,32 42,36 38,40" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </svg>
+      <img src="/logo.png" alt="Crypto AutoPay" width="72" height="72" style="border-radius:12px;display:block;margin:0 auto 12px"/>
       <div>
-        <div class="app-name">Crypto AutoPay</div>
         <div class="lock-hint">{$t.unlockHint || "Entrez votre mot de passe pour déverrouiller"}</div>
       </div>
     </div>

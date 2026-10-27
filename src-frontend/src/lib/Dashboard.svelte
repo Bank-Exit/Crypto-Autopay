@@ -53,6 +53,17 @@
     payAnimTimer = setTimeout(() => { showPayAnim = false; }, 4000);
   }
 
+  /** Resolve alert → subscription label (from live subscriptions list, or raw msg as fallback) */
+  function subLabelForAlert(alert) {
+    if (alert.sub_id) {
+      const found = subscriptions.find(s => s.id === alert.sub_id || s._db_id === alert.sub_id);
+      if (found) return found.label;
+    }
+    // Try to extract a non-UUID token from the raw message
+    const clean = alert.message.replace(/Sub #[0-9a-f-]{36}/gi, '').trim();
+    return clean.replace(/[—–-].*$/, '').trim() || null;
+  }
+
   /** Translate Rust alert kind → human message in current language */
   function translateAlertMsg(alert, tObj) {
     // Extract numeric params from Rust message (e.g. "~3 jour(s)" → 3)
@@ -65,14 +76,43 @@
         if (num !== null && num < 1) return tObj.alertBalanceLowSoon || `${tObj.refillLessThanOneDay || 'moins de 1 jour'} (${tObj.alertThreshold || 'seuil'}: ${thresh}j)`;
         return (tObj.alertBalanceLow || 'Portefeuille vide dans ~{n} jour(s) (seuil: {t}j)').replace('{n}', num ?? '?').replace('{t}', thresh);
       case 'BALANCE_EMPTY': return tObj.alertBalanceEmpty || 'Solde nul — les paiements récurrents ne peuvent pas être envoyés';
-      case 'PAYMENT_FAILED': return tObj.alertPaymentFailed || 'Échec d\'un paiement';
-      case 'OUTPUTS_LOCKED': return tObj.alertOutputsLocked || 'Fonds verrouillés (confirmations en cours), nouvel essai dans 25 min';
-      case 'CANARY_EXPIRED': return tObj.alertCanaryExpired || 'Canary expiré pour un abonnement';
-      case 'CANARY_UNREACHABLE': return tObj.alertCanaryUnreachable || 'Canary inaccessible';
-      case 'PAYMENT_OVERDUE_SOFT': return tObj.alertOverdueSoft || 'Paiement en retard (dans la tolérance)';
-      case 'PAYMENT_OVERDUE_HARD': return tObj.alertOverdueHard || 'Paiement en retard critique — dépassement de la tolérance';
+      case 'CANARY_EXPIRED': {
+        const label = subLabelForAlert(alert);
+        return (tObj.alertCanaryExpired || 'Canary expiré').replace('{label}', label);
+      }
+      case 'CANARY_UNREACHABLE': {
+        const label = subLabelForAlert(alert);
+        return (tObj.alertCanaryUnreachable || 'Canary inaccessible').replace('{label}', label);
+      }
+      case 'PAYMENT_OVERDUE_SOFT': {
+        const label = subLabelForAlert(alert);
+        return label
+          ? (tObj.alertOverdueSoft || 'Paiement en retard').replace('{label}', label)
+          : (tObj.alertOverdueSoft || 'Paiement en retard');
+      }
+      case 'PAYMENT_OVERDUE_HARD': {
+        const label = subLabelForAlert(alert);
+        return label
+          ? (tObj.alertOverdueHard || 'Paiement en retard critique').replace('{label}', label)
+          : (tObj.alertOverdueHard || 'Paiement en retard critique');
+      }
+      case 'OUTPUTS_LOCKED': {
+        const label = subLabelForAlert(alert);
+        return label
+          ? `${tObj.alertOutputsLocked || 'Fonds verrouillés'} — ${label}`
+          : (tObj.alertOutputsLocked || 'Fonds verrouillés (confirmations en cours), nouvel essai dans 25 min');
+      }
+      case 'PAYMENT_FAILED': {
+        const label = subLabelForAlert(alert);
+        return label
+          ? `${tObj.alertPaymentFailed || 'Échec paiement'} — ${label}`
+          : (tObj.alertPaymentFailed || 'Échec d\'un paiement');
+      }
       case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced || 'Wallet non synchronisé avec la blockchain';
-      default: return alert.message;
+      default: {
+        // Strip any "Sub #<uuid>" prefix from raw Rust messages
+        return alert.message.replace(/Sub #[0-9a-f-]{36}\s*[—–-]?\s*/i, '').trim();
+      }
     }
   }
 
@@ -1195,18 +1235,7 @@
   <aside class="sidebar">
     <div class="sidebar-header">
       <div class="sidebar-logo">
-        <!-- AutoPay logo: circular repeat arrow + upward send arrow -->
-        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-          <!-- Circular arc ~300° (recurring cycle), clockwise -->
-          <path d="M14 3 A11 11 0 1 1 5.5 21.5" stroke="var(--accent)" stroke-width="2.6" stroke-linecap="round"/>
-          <!-- Arrow tip on the arc tail (bottom-left) -->
-          <polyline points="3,18.5 5.5,21.5 8.5,19.5" stroke="var(--accent)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
-          <!-- Inner: upward arrow = sending a payment -->
-          <line x1="14" y1="17" x2="14" y2="11" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"/>
-          <polyline points="11,13.5 14,11 17,13.5" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-          <!-- Small base line = coin/table -->
-          <line x1="11" y1="17" x2="17" y2="17" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
-        </svg>
+        <img src="/logo.png" alt="Crypto AutoPay" width="34" height="34" style="border-radius:6px;flex-shrink:0"/>
         <div>
           <div class="sidebar-appname">Monero AutoPay</div>
           <div class="tray-row">
@@ -1251,8 +1280,10 @@
       {#if activeAlerts.length > 0}
         <div class="alerts-panel">
           {#each activeAlerts as a}
-            <div class="alert-item" class:alert-red={a.level === 'Red'} class:alert-orange={a.level === 'Orange'}>
-              {a.level === 'Red' ? '🔴' : '🟠'} {a.message}
+            <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+            <div class="alert-item" class:alert-red={a.level === 'Red'} class:alert-orange={a.level === 'Orange'}
+              style="cursor:pointer" on:click={() => showAlertsOverlay = true}>
+              {translateAlertMsg(a, $t)}
             </div>
           {/each}
         </div>
@@ -1532,10 +1563,9 @@
                     <div class="wallet-name">{w.name}</div>
                     {#if w.desc}<div class="wallet-desc text-muted">{w.desc}</div>{/if}
                   </div>
-                  <div style="display:flex;gap:6px">
-                    <button class="btn-ghost btn-sm" on:click={() => { page = 'receive'; }}
-                      title={$t.receiveTitle || 'Recharger le wallet'}>
-                      ⬇ {$t.receiveTitle || 'Recharger'}
+                  <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start">
+                    <button class="btn-recharge" on:click={() => { page = 'receive'; }}>
+                      {$t.receiveTitle || 'Recharger le wallet'}
                     </button>
                     <button class="btn-ghost btn-sm" on:click={() => startEditWallet(w)}>{$t.walletEdit}</button>
                   </div>
@@ -2273,6 +2303,18 @@
   .btn-copy:hover { opacity: 0.88; }
   .btn-receive { margin-top: 4px; padding: 6px 14px; font-size: 12px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%; }
   .btn-receive:hover { opacity: 0.88; }
+  /* Wallet card recharge button — larger, orange, slow glow */
+  @keyframes recharge-glow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(242,104,34,0); }
+    50%       { box-shadow: 0 0 16px 6px rgba(242,104,34,0.55); }
+  }
+  .btn-recharge {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 10px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+    animation: recharge-glow 6s ease-in-out infinite;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn-recharge:hover { opacity: 0.9; transform: scale(1.03); }
   .sweep-section { width: 100%; border-top: 1px solid var(--border); padding-top: 20px; display: flex; flex-direction: column; gap: 8px; }
   .sweep-section h2 { margin: 0; font-size: 15px; }
   .sweep-warn { font-size: 12px; color: #f59e0b; margin: 0; }
