@@ -13,6 +13,8 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
 - [ ] **Review "AutoPay account" creation (UX + security)**: the notion of "account" makes no sense here (nothing is registered anywhere, it is a local encrypted vault + a Monero wallet). Find better wording ("coffre local", "profil sur cet appareil"...) and re-review the whole flow: seed generation, seed backup/verification, restoration from 25 words, reset when the seed is lost, master password change.
 - [ ] **Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
+- [x] **Sweep (empty the wallet)**: tested OK on mainnet (0.2.1, Windows). Balance and the Wallets page now share the same live value.
+- [x] **Start with the session**: `tauri-plugin-autostart`, enabled once on first run (release builds), toggle in Settings. The wallet still has to be unlocked at login for payments to run; verify on Windows/macOS/Linux.
 - [x] **monero-wallet-rpc bundled**: shipped as the `autopay-wallet-rpc` sidecar (renamed to avoid clashing with a distro `monero` package in /usr/bin). Pinned in `scripts/monero-cli.lock`, fetched and SHA-256 checked by `scripts/fetch-wallet-rpc.sh` (CI and local dev). Linux verified locally (.deb); Windows/macOS to verify on the next release run.
 
 ---

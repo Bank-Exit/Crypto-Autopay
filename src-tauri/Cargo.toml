@@ -39,6 +39,7 @@ blake3.workspace = true
 zeroize.workspace = true
 tauri-plugin-deep-link = "=2.3.0"
 tauri-plugin-single-instance = "2.5.4"
+tauri-plugin-autostart = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

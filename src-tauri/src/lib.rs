@@ -202,6 +202,23 @@ async fn create_wallet(
 /// - Returns Err ONLY if the password is wrong (or vault missing).
 /// - Returns Ok(UnlockResult) in all other cases (even if RPC fails).
 ///   rpc_error / seed_invalid in the result indicate degraded mode.
+/// Whether AutoPay is registered to start with the user session.
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let launcher = app.autolaunch();
+    let res = if enabled { launcher.enable() } else { launcher.disable() };
+    res.map_err(|e| e.to_string())?;
+    log::info!("[Autostart] {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
 /// Seconds before the unlock screen accepts a new attempt (0 = now).
 #[tauri::command]
 fn unlock_lockout_remaining(state: tauri::State<'_, Mutex<AppState>>) -> Result<i64, String> {
@@ -2090,7 +2107,13 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             .and_then(|_| payment_policy::validate_address(&sub.destination_address))
             .and_then(|_| payment_policy::validate_terms(&sub.amount, &sub.schedule, &limits))
         {
-            log::warn!("[Scheduler] Sub {} blocked by payment limits ({})", short_id, e);
+            let already_alerted = app.try_state::<Mutex<AppState>>()
+                .and_then(|st| st.lock().ok().map(|s| s.alerts.iter()
+                    .any(|al| al.kind == "PAYMENT_BLOCKED_LIMITS" && al.sub_id.as_deref() == Some(sub_id.as_str()))))
+                .unwrap_or(false);
+            if !already_alerted {
+                log::warn!("[Scheduler] Sub {} blocked by payment limits ({})", short_id, e);
+            }
             push_alert(app, AlertLevel::Orange, "PAYMENT_BLOCKED_LIMITS", &sub_id, e.to_string());
             continue;
         }
@@ -2330,6 +2353,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(
             tauri_plugin_single_instance::init(|app, args, _cwd| {
                 // A second instance was launched (e.g. from a deep link click)
@@ -2360,6 +2384,18 @@ pub fn run() {
                 .expect("Failed to resolve app data dir");
             std::fs::create_dir_all(&data_dir).ok();
             restrict_permissions(&data_dir);
+
+            // Start with the user session by default (once, so a later opt-out sticks).
+            // Skipped in debug builds to avoid registering the dev binary.
+            let autostart_marker = data_dir.join("autostart_initialized");
+            if !cfg!(debug_assertions) && !autostart_marker.exists() {
+                use tauri_plugin_autostart::ManagerExt;
+                match app.autolaunch().enable() {
+                    Ok(()) => log::info!("[Autostart] Enabled on first run"),
+                    Err(e) => log::warn!("[Autostart] Could not enable: {}", e),
+                }
+                let _ = std::fs::write(&autostart_marker, "1");
+            }
 
             let vault_path      = data_dir.join("seed.vault");
             let wallet_file_path = data_dir.join("autopay_wallet");
@@ -2537,6 +2573,8 @@ pub fn run() {
             create_wallet,
             unlock_wallet,
             unlock_lockout_remaining,
+            get_autostart,
+            set_autostart,
             get_wallet_info,
             get_sync_info,
             get_alerts,

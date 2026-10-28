@@ -295,6 +295,21 @@
     const v = await tauriInvoke("get_treasurer_mode");
     if (v !== null) treasurerMode = !!v;
   }
+  let autostartEnabled = null; // null = unknown (browser dev mode)
+  async function loadAutostart() {
+    const v = await tauriInvoke("get_autostart");
+    if (v !== null) autostartEnabled = !!v;
+  }
+  async function toggleAutostart(enabled) {
+    try {
+      await invokeStrict("set_autostart", { enabled });
+      autostartEnabled = enabled;
+    } catch (e) {
+      logWarn("Dashboard", `set_autostart failed: ${e}`);
+      await loadAutostart();
+    }
+  }
+
   async function toggleTreasurerMode(enabled) {
     treasurerMode = enabled;
     await tauriInvoke("set_treasurer_mode", { enabled }).catch(() => {});
@@ -1186,6 +1201,7 @@
     await loadHistoryEntries();
     // Load treasurer mode
     await loadTreasurerMode();
+    await loadAutostart();
     await loadPaymentLimits();
 
     // Sync payment mode with Rust backend (source of truth for semi-auto enforcement)
@@ -1328,6 +1344,9 @@
   ];
 
   // Derive totalBalance from live balanceXmr — pure read, no loop
+  // The Wallets page shows the live balance, so every balance update (refresh, payment, sweep) applies at once.
+  $: displayWallets = wallets.map((w, i) => i === 0 && balanceXmr !== null ? { ...w, balance: balanceXmr.toFixed(4) } : w);
+
   $: totalBalance = balanceXmr !== null ? balanceXmr.toFixed(3) : (wallets[0]?.balance ?? "0.000");
 
   // Keep wallets[0].monthlyOut in sync using a guard to break the reactive loop
@@ -2058,7 +2077,7 @@
         </div>
       {:else}
         <div class="wallet-list">
-          {#each wallets as w}
+          {#each displayWallets as w}
             <div class="wallet-card card">
               <div class="wallet-color-bar" style="background:{w.color}"></div>
               <div class="wallet-body">
@@ -2323,6 +2342,22 @@
           {$t.treasurerModeDesc}
         </p>
       </div>
+
+      <!-- Start with the session -->
+      {#if autostartEnabled !== null}
+        <h2 class="section-title">{$t.autostartTitle}</h2>
+        <div class="settings-section card">
+          <div class="setting-row">
+            <span class="setting-label">{$t.autostartLabel}</span>
+            <label class="toggle">
+              <input type="checkbox" checked={autostartEnabled}
+                on:change={e => toggleAutostart(e.target.checked)} />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="mode-desc" style="font-size:12px;color:var(--text-muted)">{$t.autostartDesc}</p>
+        </div>
+      {/if}
 
       <!-- Notifications section -->
       <h2 class="section-title">{$t.notifTitle}</h2>

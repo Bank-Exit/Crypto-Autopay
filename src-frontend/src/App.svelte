@@ -46,7 +46,13 @@
     // Forward Rust log events (tauri-plugin-log webview target) into AppLogger
     try {
       const { attachLogger } = await import("@tauri-apps/plugin-log");
+      // The same Rust record must only be shown once, even if the listener ends up attached twice.
+      let lastRust = "";
+      if (window.__autopayRustLogAttached) throw new Error("already attached");
+      window.__autopayRustLogAttached = true;
       await attachLogger(({ level, message, location }) => {
+        if (message === lastRust) return;
+        lastRust = message;
         const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
         if (level >= 4) logError(mod, message);      // ERROR = 4
         else if (level >= 3) logWarn(mod, message);  // WARN  = 3
