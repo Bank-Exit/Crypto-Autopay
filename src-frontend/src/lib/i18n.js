@@ -178,6 +178,10 @@ const T = {
     rpcDownload: "Télécharger Monero CLI", rpcOrSetPath: "ou renseigner le chemin ci-dessous.",
     rpcBinaryPath: "Chemin du binaire (optionnel)",
     rpcPublicNode: "Nœud Monero public", rpcNodeAuto: "Automatique (premier nœud disponible)",
+    rpcNodeCustom: "Nœud personnalisé…", rpcNodeCustomLabel: "Adresse du nœud (hôte:port)",
+    rpcActiveNode: "Nœud utilisé actuellement", rpcActiveNodeNone: "aucun pour l'instant",
+    rpcNodeAutoHint: "En mode automatique, si le nœud ne répond plus (panne, blocage), le suivant de la liste est utilisé.",
+    rpcNodePinnedHint: "Nœud fixé : aucune bascule automatique si ce nœud ne répond plus.",
     rpcTolerance: "Tolérance paiement", rpcToleranceHint: "ex: 20% = ±6j sur mensuel",
 
     // Subscription list footer features
@@ -438,6 +442,10 @@ const T = {
     rpcDownload: "Download Monero CLI", rpcOrSetPath: "or set the path below.",
     rpcBinaryPath: "Binary path (optional)",
     rpcPublicNode: "Public Monero node", rpcNodeAuto: "Auto (first available node)",
+    rpcNodeCustom: "Custom node…", rpcNodeCustomLabel: "Node address (host:port)",
+    rpcActiveNode: "Node currently in use", rpcActiveNodeNone: "none yet",
+    rpcNodeAutoHint: "In automatic mode, if the node stops answering (outage, rate limit), the next one in the list is used.",
+    rpcNodePinnedHint: "Pinned node: no automatic failover if this node stops answering.",
     rpcTolerance: "Payment tolerance", rpcToleranceHint: "e.g. 20% = ±6d on monthly",
     featurePrivacyTitle: "Maximum privacy",
     featurePrivacyDesc: "No data sent externally. Zero tracking, zero analytics.",

@@ -50,6 +50,67 @@ impl Default for RpcConfig {
     }
 }
 
+impl RpcConfig {
+    /// Node pinned by the user, if any (empty string = automatic selection).
+    pub fn manual_node(&self) -> Option<String> {
+        self.daemon_address.as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Pick the daemon node for the next wallet-rpc session and return the config to use
+/// along with the node's current height (0 if no node answered).
+///
+/// A pinned node is always used. In automatic mode, the last working node is tried first,
+/// then the public list in order, so a node that starts refusing or rate-limiting us
+/// is skipped transparently.
+pub fn select_live_node(mut config: RpcConfig, last_working: Option<&str>) -> (RpcConfig, String, u64) {
+    if let Some(node) = config.manual_node() {
+        let height = probe_daemon_height(&node, Duration::from_secs(8)).unwrap_or(0);
+        if height == 0 {
+            log::warn!("[RPC] Pinned node {} did not answer", node);
+        }
+        config.daemon_address = Some(node.clone());
+        return (config, node, height);
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(n) = last_working { candidates.push(n.to_string()); }
+    for n in PUBLIC_NODES {
+        if !candidates.iter().any(|c| c == n) { candidates.push(n.to_string()); }
+    }
+
+    for node in &candidates {
+        match probe_daemon_height(node, Duration::from_secs(6)) {
+            Some(h) if h > 0 => {
+                log::info!("[RPC] Using node {} (height {})", node, h);
+                config.daemon_address = Some(node.clone());
+                return (config, node.clone(), h);
+            }
+            _ => log::warn!("[RPC] Node {} unavailable, trying next", node),
+        }
+    }
+
+    let fallback = candidates.first().cloned().unwrap_or_else(|| PUBLIC_NODES[0].to_string());
+    log::warn!("[RPC] No node answered — falling back to {}", fallback);
+    config.daemon_address = Some(fallback.clone());
+    (config, fallback, 0)
+}
+
+/// Ask a daemon for its height with a bounded total wait. None if unreachable, blocked or invalid.
+pub fn probe_daemon_height(daemon_addr: &str, timeout: Duration) -> Option<u64> {
+    let url = format!("http://{}/json_rpc", daemon_addr);
+    let body = serde_json::json!({ "jsonrpc":"2.0","id":"h","method":"get_block_count" });
+    match http_post_json(&url, &body, timeout, timeout) {
+        Ok(r) => r["result"]["count"].as_u64().filter(|h| *h > 0),
+        Err(e) => {
+            log::debug!("[RPC] Probe {} failed: {}", daemon_addr, e);
+            None
+        }
+    }
+}
+
 /// Status of the wallet-rpc process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +160,7 @@ impl RpcManager {
 
     /// Daemon address to use (user-config or first public node).
     pub fn daemon_address(&self) -> String {
-        self.config.daemon_address.clone()
+        self.config.manual_node()
             .unwrap_or_else(|| PUBLIC_NODES[0].to_string())
     }
 
@@ -329,7 +390,7 @@ impl RpcManager {
             })?
             .to_string();
 
-        log::info!("[RPC] Wallet restored successfully. Address prefix: {}…", &address[..address.len().min(12)]);
+        log::info!("[RPC] Wallet restored successfully");
         Ok(address)
     }
 
@@ -381,21 +442,14 @@ pub fn ureq_post_json_long(url: &str, body: &serde_json::Value, timeout_secs: u6
 /// Used to compute a sensible restore_height (recent) for new wallets.
 /// Falls back to 0 on error — caller should handle gracefully.
 pub fn get_daemon_block_height(daemon_addr: &str) -> u64 {
-    let url = format!("http://{}/json_rpc", daemon_addr);
     log::info!("[RPC] Querying daemon block count from {}", daemon_addr);
-    match ureq_post_json(&url, &serde_json::json!({
-        "jsonrpc":"2.0","id":"h","method":"get_block_count"
-    })) {
-        Ok(r) => {
-            let count = r["result"]["count"].as_u64().unwrap_or(0);
-            log::info!("[RPC] Daemon block count: {}", count);
-            count
-        }
-        Err(e) => {
-            log::warn!("[RPC] Could not get daemon height: {} — restore_height will be 0", e);
-            0
-        }
+    let count = probe_daemon_height(daemon_addr, Duration::from_secs(15)).unwrap_or(0);
+    if count > 0 {
+        log::info!("[RPC] Daemon block count: {}", count);
+    } else {
+        log::warn!("[RPC] Could not get daemon height from {}", daemon_addr);
     }
+    count
 }
 
 /// Minimal synchronous HTTP POST helper using std::net::TcpStream.
@@ -404,9 +458,20 @@ fn ureq_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
     ureq_post_json_timeout(url, body, 60)
 }
 
-/// Same as ureq_post_json but with a configurable read timeout.
 fn ureq_post_json_timeout(url: &str, body: &serde_json::Value, timeout_secs: u64) -> Result<serde_json::Value, String> {
+    http_post_json(url, body, Duration::from_secs(10), Duration::from_secs(timeout_secs))
+}
+
+/// HTTP/1.0 JSON POST with bounded connect and read timeouts
+/// (a plain `TcpStream::connect` can hang for minutes on a node that drops packets).
+fn http_post_json(
+    url: &str,
+    body: &serde_json::Value,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
 
     let method_hint = body.get("method").and_then(|m| m.as_str()).unwrap_or("?");
     log::debug!("[RPC/HTTP] POST {} method={}", url, method_hint);
@@ -423,12 +488,24 @@ fn ureq_post_json_timeout(url: &str, body: &serde_json::Value, timeout_secs: u64
         body_str.len()
     );
 
-    let mut stream = std::net::TcpStream::connect(host_port).map_err(|e| {
-        let msg = format!("TCP connect to {} failed: {} (is wallet-rpc running?)", host_port, e);
+    let addrs: Vec<std::net::SocketAddr> = host_port.to_socket_addrs()
+        .map_err(|e| format!("Cannot resolve {}: {}", host_port, e))?
+        .collect();
+    let mut last_err = format!("No address for {}", host_port);
+    let mut stream = None;
+    for addr in &addrs {
+        match std::net::TcpStream::connect_timeout(addr, connect_timeout) {
+            Ok(s) => { stream = Some(s); break; }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        let msg = format!("TCP connect to {} failed: {} (is wallet-rpc running?)", host_port, last_err);
         log::error!("[RPC/HTTP] {}", msg);
         msg
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_read_timeout(Some(read_timeout)).ok();
+    stream.set_write_timeout(Some(connect_timeout)).ok();
 
     stream.write_all(request.as_bytes()).map_err(|e| {
         let msg = format!("Write to {} failed: {}", host_port, e);

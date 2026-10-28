@@ -22,7 +22,7 @@
     logInfo("Unlock", "unlock_wallet invoked");
     try {
       const result = await invoke("unlock_wallet", { password });
-      logInfo("Unlock", `unlock_wallet returned: address=${result.address ? result.address.slice(0,12)+"…" : "none"}, balance=${result.balance_xmr}, seed_invalid=${result.seed_invalid}, rpc_error=${result.rpc_error ?? "none"}`);
+      logInfo("Unlock", `unlock_wallet returned: address=${result.address ? "set" : "none"}, seed_invalid=${result.seed_invalid}, rpc_error=${result.rpc_error ?? "none"}`);
 
       if (result.rpc_error) {
         if (result.seed_invalid) {
@@ -122,7 +122,7 @@
               try {
                 const { invoke: inv } = await import("@tauri-apps/api/core");
                 const info = await inv("get_wallet_info");
-                logInfo("Unlock", `[DEV] Wallet info: rpc_ok=${info?.rpc_connected}, balance=${info?.balance_xmr}`);
+                logInfo("Unlock", `[DEV] Wallet info: rpc_ok=${info?.rpc_connected}`);
                 dispatch("unlocked", { address: info?.address ?? "", balance: info?.balance_xmr ?? 0 });
               } catch (e) {
                 logWarn("Unlock", `[DEV] get_wallet_info unavailable: ${e}`);

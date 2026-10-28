@@ -549,29 +549,53 @@
   let rpcBinaryPath = null;
   let publicNodes = [];
   let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20, send_logs_enabled: false };
+  let activeNode = null;          // node used by the last RPC session
+  const CUSTOM_NODE = "__custom__";
+  let nodeChoice = "";            // "" = automatic, a public node, or CUSTOM_NODE
+  let customNode = "";
+  let rpcConfigLoaded = false;
+  let rpcSaveMsg = "";
 
   async function loadRpcState() {
-    logInfo("RPC", "Fetching RPC status from backend…");
-    const [status, binary, nodes] = await Promise.all([
+    const [status, binary, nodes, cfg] = await Promise.all([
       tauriInvoke("get_rpc_status"),
       tauriInvoke("detect_rpc_binary"),
       tauriInvoke("get_public_nodes"),
+      tauriInvoke("get_rpc_config"),
     ]);
     rpcStatus = (typeof status === "string" ? status : status?.toString?.() ?? "stopped").toLowerCase();
     rpcStatusLabel = null; // computed via $t in template
     rpcBinaryPath = binary;
     publicNodes = nodes ?? [];
-    logInfo("RPC", `Status: ${JSON.stringify(status)}, binary: ${binary ?? "not found"}, nodes: ${nodes?.length ?? 0}`);
-    if (!binary) {
-      logWarn("RPC", "monero-wallet-rpc binary not found in PATH. Install the Monero CLI suite or set the path manually in Settings → RPC.");
+    activeNode = cfg?.active_node ?? null;
+    // Only load the editable form once, so a background refresh never overwrites user input.
+    if (!rpcConfigLoaded) {
+      logInfo("RPC", `Status: ${JSON.stringify(status)}, binary: ${binary ?? "not found"}, nodes: ${publicNodes.length}`);
+      if (!binary) logWarn("RPC", "monero-wallet-rpc binary not found in PATH. Install the Monero CLI suite or set the path manually in Settings → RPC.");
+    }
+    if (cfg?.config && !rpcConfigLoaded) {
+      rpcConfig = { ...rpcConfig, ...cfg.config, daemon_address: cfg.config.daemon_address ?? "" };
+      const pinned = rpcConfig.daemon_address;
+      nodeChoice = !pinned ? "" : publicNodes.includes(pinned) ? pinned : CUSTOM_NODE;
+      customNode = nodeChoice === CUSTOM_NODE ? pinned : "";
+      rpcConfigLoaded = true;
     }
   }
 
   async function saveRpcConfig() {
-    logInfo("RPC", `Saving config: node=${rpcConfig.daemon_address ?? "auto"}, port=${rpcConfig.rpc_port}`);
-    const result = await tauriInvoke("save_rpc_config", { config: rpcConfig });
-    if (result === null || result === undefined) logInfo("RPC", "Config saved OK");
-    else logWarn("RPC", `save_rpc_config returned: ${JSON.stringify(result)}`);
+    rpcConfig.daemon_address = nodeChoice === CUSTOM_NODE ? customNode.trim() : nodeChoice;
+    if (nodeChoice === CUSTOM_NODE && !/^[^\s:/]+:\d{1,5}$/.test(rpcConfig.daemon_address)) {
+      rpcSaveMsg = "Adresse invalide — format attendu : hote:port (ex. node.example.org:18089)";
+      return;
+    }
+    try {
+      await tauriInvoke("save_rpc_config", { config: rpcConfig });
+      rpcSaveMsg = "Configuration enregistrée — prise en compte au prochain rafraîchissement";
+      logInfo("RPC", `Config saved: node=${rpcConfig.daemon_address || "auto"}`);
+    } catch (e) {
+      rpcSaveMsg = String(e);
+      logWarn("RPC", `save_rpc_config failed: ${e}`);
+    }
     await loadRpcState();
   }
 
@@ -584,9 +608,13 @@
   let rpcOk = null;             // null=unknown, true=connected, false=error
   let rpcError = null;          // last error string
   let walletAddress = null;
-  // Sync progress (from get_sync_info after each refresh)
-  let syncInfo = null; // { wallet_height, daemon_height, blocks_behind, synced }
-  let syncPollTimer = null;
+  // Progress of the running refresh, from the backend "wallet-sync" events.
+  let syncStep = null;         // { phase, node?, blocks_behind? }
+  let syncStartedAt = 0;       // ms, start of the whole refresh
+  let syncPhaseStartedAt = 0;  // ms, start of the "syncing" phase
+  let nowMs = Date.now();
+  // Observed throughput of wallet-rpc on a remote node (~35-50 blocks/s), kept conservative.
+  const SYNC_BLOCKS_PER_SEC = 30;
   let isOffline = false;          // true when the last completed refresh could not reach the Monero node
   let busyRetryTimer = null;
 
@@ -598,7 +626,6 @@
   onDestroy(() => {
     destroyed = true;
     cleanups.forEach(fn => { try { fn(); } catch (_) {} });
-    clearInterval(syncPollTimer);
     clearTimeout(busyRetryTimer);
     clearInterval(payLoaderTimer);
     clearTimeout(payAnimTimer);
@@ -942,21 +969,36 @@
     else                  refreshAgoLabel = `il y a ${Math.round(secs/3600)} h`;
   }
 
-  async function pollSyncInfo() {
-    try {
-      const info = await tauriInvoke("get_sync_info");
-      if (info) syncInfo = info;
-    } catch(_) {}
+  function formatDuration(secs) {
+    secs = Math.max(0, Math.round(secs));
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return m > 0 ? `${m} min ${String(s).padStart(2, "0")} s` : `${s} s`;
   }
+
+  $: syncElapsed = syncStartedAt ? (nowMs - syncStartedAt) / 1000 : 0;
+  $: syncEstimate = syncStep?.phase === "syncing" && syncStep.blocks_behind > 0
+    ? syncStep.blocks_behind / SYNC_BLOCKS_PER_SEC : 0;
+  $: syncPhaseElapsed = syncPhaseStartedAt ? (nowMs - syncPhaseStartedAt) / 1000 : 0;
+  $: syncPct = syncEstimate > 0 ? Math.min(95, Math.max(2, (syncPhaseElapsed / syncEstimate) * 100)) : null;
+  $: syncLabel = !syncStep ? "Préparation…"
+    : syncStep.phase === "node" ? "Recherche d'un nœud Monero disponible…"
+    : syncStep.phase === "starting" ? `Connexion au nœud ${syncStep.node ?? ""}…`
+    : syncStep.phase === "opening" ? "Ouverture du wallet…"
+    : syncStep.phase === "syncing" ? (syncStep.blocks_behind > 0
+        ? `Synchronisation : ${syncStep.blocks_behind.toLocaleString()} blocs à rattraper`
+        : "Synchronisation avec le réseau…")
+    : syncStep.phase === "reading" ? "Lecture du solde…"
+    : "Synchronisation…";
 
   async function refreshBalance() {
     if (destroyed) return;
     clearTimeout(busyRetryTimer);
     balanceLoading = true;
+    syncStep = null;
+    syncStartedAt = Date.now();
+    syncPhaseStartedAt = 0;
+    nowMs = Date.now();
     logInfo("Dashboard", "Refreshing balance via RPC…");
-    // Poll sync progress every 5s while balance is loading
-    if (syncPollTimer) clearInterval(syncPollTimer);
-    syncPollTimer = setInterval(pollSyncInfo, 5000);
     try {
       const b = await tauriInvoke("refresh_balance");
       if (b) {
@@ -973,7 +1015,6 @@
         lastBalanceRefresh = Date.now();
         updateRefreshAgo();
         logInfo("Dashboard", `Balance refreshed: [REDACTED]`);
-        await pollSyncInfo(); // update after refresh completes
       }
     } catch (e) {
       const errStr = String(e);
@@ -989,12 +1030,14 @@
         rpcError = errStr;
         // NOTE: Do NOT detect offline from "Connexion refusée" — that is the LOCAL
         // wallet-rpc (127.0.0.1:18083) restarting, not an internet connectivity issue.
-        // isOffline is set exclusively by pollSyncInfo() via daemon_height / blocks_behind.
+        // isOffline is set exclusively from daemon_reachable of a completed refresh.
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
-    if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
     balanceLoading = false;
+    syncStep = null;
+    syncStartedAt = 0;
+    loadRpcState();
   }
 
   onMount(async () => {
@@ -1037,6 +1080,12 @@
 
     // Immediately trigger a background sync without blocking the UI
     // (sync takes ~47s on first run — shows spinner in sidebar)
+    await listenWhileMounted("wallet-sync", (ev) => {
+      if (!balanceLoading) return;
+      const p = ev.payload || {};
+      if (p.phase === "syncing" && syncStep?.phase !== "syncing") syncPhaseStartedAt = Date.now();
+      syncStep = p;
+    });
     refreshBalance(); // intentionally NOT awaited
 
     everyWhileMounted(refreshBalance, 2 * 60 * 1000);
@@ -1048,6 +1097,7 @@
 
     // Fast ticker every 10s — forces reactive nextPayment banner to update
     everyWhileMounted(() => { nowTick = Date.now(); }, 10 * 1000);
+    everyWhileMounted(() => { if (balanceLoading) nowMs = Date.now(); }, 1000);
 
     // Listen for Rust background scheduler events
     await listenWhileMounted("payment-locked", async (ev) => {
@@ -1071,7 +1121,7 @@
     let _pendingQueue = [];
     await listenWhileMounted("payment-pending", (ev) => {
       const p = ev.payload || {};
-      logInfo("Scheduler", `[Semi-auto] Payment queued for approval: ${p.sub_label} — ${p.amount_xmr} XMR`);
+      logInfo("Scheduler", `[Semi-auto] Payment queued for approval: sub ${String(p.sub_id ?? "").slice(0, 8)}`);
       _pendingQueue.push(p);
     });
 
@@ -1520,17 +1570,19 @@
           <button class="btn-inline" on:click={() => { isOffline = false; refreshBalance(); }}>Réessayer</button>
         </div>
       {:else if balanceLoading}
-        <div class="refresh-ago sync-pulse">Synchro réseau en cours…</div>
-        {#if syncInfo && syncInfo.blocks_behind > 10}
-          {@const pct = Math.max(2, Math.min(99, 100 - (syncInfo.blocks_behind / Math.max(syncInfo.daemon_height, 1)) * 100))}
-          <div class="sync-progress-wrap">
-            <div class="sync-progress-bar" style="width:{pct}%"></div>
-          </div>
-          <span class="sync-progress-label">{syncInfo.blocks_behind.toLocaleString()} blocs · ~{Math.ceil(syncInfo.blocks_behind * 2 / 60)} min</span>
-        {:else if syncInfo && syncInfo.blocks_behind > 0}
-          <div class="sync-progress-label-small">{syncInfo.blocks_behind} blocs restants</div>
-        {:else if !syncInfo}
-          <div class="sync-progress-label-small">Connexion à la blockchain…</div>
+        <div class="refresh-ago sync-pulse">{syncLabel}</div>
+        <div class="sync-progress-wrap">
+          {#if syncPct !== null}
+            <div class="sync-progress-bar" style="width:{syncPct}%"></div>
+          {:else}
+            <div class="sync-progress-bar sync-progress-indeterminate"></div>
+          {/if}
+        </div>
+        <span class="sync-progress-label">
+          {formatDuration(syncElapsed)} écoulées{#if syncEstimate > 0} · estimé ~{formatDuration(Math.max(syncEstimate - syncPhaseElapsed, 0))} restantes{/if}
+        </span>
+        {#if syncElapsed > 20}
+          <div class="sync-progress-label-small">Vous pouvez continuer à utiliser l'application pendant la synchronisation.</div>
         {/if}
       {:else if refreshAgoLabel}
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
@@ -2077,13 +2129,29 @@
 
         <label class="field" style="margin-top:10px">
           <span>{$t.rpcPublicNode || 'Nœud Monero public'}</span>
-          <select bind:value={rpcConfig.daemon_address} class="setting-select" style="width:100%">
+          <select bind:value={nodeChoice} class="setting-select" style="width:100%">
             <option value="">{$t.rpcNodeAuto || 'Automatique (premier nœud disponible)'}</option>
             {#each publicNodes as node}
               <option value={node}>{node}</option>
             {/each}
+            <option value={CUSTOM_NODE}>{$t.rpcNodeCustom || 'Nœud personnalisé…'}</option>
           </select>
         </label>
+        {#if nodeChoice === CUSTOM_NODE}
+          <label class="field" style="margin-top:8px">
+            <span>{$t.rpcNodeCustomLabel || 'Adresse du nœud (hôte:port)'}</span>
+            <input type="text" bind:value={customNode} placeholder="node.example.org:18089" spellcheck="false" />
+          </label>
+        {/if}
+        <p class="rpc-info" style="margin-top:6px">
+          {$t.rpcActiveNode || 'Nœud utilisé actuellement'} :
+          <code>{activeNode ?? ($t.rpcActiveNodeNone || 'aucun pour l\'instant')}</code>
+        </p>
+        <p class="text-muted" style="font-size:11px;margin-top:2px">
+          {nodeChoice === ""
+            ? ($t.rpcNodeAutoHint || 'En mode automatique, si le nœud ne répond plus (panne, blocage), le suivant de la liste est utilisé.')
+            : ($t.rpcNodePinnedHint || 'Nœud fixé : aucune bascule automatique si ce nœud ne répond plus.')}
+        </p>
 
         <label class="field" style="margin-top:10px">
           <span>{$t.rpcTolerance || 'Tolérance paiement'} <strong>{rpcConfig.tolerance_pct}%</strong>
@@ -2095,6 +2163,9 @@
         <button class="btn-primary btn-sm" style="margin-top:10px;width:fit-content" on:click={saveRpcConfig}>
           Enregistrer la config RPC
         </button>
+        {#if rpcSaveMsg}
+          <p class="text-muted" style="font-size:11px;margin-top:6px">{rpcSaveMsg}</p>
+        {/if}
       </div>
 
       <!-- Logs section in Settings -->
@@ -2586,6 +2657,8 @@
   .sync-pulse { color: var(--accent) !important; opacity: 1 !important; animation: pulse-dot 1.5s ease-in-out infinite; }
   .sync-progress-wrap { position: relative; height: 4px; background: var(--border); border-radius: 2px; margin: 3px 0 2px; overflow: hidden; }
   .sync-progress-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 1s ease; }
+  .sync-progress-indeterminate { position: absolute; width: 35%; animation: sync-slide 1.4s ease-in-out infinite; }
+  @keyframes sync-slide { from { left: -35%; } to { left: 100%; } }
   .sync-progress-label { font-size: 9px; color: var(--text-muted); }
   .sync-progress-label-small { font-size: 9px; color: var(--text-muted); margin-top: 2px; }
   .balance-amount { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
@@ -2730,9 +2803,10 @@
   }
   .lock-nav-btn {
     background: none; border: 2px solid var(--accent); border-radius: 8px;
-    width: 42px; height: 36px; display: flex; align-items: center; justify-content: center;
+    width: 42px; height: 36px; padding: 0; display: flex; align-items: center; justify-content: center;
     cursor: pointer; transition: all 0.15s; opacity: 0.75;
   }
+  .lock-nav-btn svg { flex-shrink: 0; }
   .lock-nav-btn:hover { background: rgba(242,104,34,0.15); opacity: 1; transform: scale(1.05); }
   .refill-urgent { border: 1px solid #f97316 !important; background: #f9731610 !important; }
   .refill-urgent-text { color: #ef4444 !important; font-size: 15px !important; animation: blink-urgent 1.2s ease-in-out infinite; }

@@ -101,7 +101,7 @@ This document maps every possible state of the RPC subsystem, their causes, impl
                    │  surfaces at unlock_wallet, Case E)
                    ▼
           ┌──────────────────┐
-          │ refresh()        │  long sync, 180s timeout, non-fatal
+          │ refresh()        │  long sync, 600s timeout, non-fatal
           │ get_height()     │  optional (None if it fails)
           │ get_balance()    │  failure → Err (never reported as 0)
           └────────┬─────────┘
@@ -251,6 +251,16 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 ---
 
+### Case F2 — Node blocks us / goes down (failover)
+
+**Trigger**: the remote node rate-limits, refuses or drops connections.
+
+**Rust**: before each wallet-rpc session, `live_rpc_manager()` probes nodes with `get_block_count` (6s bounded connect+read). Automatic mode (no node pinned in Settings): last working node first, then `PUBLIC_NODES` in order; the first answering node is used and stored in `AppState.active_node`. Pinned node: always used, no failover. If no node answers, the session still starts on the first candidate and Case F applies.
+
+**Frontend**: Settings > Wallet RPC shows the node in use (`get_rpc_config().active_node`) and accepts a custom `host:port`.
+
+---
+
 ### Case G — Local RPC connection refused (RPC restarting between operations)
 
 **Trigger**: The scheduler has just killed `monero-wallet-rpc` after a payment. A `refresh_balance` call arrives in the milliseconds before the next one is spawned.
@@ -327,16 +337,19 @@ refreshBalance() {
   check unlocked → true
   compare_exchange rpc_busy false→true → ok
   │
-  ├─ spawn_blocking {
-  │    RpcManager::new(config)
-  │    start_for_dir(wallet_dir)
+  ├─ spawn_blocking {                   emits "wallet-sync" {phase} at each step:
+  │    live_rpc_manager()              node     → probe nodes, pick a live one
+  │    start_for_dir(wallet_dir)       starting
   │      detect_binary()               → /usr/local/bin/monero-wallet-rpc
   │      kill stale :18083 if any
   │      Command::spawn(args)          → PID 3488406
   │      wait_for_ready(10s)           → ok after 9 attempts (~2s)
-  │    open_wallet(name, password)     → ok
-  │    refresh()                       → sync with daemon (≤180s)
-  │    get_height()                    → { height: 3793484 }
+  │    open_wallet(name, password)     opening
+  │    get_height()                    → start height, blocks_behind = node − start
+  │    refresh()                       syncing {blocks_behind} — ≤600s, wallet-rpc
+  │                                    answers nothing else meanwhile (no live progress;
+  │                                    the UI shows elapsed time + estimate ~30 blocks/s)
+  │    get_height()                    reading → { height: 3793484 }
   │    get_balance()                   → { balance: 820000000000, ... }
   │    RpcManager::stop()              → kill PID, rpc_busy = false
   │  }

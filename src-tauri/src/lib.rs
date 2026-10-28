@@ -74,6 +74,8 @@ pub struct AppState {
     pub rpc_busy: Arc<AtomicBool>,
     /// RPC process manager.
     pub rpc: RpcManager,
+    /// Node used by the last successful node selection (tried first next time).
+    pub active_node: Option<String>,
     /// Alert config: minimum days of runway before BALANCE_LOW fires (default 7).
     pub balance_low_threshold_days: f64,
     /// Alert preferences: which alert kinds are enabled (all enabled by default).
@@ -252,7 +254,7 @@ async fn unlock_wallet(
         .map(|s| s.trim().to_string())
         .filter(|a| a.len() > 90 && saved_height_fast > 0)
     {
-        log::info!("[Unlock] Fast path: using cached address {}…", &cached_addr[..12]);
+        log::info!("[Unlock] Fast path: using cached address");
         if let Ok(mut s) = state.lock() {
             s.unlocked = true;
             s.last_unlock_at = chrono::Utc::now().timestamp();
@@ -275,10 +277,11 @@ async fn unlock_wallet(
     // Try RPC session — non-fatal on failure
     log::info!("[Unlock] wallet_dir={:?}, wallet_exists={}, wallet_name={}", wallet_dir, wallet_exists, wallet_name);
     let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
+    let app_rpc = app_handle.clone();
 
     let rpc_result: Result<(String, f64), (String, bool)> = tokio::task::spawn_blocking(move || {
         log::info!("[Unlock/RPC] spawn_blocking started");
-        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        let (mut mgr, _) = live_rpc_manager(&app_rpc);
         log::info!("[Unlock/RPC] Using daemon: {}, port: {}", mgr.daemon_address(), mgr.config_port());
 
         mgr.start_for_dir(&wd).map_err(|e| {
@@ -330,7 +333,7 @@ async fn unlock_wallet(
                 log::error!("[Unlock/RPC] restore failed (seed_invalid={}): {}", is_seed, e);
                 (e, is_seed)
             })?;
-            log::info!("[Unlock/RPC] Restore OK, address={}", &addr[..addr.len().min(12)]);
+            log::info!("[Unlock/RPC] Restore OK");
             // Save height marker so we know this wallet was created with a good restore_height
             let _ = std::fs::write(&height_marker, restore_height.to_string());
             // Balance is 0 immediately after restore — sync happens via refresh_balance later.
@@ -359,7 +362,7 @@ async fn unlock_wallet(
                 (e, false)
             })?;
             let addr = addr_resp["result"]["address"].as_str().unwrap_or("").to_string();
-            log::info!("[Unlock/RPC] Address retrieved ({}…)", &addr[..addr.len().min(12)]);
+            log::info!("[Unlock/RPC] Address retrieved");
             let bal = mgr.rpc_get_balance().map(|(_, u)| u).unwrap_or_else(|e| {
                 log::warn!("[Unlock/RPC] get_balance failed: {}", e);
                 0.0
@@ -472,13 +475,14 @@ async fn send_payment(
     log::info!("[Payment] Sending payment for subscription #{}", subscription_id);
 
     let busy_clone = Arc::clone(&rpc_busy);
+    let app_rpc = app_handle.clone();
     let result = tokio::task::spawn_blocking(move || {
         // RAII guard: always clear rpc_busy when this closure exits
         struct RpcGuard(Arc<AtomicBool>);
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(Arc::clone(&busy_clone));
 
-        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        let (mut mgr, _) = live_rpc_manager(&app_rpc);
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
 
@@ -557,10 +561,11 @@ async fn sweep_all(
         (wn, wd, pw)
     };
 
-    log::info!("[Sweep] Initiating sweep_all to {}…", &dest[..dest.len().min(12)]);
+    log::info!("[Sweep] Initiating sweep_all");
 
+    let app_rpc = app_handle.clone();
     let tx_hash = tokio::task::spawn_blocking(move || {
-        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        let (mut mgr, _) = live_rpc_manager(&app_rpc);
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
 
@@ -628,16 +633,27 @@ async fn refresh_balance(
         return Err("RPC busy".into());
     }
 
+    let app_rpc = app_handle.clone();
     let rpc_result = tokio::task::spawn_blocking(move || {
         struct RpcGuard(Arc<AtomicBool>);
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(rpc_busy);
 
-        let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+        let progress = |phase: &str, extra: serde_json::Value| {
+            let mut payload = serde_json::json!({ "phase": phase });
+            if let (Some(p), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+                p.extend(e.clone());
+            }
+            app_rpc.emit("wallet-sync", payload).ok();
+        };
+
+        progress("node", serde_json::json!({}));
+        let (mut mgr, daemon_height_before) = live_rpc_manager(&app_rpc);
+        progress("starting", serde_json::json!({ "node": mgr.daemon_address() }));
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
 
-        // Open wallet
+        progress("opening", serde_json::json!({}));
         let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"open","method":"open_wallet",
             "params":{"filename":wallet_name,"password":password}
@@ -646,12 +662,21 @@ async fn refresh_balance(
             log::warn!("[refresh_balance] open_wallet error: {}", err);
         }
 
-        // Trigger wallet refresh (sync with daemon) — 180s timeout (720 blocks ≈ 47s on remote node)
-        log::info!("[refresh_balance] Calling wallet refresh (may take up to ~2 min for first sync)…");
+        let height_body = serde_json::json!({ "jsonrpc":"2.0","id":"h","method":"get_height","params":{} });
+        let start_height = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &height_body, 10)
+            .ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(0);
+        // wallet-rpc does not answer any call while `refresh` runs, so only the gap
+        // to catch up is known up front; the UI derives an estimate from it.
+        let blocks_behind = daemon_height_before.saturating_sub(start_height);
+        log::info!("[refresh_balance] Calling wallet refresh ({} blocks behind)…", blocks_behind);
+        progress("syncing", serde_json::json!({ "blocks_behind": blocks_behind }));
+
+        // A wallet that was closed for days can need several minutes on a remote node.
         let refresh_resp = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"refresh","method":"refresh",
             "params":{"start_height":0}
-        }), 180);
+        }), 600);
+        progress("reading", serde_json::json!({}));
         match &refresh_resp {
             Ok(r) => {
                 let fetched = r["result"]["blocks_fetched"].as_u64().unwrap_or(0);
@@ -668,14 +693,15 @@ async fn refresh_balance(
         let (total, _unlocked) = mgr.rpc_get_balance()?;
         let atomic = (total * 1e12) as u64;
         log::info!("[refresh_balance] Balance fetched");
+        let node = mgr.daemon_address();
         mgr.stop();
-        Ok::<(f64, u64, Option<u64>), String>((total, atomic, wallet_height))
+        Ok::<(f64, u64, Option<u64>, String), String>((total, atomic, wallet_height, node))
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
 
-    let (xmr, atomic, wallet_height) = match rpc_result {
+    let (xmr, atomic, wallet_height, daemon_addr) = match rpc_result {
         Ok(v) => v,
         Err(e) => {
             if let Ok(mut s) = state.lock() {
@@ -688,8 +714,9 @@ async fn refresh_balance(
 
     // 0 means the remote node did not answer: keep it as-is, never substitute the wallet height,
     // otherwise offline detection and OFFLINE_WITH_PENDING can never trigger.
-    let daemon_addr = state.lock().map_err(|e| e.to_string())?.rpc.daemon_address();
-    let daemon_height = rpc_manager::get_daemon_block_height(&daemon_addr);
+    let daemon_height = tokio::task::spawn_blocking(move || rpc_manager::get_daemon_block_height(&daemon_addr))
+        .await
+        .unwrap_or(0);
     let daemon_reachable = daemon_height > 0;
 
     if let Ok(mut s) = state.lock() {
@@ -1273,6 +1300,36 @@ fn get_public_nodes() -> Vec<String> {
     PUBLIC_NODES.iter().map(|s| s.to_string()).collect()
 }
 
+/// Build an RpcManager from the saved settings on a node that currently answers
+/// (automatic failover when no node is pinned). Blocking: probes nodes over the network.
+/// Also returns the selected node's height (0 if no node answered).
+fn live_rpc_manager(app: &tauri::AppHandle) -> (RpcManager, u64) {
+    let (config, last_working) = match app.try_state::<Mutex<AppState>>() {
+        Some(st) => match st.lock() {
+            Ok(s) => (s.rpc.config.clone(), s.active_node.clone()),
+            Err(_) => (RpcConfig::default(), None),
+        },
+        None => (RpcConfig::default(), None),
+    };
+    let (config, node, height) = rpc_manager::select_live_node(config, last_working.as_deref());
+    if height > 0 {
+        if let Some(st) = app.try_state::<Mutex<AppState>>() {
+            if let Ok(mut s) = st.lock() { s.active_node = Some(node); }
+        }
+    }
+    (RpcManager::new(config), height)
+}
+
+/// Saved RPC settings plus the node actually in use.
+#[tauri::command]
+fn get_rpc_config(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "config": s.rpc.config,
+        "active_node": s.active_node,
+    }))
+}
+
 /// Check if a monero-wallet-rpc binary can be found.
 #[tauri::command]
 fn detect_rpc_binary(state: tauri::State<'_, Mutex<AppState>>) -> Option<String> {
@@ -1294,12 +1351,27 @@ fn save_rpc_config(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<(), String> {
+    let mut config = config;
+    config.daemon_address = config.manual_node();
+    if let Some(node) = &config.daemon_address {
+        let valid = match node.rsplit_once(':') {
+            Some((host, port)) => !host.is_empty()
+                && !host.contains("://")
+                && !host.contains(char::is_whitespace)
+                && port.parse::<u16>().map(|p| p > 0).unwrap_or(false),
+            None => false,
+        };
+        if !valid {
+            return Err("Invalid node address (expected host:port, e.g. node.example.org:18089).".into());
+        }
+    }
     let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
     let path = data_dir.join("rpc_config.json");
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     // Update live config (takes effect on next start)
     let mut s = state.lock().unwrap();
+    if let Some(node) = config.manual_node() { s.active_node = Some(node); }
     s.rpc = RpcManager::new(config);
     Ok(())
 }
@@ -1500,12 +1572,10 @@ async fn execute_pv_payment(
     let _guard = RpcGuard(rpc_busy);
 
     let wallet_file = wallet_dir.join(&wallet_name);
-    let rpc_config = {
-        let s = state.lock().map_err(|e| e.to_string())?;
-        s.rpc.config.clone()
-    };
-
-    let mut rpc = crate::rpc_manager::RpcManager::new(rpc_config);
+    let app_rpc = app.clone();
+    let (mut rpc, _) = tokio::task::spawn_blocking(move || live_rpc_manager(&app_rpc))
+        .await
+        .map_err(|e| e.to_string())?;
     rpc.start(&wallet_file, &password)
         .map_err(|e| format!("Failed to start RPC: {e}"))?;
 
@@ -1679,9 +1749,10 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
         let wallet_dir2 = wallet_dir.clone();
         let wallet_name2 = wallet_name.clone();
         let pw2 = session_pw.clone();
+        let app_rpc = app.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
+            let (mut mgr, _) = live_rpc_manager(&app_rpc);
             mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
             mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
 
@@ -1910,6 +1981,7 @@ pub fn run() {
                 pending_approvals: std::collections::HashMap::new(),
                 approved_payments: std::collections::HashSet::new(),
                 last_unlock_at: 0,
+                active_node: None,
                 treasurer_mode: false,
             }));
 
@@ -2059,6 +2131,7 @@ pub fn run() {
             delete_subscription,
             set_subscription_status,
             get_public_nodes,
+            get_rpc_config,
             detect_rpc_binary,
             get_rpc_status,
             save_rpc_config,
