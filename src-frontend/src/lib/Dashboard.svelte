@@ -126,6 +126,7 @@
   let showAlertsOverlay = false;
   // Semi-auto mode: pending confirmation modal
   let pendingPaymentModal = null; // { sub_id, sub_label, amount_xmr, schedule, payments_sent, last_payment_at }
+  let _pendingQueue = [];        // semi-auto payments waiting for the popup
   // Upper bound of a standard Monero transfer fee, so "enough balance" is not off by the fee.
   const FEE_MARGIN_XMR = 0.0001;
   $: pendingShortfall = pendingPaymentModal && balanceXmr !== null
@@ -211,6 +212,21 @@
            setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
 
   // Tauri shell.open for external links (safe fallback for browser dev)
+  // Moves the due date in the DB (postpone 1 h, or skip to the next occurrence);
+  // simply closing the popup would let the scheduler re-queue it a minute later.
+  async function declinePending(skip) {
+    const subId = pendingPaymentModal?.sub_id;
+    pendingPaymentModal = null;
+    _pendingQueue = _pendingQueue.filter(q => q.sub_id !== subId);
+    if (!subId) return;
+    try {
+      const next = await tauriInvoke("reject_payment", { subId, skip });
+      if (next) subscriptions = subscriptions.map(s => s.id === subId ? { ...s, next_payment_at: next } : s);
+    } catch (e) {
+      logWarn("Scheduler", `reject_payment failed: ${e}`);
+    }
+  }
+
   async function goToGuide(sectionId) {
     page = "howto";
     await tick();
@@ -1129,11 +1145,14 @@
 
     // Semi-auto: show modal when payment needs user approval
     // Queue the payload and show only when sync is done (balance known)
-    let _pendingQueue = [];
+    // The scheduler re-emits every minute while a payment is due: keep one entry per subscription.
     await listenWhileMounted("payment-pending", (ev) => {
       const p = ev.payload || {};
-      logInfo("Scheduler", `[Semi-auto] Payment queued for approval: sub ${String(p.sub_id ?? "").slice(0, 8)}`);
-      _pendingQueue.push(p);
+      if (!p.sub_id || pendingPaymentModal?.sub_id === p.sub_id) return;
+      if (!_pendingQueue.some(q => q.sub_id === p.sub_id)) {
+        logInfo("Scheduler", `[Semi-auto] Payment queued for approval: sub ${String(p.sub_id).slice(0, 8)}`);
+      }
+      _pendingQueue = [..._pendingQueue.filter(q => q.sub_id !== p.sub_id), p];
     });
 
     // Check every 3s if we should display a queued pending payment
@@ -1397,24 +1416,22 @@
           </div>
         </div>
         <div style="display:flex;gap:10px;justify-content:center">
-          <button class="btn-ghost" style="flex:1;padding:10px"
-            on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; }}>
-            Reporter
+          <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => declinePending(false)}>
+            Reporter d'1 h
           </button>
           <button class="btn-primary" style="flex:1;padding:10px;font-size:14px"
-            on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; page = "receive"; }}>
+            on:click={() => { declinePending(false); page = "receive"; }}>
             Recharger le portefeuille
           </button>
         </div>
         <button class="btn-inline" style="margin-top:12px;font-size:11.5px"
-          on:click={() => { pendingPaymentModal = null; goToGuide("get-monero"); }}>
+          on:click={() => { declinePending(false); goToGuide("get-monero"); }}>
           Comment obtenir du Monero ?
         </button>
       {:else}
       <div style="display:flex;gap:10px;justify-content:center">
-        <button class="btn-ghost" style="flex:1;padding:10px"
-          on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; }}>
-          Passer / Reporter
+        <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => declinePending(false)}>
+          Reporter d'1 h
         </button>
         <button class="btn-primary" style="flex:1;padding:10px;font-size:15px"
           on:click={async () => {
@@ -1426,6 +1443,9 @@
           Confirmer l'envoi
         </button>
       </div>
+      <button class="btn-inline" style="margin-top:12px;font-size:11.5px" on:click={() => declinePending(true)}>
+        Passer cette échéance (pas d'envoi, prochaine selon la cadence)
+      </button>
       {/if}
     </div>
   </div>

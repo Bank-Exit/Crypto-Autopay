@@ -79,7 +79,7 @@
       const { listen } = await import("@tauri-apps/api/event");
       listen("autopay://open-subscription", async (event) => {
         const url = event.payload;
-        console.log("[DeepLink] Event received, appState=", appState, url);
+        console.log("[DeepLink] Event received, appState=", appState);
         // Reset to null first so Svelte triggers reactivity even for same URL
         pendingDeepLinkCode = null;
         await tick();

@@ -303,6 +303,12 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 **Frontend**: Shows confirmation modal (only when `balanceLoading = false` AND `balanceXmr !== null` AND not offline). User confirms → `approve_payment()` → `approved_payments` set → next scheduler cycle sends.
 
+**Decline**: "Reporter d'1 h" moves `next_payment_at` to now + 60 min; "Passer cette échéance" moves it to the next occurrence of the schedule (no payment). Both go through `reject_payment`, which updates the DB — otherwise the scheduler re-queues the payment on the next 60s tick.
+
+**Low balance**: if balance < amount + 0.0001 XMR (fee margin), the popup shows the shortfall and offers to reload the wallet instead of confirming.
+
+**Lock**: the scheduler takes `rpc_busy` before sending (skips the cycle if busy), so it can no longer kill the wallet-rpc of a running refresh.
+
 **Important**: The approval only lives in memory for the current session. If the app restarts, the pending approval is re-shown at next scheduler cycle.
 
 ---

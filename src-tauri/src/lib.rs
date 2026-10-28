@@ -495,6 +495,12 @@ async fn send_payment(
             return Err(format!("open_wallet: {}", err));
         }
 
+        if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
+        }), 600) {
+            log::warn!("[Payment] refresh before transfer failed (continuing): {}", e);
+        }
+
         let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"tx","method":"transfer",
             "params":{
@@ -662,13 +668,25 @@ async fn refresh_balance(
             log::warn!("[refresh_balance] open_wallet error: {}", err);
         }
 
+        // wallet-rpc starts its own background refresh right after open_wallet and then
+        // answers nothing until it is done, so get_height often times out here.
+        // Fall back to the height saved after the previous successful sync.
+        let synced_height_file = wallet_dir.join(format!("{}.synced_height", wallet_name));
         let height_body = serde_json::json!({ "jsonrpc":"2.0","id":"h","method":"get_height","params":{} });
-        let start_height = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &height_body, 10)
-            .ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(0);
+        let start_height = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &height_body, 3)
+            .ok().and_then(|r| r["result"]["height"].as_u64())
+            .filter(|h| *h > 0)
+            .or_else(|| std::fs::read_to_string(&synced_height_file).ok()
+                .and_then(|s| s.trim().parse::<u64>().ok()));
+
         // wallet-rpc does not answer any call while `refresh` runs, so only the gap
         // to catch up is known up front; the UI derives an estimate from it.
-        let blocks_behind = daemon_height_before.saturating_sub(start_height);
-        log::info!("[refresh_balance] Calling wallet refresh ({} blocks behind)…", blocks_behind);
+        let blocks_behind = match start_height {
+            Some(h) if daemon_height_before > 0 => Some(daemon_height_before.saturating_sub(h)),
+            _ => None,
+        };
+        log::info!("[refresh_balance] Calling wallet refresh ({} blocks behind)…",
+            blocks_behind.map(|b| b.to_string()).unwrap_or_else(|| "unknown".into()));
         progress("syncing", serde_json::json!({ "blocks_behind": blocks_behind }));
 
         // A wallet that was closed for days can need several minutes on a remote node.
@@ -689,6 +707,11 @@ async fn refresh_balance(
         let wallet_height = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"h2","method":"get_height","params":{}
         })).ok().and_then(|r| r["result"]["height"].as_u64());
+        if refresh_resp.is_ok() {
+            if let Some(h) = wallet_height {
+                let _ = std::fs::write(&synced_height_file, h.to_string());
+            }
+        }
 
         let (total, _unlocked) = mgr.rpc_get_balance()?;
         let atomic = (total * 1e12) as u64;
@@ -1011,16 +1034,39 @@ async fn approve_payment(
     Ok(())
 }
 
-/// Reject a queued payment (semi-auto mode). Defers it to next occurrence.
+/// Delay applied by "Reporter" in the semi-auto popup.
+const POSTPONE_MINUTES: i64 = 60;
+
+/// Decline a queued payment (semi-auto mode) and move its due date, otherwise the
+/// scheduler would queue it again on the next 60s tick.
+/// `skip = false`: postpone by POSTPONE_MINUTES. `skip = true`: drop this occurrence
+/// and wait for the next one of the schedule. Returns the new due date (RFC 3339).
 #[tauri::command]
 async fn reject_payment(
     sub_id: String,
+    skip: Option<bool>,
     app_state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<(), String> {
-    let mut s = app_state.lock().map_err(|e| e.to_string())?;
-    s.pending_approvals.remove(&sub_id);
-    log::info!("[PaymentMode] Payment rejected by user for sub {}", &sub_id[..8.min(sub_id.len())]);
-    Ok(())
+    db_state: tauri::State<'_, Mutex<Database>>,
+) -> Result<String, String> {
+    app_state.lock().map_err(|e| e.to_string())?.pending_approvals.remove(&sub_id);
+
+    let db = db_state.lock().map_err(|e| e.to_string())?;
+    let sub = db.list_subscriptions().map_err(|e| e.to_string())?
+        .into_iter().find(|s| s.id == sub_id)
+        .ok_or("Subscription not found")?;
+    let now = chrono::Utc::now();
+    let new_next = if skip.unwrap_or(false) {
+        let period = chrono::Duration::minutes(cron_period_minutes(&sub.schedule).max(1));
+        let mut next = sub.next_payment_at.unwrap_or(now) + period;
+        while next <= now { next = next + period; }
+        next
+    } else {
+        now + chrono::Duration::minutes(POSTPONE_MINUTES)
+    };
+    db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent).map_err(|e| e.to_string())?;
+    log::info!("[PaymentMode] Payment {} by user for sub {}",
+        if skip.unwrap_or(false) { "skipped" } else { "postponed" }, &sub_id[..8.min(sub_id.len())]);
+    Ok(new_next.to_rfc3339())
 }
 
 /// Get all payments currently pending user approval.
@@ -1738,7 +1784,19 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             continue; // skip to next sub — scheduler will retry next cycle
         }
 
-        log::info!("[Scheduler] Sending payment for sub {}", sub_id);
+        // Without the lock, start_for_dir would kill the wallet-rpc of a running refresh (or payment).
+        let rpc_busy = match app.try_state::<Mutex<AppState>>()
+            .and_then(|st| st.lock().ok().map(|s| Arc::clone(&s.rpc_busy)))
+        {
+            Some(b) => b,
+            None => return,
+        };
+        if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            log::info!("[Scheduler] RPC busy — payment for sub {} retried next cycle", &sub_id[..8.min(sub_id.len())]);
+            return;
+        }
+
+        log::info!("[Scheduler] Sending payment for sub {}", &sub_id[..8.min(sub_id.len())]);
 
         let wallet_dir2 = wallet_dir.clone();
         let wallet_name2 = wallet_name.clone();
@@ -1746,6 +1804,10 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
         let app_rpc = app.clone();
 
         let result = tokio::task::spawn_blocking(move || {
+            struct RpcGuard(Arc<AtomicBool>);
+            impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+            let _guard = RpcGuard(rpc_busy);
+
             let (mut mgr, _) = live_rpc_manager(&app_rpc);
             mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
             mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
@@ -1758,14 +1820,22 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 return Err(format!("open_wallet: {}", err));
             }
 
+            // Spend from an up-to-date wallet, otherwise stale outputs make the transfer fail.
+            if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
+            }), 600) {
+                log::warn!("[Scheduler] refresh before transfer failed (continuing): {}", e);
+            }
+
             let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
                 "jsonrpc":"2.0","id":"tx","method":"transfer",
                 "params":{
                     "destinations":[{"amount": amount_pico, "address": dest}],
                     "account_index": 0, "priority": 1
                 }
-            })).map_err(|e| e.to_string())?;
+            })).map_err(|e| e.to_string());
             mgr.stop();
+            let resp = resp?;
 
             if let Some(err) = resp.get("error") {
                 let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("?");
@@ -1776,7 +1846,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
 
         match result {
             Ok(Ok(tx_hash)) => {
-                log::info!("[Scheduler] Payment sent for sub {} (tx={})", sub_id, tx_hash);
+                log::info!("[Scheduler] Payment sent for sub {} (tx={}…)", &sub_id[..8.min(sub_id.len())], &tx_hash[..8.min(tx_hash.len())]);
                 // Update last_payment_sent_at in AppState
                 if let Some(state) = app.try_state::<Mutex<AppState>>() {
                     if let Ok(mut s) = state.lock() {
@@ -1899,7 +1969,7 @@ pub fn run() {
                 // Forward any crypto-autopay: URL from its args to the running instance
                 for arg in &args {
                     if arg.starts_with("crypto-autopay:") {
-                        log::info!("Single-instance redirect: {}", arg);
+                        log::info!("Single-instance redirect: deep link forwarded");
                         // Store in state (in case frontend polls for it)
                         if let Some(state) = app.try_state::<Mutex<AppState>>() {
                             if let Ok(mut s) = state.lock() {
@@ -2021,7 +2091,7 @@ pub fn run() {
                     raw.to_string()
                 };
                 if url.starts_with("crypto-autopay:") {
-                    log::info!("Deep link received: {}", url);
+                    log::info!("Deep link received");
                     // Store so the frontend can poll for it after unlock
                     if let Some(state) = handle2.try_state::<Mutex<AppState>>() {
                         if let Ok(mut s) = state.lock() {
