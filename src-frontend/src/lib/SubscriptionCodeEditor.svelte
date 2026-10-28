@@ -15,6 +15,8 @@
 -->
 <script>
   import { createEventDispatcher, onMount } from "svelte";
+  import FiatOptInPopup from "./FiatOptInPopup.svelte";
+  import { fiatOptIn, fetchXmrRate, FIAT_SYMBOLS } from "./price.js";
   import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED, scheduleToHuman, splitYearStep, withYearStep } from "./autopay-encode.js";
 
   const dispatch = createEventDispatcher();
@@ -223,35 +225,37 @@
 
   let generatedPayloadForShare = null;
 
-  // ---- Fiat conversion (privacy-opt-in) ----
-  let fiatEnabled = false;
-  let fiatValue = null;
+  // ---- Fiat conversion (privacy opt-in, see price.js) ----
+  // XMR amount -> shown in EUR; fiat amount -> shown in XMR.
+  let fiatText = null;
   let fiatLoading = false;
   let showFiatWarning = false;
   let fiatError = null;
+  let fiatRequest = 0;
 
-  function requestFiatEnable() { showFiatWarning = true; }
-  async function confirmFiatEnable() {
+  function confirmFiatEnable() {
     showFiatWarning = false;
-    fiatEnabled = true;
-    await fetchFiatRate();
+    fiatOptIn.set(true);
   }
-  async function fetchFiatRate() {
-    if (!payload.amount || !fiatEnabled) return;
-    fiatLoading = true; fiatError = null; fiatValue = null;
+  async function updateFiat(amount, currency) {
+    const n = parseFloat(amount);
+    const id = ++fiatRequest;
+    fiatText = null; fiatError = null;
+    if (!(n > 0)) return;
+    const isXmr = !currency || currency === "XMR";
+    const fiat = isXmr ? "EUR" : currency;
+    fiatLoading = true;
     try {
-      const res = await fetch(`https://libremonero.com/api/price?from=${payload.currency || "XMR"}&to=EUR`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const rate = data.price || data.rate || data.EUR;
-      if (rate) fiatValue = parseFloat(payload.amount) * parseFloat(rate);
-      else throw new Error("No rate in response");
-    } catch (e) {
-      fiatError = l("Erreur API", "API error"); fiatValue = null;
-      console.warn("[SCE] Fiat rate fetch failed:", e);
-    } finally { fiatLoading = false; }
+      const rate = await fetchXmrRate(fiat);
+      if (id !== fiatRequest) return;
+      fiatText = isXmr ? `${(n * rate).toFixed(2)} ${FIAT_SYMBOLS.EUR}` : `${(n / rate).toFixed(6)} XMR`;
+    } catch {
+      if (id === fiatRequest) fiatError = l("Cours indisponible", "Rate unavailable");
+    } finally {
+      if (id === fiatRequest) fiatLoading = false;
+    }
   }
-  $: if (fiatEnabled && payload.amount) { fetchFiatRate(); }
+  $: if ($fiatOptIn) updateFiat(payload.amount, payload.currency);
 
   // ---- Pre-import duplicate popup ----
   const DUP_SECONDS = 20;
@@ -390,14 +394,10 @@
     "Currency": { de: "Währung", es: "Moneda" },
     "Fiat equivalent": { de: "Fiat-Gegenwert", es: "Equivalente fiat" },
     "Enable (⚠ privacy)": { de: "Aktivieren (⚠ Privatsphäre)", es: "Activar (⚠ privacidad)" },
-    "Enable fiat conversion": { de: "Fiat-Umrechnung aktivieren", es: "Activar la conversión fiat" },
-    "The LibreMonero.com API will be used to fetch the current rate. It is a volunteer service that guarantees anonymity and keeps no logs.": { de: "Die API von LibreMonero.com wird verwendet, um den aktuellen Kurs abzurufen. Es ist ein ehrenamtlicher Dienst, der Anonymität garantiert und keine Protokolle speichert.", es: "Se usará la API de LibreMonero.com para obtener la cotización actual. Es un servicio voluntario que garantiza el anonimato y no guarda registros." },
-    "For maximum anonymity, it is recommended to leave this field disabled.": { de: "Für maximale Anonymität wird empfohlen, dieses Feld deaktiviert zu lassen.", es: "Para un anonimato máximo, se recomienda dejar este campo desactivado." },
-    "API error": { de: "API-Fehler", es: "Error de la API" },
-    "Enable": { de: "Aktivieren", es: "Activar" },
     "Cancel": { de: "Abbrechen", es: "Cancelar" },
     "Frequency": { de: "Häufigkeit", es: "Frecuencia" },
     "Every": { de: "Alle", es: "Cada" },
+    "Rate unavailable": { de: "Kurs nicht verfügbar", es: "Cambio no disponible" },
     "Multi-year": { de: "Mehrjährig", es: "Plurianual" },
     "years": { de: "Jahre", es: "años" },
     "Cron:": { de: "Cron:", es: "Cron:" },
@@ -556,43 +556,21 @@
 
       <!-- Fiat equivalent (opt-in for privacy) -->
       <div class="fiat-row">
-        <span class="fiat-label">≈ {l("Équivalent fiat", "Fiat equivalent")} (€)</span>
-        {#if !fiatEnabled}
-          <button class="btn-ghost btn-xs fiat-enable-btn" type="button" on:click={requestFiatEnable}>
+        <span class="fiat-label">≈ {payload.currency && payload.currency !== "XMR" ? "XMR" : `${l("Équivalent fiat", "Fiat equivalent")} (€)`}</span>
+        {#if !$fiatOptIn}
+          <button class="btn-ghost btn-xs fiat-enable-btn" type="button" on:click={() => showFiatWarning = true}>
             {l("Activer (⚠ privacy)", "Enable (⚠ privacy)")}
           </button>
         {:else if fiatLoading}
           <span class="fiat-value fiat-loading">…</span>
         {:else if fiatError}
           <span class="fiat-error">{fiatError}</span>
-        {:else if fiatValue !== null}
-          <span class="fiat-value">≈ {fiatValue.toFixed(2)} €</span>
+        {:else if fiatText}
+          <span class="fiat-value">≈ {fiatText}</span>
         {/if}
       </div>
       {#if showFiatWarning}
-        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-        <div class="fiat-popup-overlay" on:click={() => showFiatWarning = false}>
-          <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-          <div class="fiat-popup card" on:click|stopPropagation>
-            <p class="fiat-popup-title">⚠ {l("Activation de la conversion fiat", "Enable fiat conversion")}</p>
-            <p class="fiat-popup-body">
-              {l(
-                "L'API LibreMonero.com sera utilisée pour récupérer le cours actuel. C'est un service bénévole qui garantit l'anonymat et ne conserve aucun log.",
-                "The LibreMonero.com API will be used to fetch the current rate. It is a volunteer service that guarantees anonymity and keeps no logs."
-              )}
-            </p>
-            <p class="fiat-popup-body" style="font-style:italic;color:var(--text-muted)">
-              {l(
-                "Pour un anonymat maximal, il est recommandé de laisser ce champ désactivé.",
-                "For maximum anonymity, it is recommended to leave this field disabled."
-              )}
-            </p>
-            <div class="fiat-popup-actions">
-              <button class="btn-primary" type="button" on:click={confirmFiatEnable}>{l("Activer", "Enable")}</button>
-              <button class="btn-ghost" type="button" on:click={() => showFiatWarning = false}>{l("Annuler", "Cancel")}</button>
-            </div>
-          </div>
-        </div>
+        <FiatOptInPopup {lang} on:confirm={confirmFiatEnable} on:cancel={() => showFiatWarning = false} />
       {/if}
 
       <!-- Schedule -->
@@ -968,20 +946,6 @@
   .fiat-loading { font-style: italic; }
   .fiat-error { color: #ef4444; font-size: 11px; }
   .btn-xs { padding: 2px 7px !important; font-size: 11px !important; }
-
-  /* Fiat warning popup */
-  .fiat-popup-overlay {
-    position: fixed; inset: 0; z-index: 300;
-    display: flex; align-items: center; justify-content: center;
-    background: #0005;
-  }
-  .fiat-popup {
-    max-width: 320px; width: 90%; padding: 1.25rem;
-    display: flex; flex-direction: column; gap: 10px;
-  }
-  .fiat-popup-title { font-weight: 700; font-size: 0.95rem; }
-  .fiat-popup-body { font-size: 0.84rem; line-height: 1.5; }
-  .fiat-popup-actions { display: flex; gap: 8px; }
 
   /* HTML button live preview */
   .html-preview {

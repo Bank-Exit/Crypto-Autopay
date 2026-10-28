@@ -192,6 +192,8 @@ export default {
   paymentModeAutoDesc: "Pagos automáticos sin confirmación.",
   walletRefillIn: "Recargar en ~",
   walletMonthlyOut: "gasto/mes",
+  fiatShowButton: "Mostrar en €",
+  fiatUnavailable: "Cambio no disponible",
   historyEncryptedLabel: "Cifrado · {days} días de conservación",
   historyDisabledLabel: "Historial desactivado (privacidad)",
   historyEnabled: "Activado",

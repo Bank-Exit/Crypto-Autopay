@@ -192,6 +192,8 @@ export default {
   paymentModeAutoDesc: "Zahlungen automatisch ohne Bestätigung.",
   walletRefillIn: "Aufladen in ~",
   walletMonthlyOut: "Ausgaben/Monat",
+  fiatShowButton: "In € anzeigen",
+  fiatUnavailable: "Kurs nicht verfügbar",
   historyEncryptedLabel: "Verschlüsselt · {days} Tage Aufbewahrung",
   historyDisabledLabel: "Historie deaktiviert (Privatsphäre)",
   historyEnabled: "Aktiviert",

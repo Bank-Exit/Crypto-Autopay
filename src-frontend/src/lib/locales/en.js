@@ -192,6 +192,8 @@ export default {
   paymentModeAutoDesc: "Payments sent automatically at due date, no confirmation needed.",
   walletRefillIn: "Top up in ~",
   walletMonthlyOut: "spend/month",
+  fiatShowButton: "Show in €",
+  fiatUnavailable: "Rate unavailable",
   historyEncryptedLabel: "Encrypted · {days}-day retention",
   historyDisabledLabel: "History disabled (privacy mode)",
   historyEnabled: "Enabled",

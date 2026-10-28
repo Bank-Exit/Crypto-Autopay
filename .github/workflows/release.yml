@@ -82,32 +82,46 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf \
             libssl-dev \
             pkg-config
 
-      # ── Build Tauri app ───────────────────────
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+      # ── macOS signing (only when the secrets exist) ──
+      # Tauri tries to import APPLE_CERTIFICATE as soon as the variable is defined, even empty,
+      # so it is exported only when set. Without it the app is ad-hoc signed (tauri.conf.json).
+      - name: macOS signing secrets
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS code signing (optional — set in repo secrets)
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Windows code signing (optional)
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              if [ -n "${!v}" ]; then
+                { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
+              fi
+            done
+            echo "Developer ID signing enabled"
+          else
+            echo "No APPLE_CERTIFICATE secret: ad-hoc signing"
+          fi
+
+      # ── Build Tauri app ───────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Crypto AutoPay ${{ github.ref_name }}'
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: 'Crypto AutoPay ${{ github.event.inputs.tag || github.ref_name }}'
           releaseBody: |
-            ## Crypto AutoPay ${{ github.ref_name }}
+            ## Crypto AutoPay ${{ github.event.inputs.tag || github.ref_name }}
 
             ### Téléchargements / Downloads
             | Plateforme | Fichier |

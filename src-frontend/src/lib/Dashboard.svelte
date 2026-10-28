@@ -2,6 +2,8 @@
   import { tick, onMount, onDestroy, createEventDispatcher } from "svelte";
   const dispatch = createEventDispatcher();
   import { t, fmt, currentLang, LANGUAGES } from "./i18n.js";
+  import FiatOptInPopup from "./FiatOptInPopup.svelte";
+  import { fiatOptIn, fetchXmrRate, FIAT_SYMBOLS } from "./price.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
   import { paymentMode } from "./paymentMode.js";
@@ -361,6 +363,16 @@
   export let externalCode = null;
 
   $: colon = $currentLang === "fr" ? " :" : ":";
+
+  // Monthly spend in EUR, only after the privacy opt-in (shared with the code editor).
+  let showFiatPopup = false;
+  let xmrEurRate = null;
+  let fiatRateError = false;
+  async function loadFiatRate() {
+    try { xmrEurRate = await fetchXmrRate("EUR"); fiatRateError = false; }
+    catch { xmrEurRate = null; fiatRateError = true; }
+  }
+  $: if ($fiatOptIn) loadFiatRate();
   let subscriptions = [];
 
   /** Convert a payload from SubscriptionCodeEditor into a subscription row */
@@ -1879,7 +1891,15 @@
       <div class="refill-banner card" class:refill-urgent={refillUrgent}>
         <span class="text-muted">{$t.nextRefillLabel}{colon}</span>
         <strong class:refill-urgent-text={refillUrgent}>{$t.refillIn} {totalRefillText($t)}</strong>
-        <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
+        <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut}{#if $fiatOptIn && xmrEurRate}{` ≈ ${(totalMonthlyOut * xmrEurRate).toFixed(2)} ${FIAT_SYMBOLS.EUR}`}{/if})</span>
+        {#if !$fiatOptIn}
+          <button class="btn-ghost btn-xs refill-fiat-btn" type="button" on:click={() => showFiatPopup = true}>{$t.fiatShowButton}</button>
+        {:else if fiatRateError}
+          <span class="text-muted refill-hint">{$t.fiatUnavailable}</span>
+        {/if}
+        {#if showFiatPopup}
+          <FiatOptInPopup lang={$currentLang} on:confirm={() => { showFiatPopup = false; fiatOptIn.set(true); }} on:cancel={() => showFiatPopup = false} />
+        {/if}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <span class="refill-help-link" role="link" tabindex="0"
           on:click={() => openExternal("https://libre-market.com/m/epicerie/tutorial")}
@@ -3093,6 +3113,7 @@
   }
   .refill-banner { font-size: 12px; opacity: 0.85; flex-wrap: wrap; }
   .refill-hint { font-size: 11px; }
+  .refill-fiat-btn { font-size: 11px; padding: 2px 8px; }
   .refill-help-link {
     margin-left: auto; font-size: 11px;
     color: var(--accent); text-decoration: none; white-space: nowrap;

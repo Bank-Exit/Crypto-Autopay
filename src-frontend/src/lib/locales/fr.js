@@ -192,6 +192,8 @@ export default {
   paymentModeAutoDesc: "Paiements envoyés automatiquement à l'échéance, sans confirmation.",
   walletRefillIn: "À recharger dans ~",
   walletMonthlyOut: "dépenses/mois",
+  fiatShowButton: "Afficher en €",
+  fiatUnavailable: "Cours indisponible",
   historyEncryptedLabel: "Chiffré · {days} jours de rétention",
   historyDisabledLabel: "Historique désactivé (vie privée)",
   historyEnabled: "Activé",

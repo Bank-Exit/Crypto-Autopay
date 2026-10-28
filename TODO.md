@@ -22,7 +22,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **No amount/address in logs**: Already implemented — verify no regression with new code paths (scheduler, sweep, send_payment).
 - [ ] **History encryption key rotation**: The history key is derived from the master password with a random per-install salt (`history.salt`). If the user changes their password, old entries become unreadable. Plan: re-encrypt on password change.
 - [ ] **Encrypt subscriptions.db**: addresses, amounts and schedules are stored in clear (file is 0600). Plan: SQLCipher keyed from the master password, which means opening the DB only after unlock (today `Database` is opened at startup and shared everywhere).
-- [ ] **Price lookup leaks the IP**: the code editor fetches `libremonero.com/api/price` directly. Route through Tor/proxy or make it opt-in.
+- [ ] **Fiat price (LibreMonero only)**: `src-frontend/src/lib/price.js` is a stub until LibreMonero publishes a public price route: set `LIBREMONERO_PRICE_URL`. Dev builds return a mock rate, release builds show "rate unavailable". Opt-in popup warns that the request reveals the IP; consider routing through Tor later.
 - [ ] **Post-quantum consideration**: Current encryption is AES-256-GCM + Argon2id. AES-256 is considered quantum-resistant. For the future: evaluate CRYSTALS-Kyber (ML-KEM) for key encapsulation if a threat model requires it.
 - [ ] **Audit**: Before any public release with real funds, a security audit of `autopay-crypto` crate is strongly recommended.
 
@@ -44,10 +44,9 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 - [ ] **monero-wallet-rpc version pinning**: ship a pinned version with its SHA-256 (verified against binaryFate's signed `hashes.txt`), check `get_version` at startup and refuse/alert on an unknown major version. CI job watching Monero releases + hard-fork dates, run the RPC integration tests against the new binary, release before the fork height.
 - [ ] **App update channel**: Tauri updater with a minisign public key embedded in the binary. Signed manifest fetched from the hardcoded domain, with Tor onion and IPFS mirrors as fallbacks; the signature is mandatory whatever the source. Notification only (no silent install), link to the official repository. Aim for reproducible builds.
-- [ ] **Release workflow manual run**: `workflow_dispatch` ignores its `tag` input (`tagName` uses `github.ref_name`, i.e. the branch name). Use the input when present.
 - [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
-- [ ] **macOS code signing**: Set `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` secrets in GitHub repo settings. Without signing, macOS shows Gatekeeper warning.
-- [ ] **Windows code signing**: Set `TAURI_SIGNING_PRIVATE_KEY` in GitHub secrets. Without signing, Windows Defender flags the installer.
+- [ ] **macOS code signing**: set `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` in the repo secrets (Apple Developer account). Until then builds are ad-hoc signed: users must right-click > Open, or run `xattr -cr`.
+- [ ] **Windows code signing**: needs an Authenticode certificate (OV/EV) and a signing step; without it SmartScreen warns on first launch. Note: `TAURI_SIGNING_PRIVATE_KEY` is the updater key, unrelated.
 - [ ] **Automated tests**: Add integration tests for the payment scheduler (mock monero-wallet-rpc HTTP server). Add unit tests for `recompute_alerts`.
 - [ ] **Clippy clean**: Run `cargo clippy -D warnings` in CI and fix any remaining lint warnings.
 - [ ] **DB migration system**: Currently schema is created fresh if DB doesn't exist. Need versioned migrations for schema updates (e.g. adding `max_payments` column).
