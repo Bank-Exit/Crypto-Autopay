@@ -1,6 +1,6 @@
 [package]
 name = "monero-autopay"
-version = "0.2.0"
+version = "0.2.1"
 description = "Non-custodial recurring Monero payments"
 authors = ["Monero AutoPay Contributors"]
 license = "GPL-3.0"
