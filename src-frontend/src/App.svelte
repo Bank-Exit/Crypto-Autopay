@@ -171,7 +171,6 @@
       on:unlocked={async (e) => {
         const { address, balance, rpcError } = e.detail || {};
         if (rpcError) console.warn("[Unlock] RPC unavailable (offline mode):", rpcError);
-        if (address) console.log("[Unlock] Wallet address:", address.slice(0, 12) + "…");
         appState = "dashboard";
         await checkPendingDeepLink();
       }}

@@ -163,6 +163,7 @@
           <!-- svelte-ignore a11y-autofocus -->
           <input type="password" bind:value={password} placeholder={$t.masterPasswordPlaceholder} autocomplete="new-password" autofocus
             on:keydown={e => e.key === "Enter" && document.querySelector('#onb-confirm-pw')?.focus()} />
+          <span class="pw-hint" class:pw-hint-ok={password.length >= 12}>{$t.passwordMinHint} ({Math.min(password.length, 12)}/12)</span>
         </label>
         <label>
           {$t.confirmPassword}
@@ -531,4 +532,6 @@
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
+  .pw-hint { display: block; font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .pw-hint-ok { color: var(--green); }
 </style>

@@ -57,16 +57,8 @@
   </div>
 
   <div class="hero">
-    <!-- Logo: circular recurrence arrow + A→B payment flow -->
-    <div class="logo-mark" aria-label="Monero AutoPay logo">
-      <svg width="68" height="68" viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M36 8 A28 28 0 1 1 8 36" stroke="var(--accent)" stroke-width="4.5" stroke-linecap="round" fill="none"/>
-        <polyline points="6,24 8,36 20,34" stroke="var(--accent)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-        <circle cx="23" cy="36" r="5.5" fill="var(--accent)" opacity="0.9"/>
-        <circle cx="49" cy="36" r="5.5" fill="var(--accent)" opacity="0.45"/>
-        <line x1="31" y1="36" x2="41" y2="36" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
-        <polyline points="38,32 43,36 38,40" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </svg>
+    <div class="logo-mark">
+      <img src="/logo.png" alt="Monero AutoPay" width="112" height="112" style="border-radius:18px;display:block"/>
     </div>
 
     <!-- Title with clickable network name -->

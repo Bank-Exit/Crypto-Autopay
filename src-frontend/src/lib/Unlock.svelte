@@ -1,5 +1,5 @@
 <script>
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme, toggleTheme } from "./theme.js";
@@ -11,8 +11,34 @@
   let error = "";
   let rpcWarning = null; // non-blocking warning after unlock
   let loading = false;
+
+  // Progressive lockout, enforced by the backend; this only mirrors the countdown.
+  let lockedSecs = 0;
+  let lockTimer = null;
+
+  function startLockout(secs) {
+    clearInterval(lockTimer);
+    lockedSecs = Math.max(0, Number(secs) || 0);
+    if (lockedSecs > 0) {
+      lockTimer = setInterval(() => {
+        lockedSecs = Math.max(0, lockedSecs - 1);
+        if (lockedSecs === 0) clearInterval(lockTimer);
+      }, 1000);
+    }
+  }
+
+  function formatWait(secs) {
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), sec = secs % 60;
+    if (h > 0) return `${h} h ${String(m).padStart(2, "0")} min`;
+    if (m > 0) return `${m} min ${String(sec).padStart(2, "0")} s`;
+    return `${sec} s`;
+  }
+
+  onMount(() => { invoke("unlock_lockout_remaining").then(startLockout).catch(() => {}); });
+  onDestroy(() => clearInterval(lockTimer));
+
   async function unlock() {
-    if (!password) return;
+    if (!password || lockedSecs > 0) return;
     loading = true;
     error = "";
     rpcWarning = null;
@@ -38,7 +64,18 @@
     } catch (e) {
       const msg = typeof e === "string" ? e : String(e);
       logError("Unlock", `unlock_wallet threw: ${msg}`);
-      error = msg.includes("Incorrect") ? $t.unlockWrongPassword : msg;
+      if (msg.startsWith("LOCKED_OUT:")) {
+        startLockout(parseInt(msg.slice("LOCKED_OUT:".length), 10));
+        password = "";
+        error = "";
+      } else if (msg.includes("Incorrect")) {
+        const left = msg.match(/remaining=(\d+)/);
+        error = left && Number(left[1]) <= 2
+          ? `${$t.unlockWrongPassword} ${$t.unlockAttemptsLeft.replace("{n}", left[1])}`
+          : $t.unlockWrongPassword;
+      } else {
+        error = msg;
+      }
       loading = false;
     }
   }
@@ -103,6 +140,7 @@
           placeholder="••••••••••••"
           autocomplete="current-password"
           autofocus
+          disabled={lockedSecs > 0}
         />
         {#if import.meta.env.DEV}
           <!-- Dev bypass: skip password check but still load wallet info -->
@@ -127,7 +165,9 @@
       </div>
     </label>
 
-    {#if error}
+    {#if lockedSecs > 0}
+      <div class="error-msg">{$t.unlockLockedOut.replace("{time}", formatWait(lockedSecs))}</div>
+    {:else if error}
       <div class="error-msg">{error}</div>
     {/if}
 
@@ -147,7 +187,7 @@
       <button
         class="btn-primary btn-full"
         on:click={unlock}
-        disabled={!password || loading}
+        disabled={!password || loading || lockedSecs > 0}
       >
         {#if loading}
           <span class="spinner"></span> {$t.unlockLoading}

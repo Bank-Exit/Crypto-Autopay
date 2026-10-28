@@ -14,6 +14,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Build a command that never flashes a console window on Windows
+/// (wallet-rpc, `where` and `taskkill` are console programs).
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 // ---- Public node list (mainnet, no local node needed) ----
 // Nodes are tried in order; first reachable one is used.
 pub const PUBLIC_NODES: &[&str] = &[
@@ -175,7 +189,7 @@ fn kill_pid(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+        let _ = command("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
     }
 }
 
@@ -199,14 +213,15 @@ impl RpcManager {
         }
         // 3. PATH lookup
         for candidate in &["monero-wallet-rpc", "monero-wallet-rpc.exe"] {
-            if let Ok(output) = Command::new("which").arg(candidate).output() {
+            #[cfg(not(windows))]
+            if let Ok(output) = command("which").arg(candidate).output() {
                 if output.status.success() {
                     let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path_str.is_empty() { return Some(PathBuf::from(path_str)); }
                 }
             }
-            // Windows-style where
-            if let Ok(output) = Command::new("where").arg(candidate).output() {
+            #[cfg(windows)]
+            if let Ok(output) = command("where").arg(candidate).output() {
                 if output.status.success() {
                     let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path_str.is_empty() { return Some(PathBuf::from(path_str.lines().next().unwrap_or(""))); }
@@ -252,8 +267,8 @@ impl RpcManager {
                 b
             }
             None => {
-                let msg = "monero-wallet-rpc not found in PATH and no custom path configured. \
-                           Install the Monero CLI tools or set the binary path in Settings.";
+                let msg = "RPC_BINARY_MISSING: monero-wallet-rpc not found (bundled copy missing, \
+                           not in PATH, no custom path configured).";
                 log::error!("[RPC] {}", msg);
                 return Err(msg.to_string());
             }
@@ -310,7 +325,7 @@ impl RpcManager {
         log::info!("[RPC] Spawning: {:?} {:?}", binary, args);
         self.status = RpcStatus::Starting;
 
-        let child = Command::new(&binary)
+        let child = command(&binary)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

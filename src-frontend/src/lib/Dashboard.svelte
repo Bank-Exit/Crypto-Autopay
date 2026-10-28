@@ -200,6 +200,7 @@
         if (num !== null && num < 1) return tObj.alertBalanceLowSoon;
         return (tObj.alertBalanceLow).replace('{n}', num ?? '?').replace('{t}', thresh);
       case 'BALANCE_EMPTY': return tObj.alertBalanceEmpty;
+      case 'RPC_BINARY_MISSING': return tObj.alertRpcBinaryMissing;
       case 'CANARY_EXPIRED': {
         const label = subLabelForAlert(alert);
         return (tObj.alertCanaryExpired).replace('{label}', label);
@@ -678,8 +679,6 @@
     // The share view is displayed inside the create-code page — nothing to close
   }
 
-  let trayStatus = "green";
-
   // ---- RPC settings state ----
   let rpcStatus = "stopped";
   let rpcStatusLabel = "";
@@ -753,6 +752,23 @@
   // Observed throughput of wallet-rpc on a remote node (~35-50 blocks/s), kept conservative.
   const SYNC_BLOCKS_PER_SEC = 30;
   let isOffline = false;          // true when the last completed refresh could not reach the Monero node
+
+  // Sidebar health dot: green only when the RPC is confirmed working and nothing is pending.
+  let showRpcBinaryPopup = false;
+  let rpcBinaryPopupShown = false;
+  $: rpcDiag = rpcError ? rpcDiagnosis(rpcError, $t) : null;
+  $: if (rpcDiag?.binaryMissing && !rpcBinaryPopupShown) { rpcBinaryPopupShown = true; showRpcBinaryPopup = true; }
+  $: hasRedAlert = activeAlerts.some(a => a.level === 'Red');
+  $: hasOrangeAlert = activeAlerts.some(a => a.level === 'Orange');
+  $: healthLevel = (hasRedAlert || rpcDiag?.level === 'error') ? 'red'
+    : (hasOrangeAlert || rpcDiag || isOffline) ? 'orange'
+    : rpcOk === true ? 'green' : 'grey';
+
+  function openHealthDetails() {
+    if (rpcDiag?.binaryMissing) showRpcBinaryPopup = true;
+    else if (activeAlerts.length > 0) showAlertsOverlay = true;
+    else page = "home";
+  }
   let busyRetryTimer = null;
 
   // onMount's callback is async, so a returned cleanup function would be ignored by Svelte:
@@ -967,9 +983,9 @@
         actionLabel: tObj.diagSeedAction,
       };
     }
-    if (err.includes("not found") || err.includes("PATH") || err.includes("binary")) {
+    if (err.startsWith("RPC_BINARY_MISSING") || err.includes("not found") || err.includes("PATH") || err.includes("binary")) {
       return {
-        icon: "🔴", level: "error",
+        icon: "🔴", level: "error", binaryMissing: true,
         title: tObj.diagBinaryTitle,
         detail: tObj.diagBinaryDetail,
         action: "settings",
@@ -1399,7 +1415,7 @@
     if (notifSettings.lowBalance)    enabled.push("BALANCE_LOW", "BALANCE_EMPTY");
     if (notifSettings.canary)        enabled.push("CANARY_EXPIRED", "CANARY_UNREACHABLE");
     if (notifSettings.paymentFailed) enabled.push("PAYMENT_FAILED", "PAYMENT_OVERDUE_SOFT", "PAYMENT_OVERDUE_HARD");
-    enabled.push("OUTPUTS_LOCKED", "WALLET_NOT_SYNCED"); // always enabled
+    enabled.push("OUTPUTS_LOCKED", "WALLET_NOT_SYNCED", "RPC_BINARY_MISSING"); // always enabled
     await tauriInvoke("set_alert_config", {
       balanceLowThresholdDays: notifSettings.lowBalanceThresholdDays,
       enabledAlerts: enabled,
@@ -1596,6 +1612,33 @@
   </div>
 {/if}
 
+<!-- Monero engine missing: explain the blocker and how to fix it -->
+{#if showRpcBinaryPopup}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showRpcBinaryPopup = false} role="dialog" aria-modal="true">
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-panel" on:click|stopPropagation role="document" style="max-width:540px">
+      <div class="modal-header">
+        <h2 class="modal-title">🔴 {$t.rpcMissingTitle}</h2>
+        <button class="modal-close" on:click={() => showRpcBinaryPopup = false} aria-label={$t.alertOverlayClose}>✕</button>
+      </div>
+      <div class="modal-body rpc-missing-body">
+        <p>{$t.rpcMissingIntro}</p>
+        <ol>
+          <li><strong>{$t.rpcMissingAvTitle}</strong><br/>{$t.rpcMissingAvDetail}</li>
+          <li><strong>{$t.rpcMissingReinstallTitle}</strong><br/>{$t.rpcMissingReinstallDetail}</li>
+          <li><strong>{$t.rpcMissingManualTitle}</strong><br/>{$t.rpcMissingManualDetail}</li>
+        </ol>
+        <div class="rpc-missing-actions">
+          <a class="btn-ghost" href="https://www.getmonero.org/downloads/#cli" target="_blank">{$t.rpcDownload} ↗</a>
+          <button class="btn-ghost" on:click={() => { showRpcBinaryPopup = false; page = "settings"; }}>⚙️ {$t.diagBinaryAction}</button>
+          <button class="btn-primary" on:click={() => { showRpcBinaryPopup = false; tauriInvoke('lock_wallet').finally(() => dispatch('lock')); }}>↻ {$t.rpcMissingRetry}</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- Alerts detail overlay -->
 {#if showAlertsOverlay}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
@@ -1670,18 +1713,22 @@
         <div>
           <div class="sidebar-appname">Monero AutoPay</div>
           <div class="tray-row">
-            <span class="status-dot {activeAlerts.some(a => a.level === 'Red') ? 'red' : activeAlerts.some(a => a.level === 'Orange') ? 'orange' : trayStatus}"></span>
+            <span class="status-dot {healthLevel}"></span>
             {#if activeAlerts.length > 0}
               <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-              <span class="alert-badge" class:badge-red={activeAlerts.some(a => a.level === 'Red')} class:badge-orange={!activeAlerts.some(a => a.level === 'Red')}
+              <span class="alert-badge" class:badge-red={hasRedAlert} class:badge-orange={!hasRedAlert}
                 style="cursor:pointer" on:click={() => showAlertsOverlay = true}>
                 {activeAlerts.length}
               </span>
-              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-              <span class="tray-label" style="color:{activeAlerts.some(a=>a.level==='Red') ? '#ef4444' : '#f97316'};cursor:pointer"
-                on:click={() => showAlertsOverlay = true}>{activeAlerts.some(a => a.level === 'Red') ? $t.trayCritical : $t.trayWarning}</span>
-            {:else}
+            {/if}
+            {#if healthLevel === 'green'}
               <span class="tray-label">OK</span>
+            {:else if healthLevel === 'grey'}
+              <span class="tray-label">{$t.trayChecking}</span>
+            {:else}
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <span class="tray-label" style="color:{healthLevel === 'red' ? '#ef4444' : '#f97316'};cursor:pointer"
+                on:click={openHealthDetails}>{healthLevel === 'red' ? $t.trayCritical : $t.trayWarning}</span>
             {/if}
           </div>
           <div class="tray-row mode-tray">
@@ -1828,7 +1875,9 @@
               <div class="rpc-diag-title">{diag.icon} {diag.title}</div>
               <div class="rpc-diag-detail">{diag.detail}</div>
               <div class="rpc-diag-actions">
-                {#if diag.action === "settings"}
+                {#if diag.binaryMissing}
+                  <button class="rpc-diag-btn" on:click={() => showRpcBinaryPopup = true}>{$t.rpcMissingHowTo}</button>
+                {:else if diag.action === "settings"}
                   <button class="rpc-diag-btn" on:click={() => page = "settings"}>⚙️ {diag.actionLabel}</button>
                 {:else if diag.action === "retry"}
                   <button class="rpc-diag-btn" on:click={refreshBalance} disabled={balanceLoading}>↻ {diag.actionLabel}</button>
@@ -2554,6 +2603,9 @@
           {/if}
         {:else}
           <div class="balance-hint">{$t.receiveNoAddress}</div>
+          {#if rpcDiag?.binaryMissing}
+            <button class="btn-inline" on:click={() => showRpcBinaryPopup = true}>{$t.rpcMissingHowTo}</button>
+          {/if}
         {/if}
       </div>
 
@@ -3419,4 +3471,8 @@
   }
   .modal-close:hover { background: var(--border); color: var(--text); }
   .modal-body { padding: 16px 20px 20px; }
+  .rpc-missing-body { padding:16px; display:flex; flex-direction:column; gap:12px; font-size:14px; line-height:1.5; }
+  .rpc-missing-body ol { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
+  .rpc-missing-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  .rpc-missing-actions a { text-decoration:none; }
 </style>

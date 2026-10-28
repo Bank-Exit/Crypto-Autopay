@@ -34,6 +34,7 @@ use autopay_core::models::{Subscription, SubscriptionStatus};
 
 mod rpc_manager;
 mod payment_policy;
+mod unlock_guard;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -201,6 +202,13 @@ async fn create_wallet(
 /// - Returns Err ONLY if the password is wrong (or vault missing).
 /// - Returns Ok(UnlockResult) in all other cases (even if RPC fails).
 ///   rpc_error / seed_invalid in the result indicate degraded mode.
+/// Seconds before the unlock screen accepts a new attempt (0 = now).
+#[tauri::command]
+fn unlock_lockout_remaining(state: tauri::State<'_, Mutex<AppState>>) -> Result<i64, String> {
+    let vault_path = state.lock().map_err(|e| e.to_string())?.vault_path.clone();
+    Ok(unlock_guard::UnlockGuard::load(&vault_path).remaining_secs(chrono::Utc::now().timestamp()))
+}
+
 #[tauri::command]
 async fn unlock_wallet(
     password: String,
@@ -218,9 +226,29 @@ async fn unlock_wallet(
     let encrypted: EncryptedSeed = serde_json::from_str(&vault_json)
         .map_err(|e| format!("Invalid vault file: {e}"))?;
 
+    let now = chrono::Utc::now().timestamp();
+    let mut guard = unlock_guard::UnlockGuard::load(&vault_path);
+    let wait = guard.remaining_secs(now);
+    if wait > 0 {
+        return Err(format!("LOCKED_OUT:{wait}"));
+    }
+
     // Decrypt — ONLY step that can return Err (wrong password)
-    let seed = SeedVault::decrypt(&encrypted, &password)
-        .map_err(|_| "Incorrect password.".to_string())?;
+    let seed = match SeedVault::decrypt(&encrypted, &password) {
+        Ok(seed) => {
+            guard.record_success();
+            seed
+        }
+        Err(_) => {
+            let wait = guard.record_failure(now);
+            log::warn!("[Unlock] Wrong password (lockout: {}s)", wait);
+            return Err(if wait > 0 {
+                format!("LOCKED_OUT:{wait}")
+            } else {
+                format!("Incorrect password.;remaining={}", guard.attempts_before_lockout())
+            });
+        }
+    };
 
     log::info!("[Unlock] Vault decrypted successfully.");
 
@@ -418,6 +446,8 @@ async fn unlock_wallet(
     s.wallet_file_path = wallet_file_path.clone();
 
     log::info!("[Unlock] Done. rpc_connected={}, seed_invalid={}", s.rpc_connected, seed_invalid);
+    drop(s);
+    refresh_alerts_and_tray(&app_handle);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
 }
 
@@ -637,15 +667,16 @@ async fn refresh_balance(
     state: tauri::State<'_, Mutex<AppState>>,
     app_handle: tauri::AppHandle,
 ) -> Result<BalanceResponse, String> {
-    let (wallet_name, wallet_dir, password, rpc_busy) = {
+    let (wallet_name, wallet_dir, password, rpc_busy, need_address) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Locked".into()); }
+        let need_address = s.wallet_address.is_none();
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
         let pw = s.session_password.clone().ok_or("No session")?;
         let busy = Arc::clone(&s.rpc_busy);
-        (wn, wd, pw, busy)
+        (wn, wd, pw, busy, need_address)
     };
 
     // If a payment is in progress, skip this refresh rather than crashing the payment
@@ -731,21 +762,39 @@ async fn refresh_balance(
         let (total, _unlocked) = mgr.rpc_get_balance()?;
         let atomic = (total * 1e12) as u64;
         log::info!("[refresh_balance] Balance fetched");
+
+        // The address is normally read at unlock; recover it if the RPC was unavailable then.
+        let address = if need_address {
+            let addr = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+                "jsonrpc":"2.0","id":"addr","method":"get_address","params":{"account_index":0}
+            })).ok()
+                .and_then(|r| r["result"]["address"].as_str().map(str::to_string))
+                .filter(|a| !a.is_empty());
+            if let Some(a) = &addr {
+                let _ = std::fs::write(wallet_dir.join(format!("{}.address", wallet_name)), a);
+                log::info!("[refresh_balance] Address recovered and cached");
+            }
+            addr
+        } else {
+            None
+        };
+
         let node = mgr.daemon_address();
         mgr.stop();
-        Ok::<(f64, u64, Option<u64>, String, u64), String>((total, atomic, wallet_height, node, daemon_height_before))
+        Ok::<_, String>((total, atomic, wallet_height, node, daemon_height_before, address))
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
 
-    let (xmr, atomic, wallet_height, daemon_addr, daemon_height_before) = match rpc_result {
+    let (xmr, atomic, wallet_height, daemon_addr, daemon_height_before, address) = match rpc_result {
         Ok(v) => v,
         Err(e) => {
             if let Ok(mut s) = state.lock() {
                 s.rpc_connected = false;
                 s.rpc_last_error = Some(e.clone());
             }
+            refresh_alerts_and_tray(&app_handle);
             return Err(e);
         }
     };
@@ -764,6 +813,7 @@ async fn refresh_balance(
         s.balance_atomic = atomic;
         s.rpc_connected = true;
         s.rpc_last_error = None;
+        if address.is_some() { s.wallet_address = address; }
         if let Some(h) = wallet_height { s.last_wallet_height = h; }
         if daemon_reachable {
             s.last_daemon_height = daemon_height;
@@ -796,6 +846,23 @@ async fn refresh_balance(
 async fn get_alerts(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<AppAlert>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     Ok(s.alerts.clone())
+}
+
+/// Recompute alerts from the current state and update the tray icon accordingly.
+fn refresh_alerts_and_tray(app_handle: &tauri::AppHandle) {
+    if let (Some(state_rc), Some(db_rc)) = (
+        app_handle.try_state::<Mutex<AppState>>(),
+        app_handle.try_state::<Mutex<Database>>(),
+    ) {
+        if let (Ok(mut s), Ok(db)) = (state_rc.lock(), db_rc.lock()) {
+            if let Ok(subs) = db.list_subscriptions() {
+                let worst = recompute_alerts(&mut s, &subs, chrono::Utc::now().timestamp());
+                let count = s.alerts.len();
+                drop(s);
+                update_tray_icon(app_handle, worst, count);
+            }
+        }
+    }
 }
 
 /// Recompute all alerts based on current state and subscriptions.
@@ -949,6 +1016,17 @@ fn recompute_alerts(
                 });
             }
         }
+    }
+
+    // RED: the Monero engine cannot start at all, nothing can be paid.
+    if state.rpc_last_error.as_deref().is_some_and(|e| e.starts_with("RPC_BINARY_MISSING")) {
+        alerts.push(AppAlert {
+            level: AlertLevel::Red,
+            kind: "RPC_BINARY_MISSING".into(),
+            sub_id: None,
+            message: "monero-wallet-rpc not found".into(),
+            created_at: now_ts,
+        });
     }
 
     state.alerts = alerts;
@@ -2458,6 +2536,7 @@ pub fn run() {
             check_wallet_exists,
             create_wallet,
             unlock_wallet,
+            unlock_lockout_remaining,
             get_wallet_info,
             get_sync_info,
             get_alerts,
