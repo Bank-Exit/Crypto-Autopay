@@ -1376,18 +1376,6 @@ fn save_rpc_config(
     Ok(())
 }
 
-/// Start wallet-rpc (only called when a payment is due or user explicitly requests it).
-#[tauri::command]
-fn start_wallet_rpc(
-    wallet_password: String,
-    state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<String, String> {
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    let wallet_path = s.wallet_file_path.clone();
-    s.rpc.start(&wallet_path, &wallet_password)?;
-    Ok(s.rpc.rpc_url())
-}
-
 /// Stop wallet-rpc.
 #[tauri::command]
 fn stop_wallet_rpc(state: tauri::State<'_, Mutex<AppState>>) {
@@ -1567,57 +1555,63 @@ async fn execute_pv_payment(
         return Err("RPC busy — another operation is in progress. Try again in a moment.".to_string());
     }
 
-    struct RpcGuard(Arc<AtomicBool>);
-    impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
-    let _guard = RpcGuard(rpc_busy);
-
-    let wallet_file = wallet_dir.join(&wallet_name);
-    let app_rpc = app.clone();
-    let (mut rpc, _) = tokio::task::spawn_blocking(move || live_rpc_manager(&app_rpc))
-        .await
-        .map_err(|e| e.to_string())?;
-    rpc.start(&wallet_file, &password)
-        .map_err(|e| format!("Failed to start RPC: {e}"))?;
-
     let amount_pico = (payment.amount_xmr * 1e12) as u64;
-    let rpc_url = rpc.rpc_url();
+    let app_rpc = app.clone();
+    let pv_id = payment.id.clone();
+    let dest = payment.address.clone();
 
-    // Open wallet
-    let _ = rpc_manager::ureq_post_json_pub(&rpc_url, &serde_json::json!({
-        "jsonrpc": "2.0", "id": "1", "method": "open_wallet",
-        "params": { "filename": wallet_name, "password": password }
-    }));
+    // Same flow as send_payment: wallet-dir mode + open_wallet, so the password
+    // never appears on the wallet-rpc command line (visible to any local user via `ps`).
+    tokio::task::spawn_blocking(move || {
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(rpc_busy);
 
-    // Refresh wallet (sync with daemon)
-    let _ = rpc_manager::ureq_post_json_long(&rpc_url, &serde_json::json!({
-        "jsonrpc": "2.0", "id": "1", "method": "refresh", "params": {}
-    }), 120);
+        let (mut mgr, _) = live_rpc_manager(&app_rpc);
+        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
 
-    let result = rpc_manager::ureq_post_json_pub(&rpc_url, &serde_json::json!({
-        "jsonrpc": "2.0", "id": "1", "method": "transfer",
-        "params": {
-            "destinations": [{ "amount": amount_pico, "address": payment.address }],
-            "priority": 0,
-            "ring_size": 16,
-            "get_tx_key": false,
+        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"open","method":"open_wallet",
+            "params":{"filename":wallet_name,"password":password}
+        })).map_err(|e| e.to_string())?;
+        if let Some(err) = open.get("error") {
+            mgr.stop();
+            return Err(format!("open_wallet: {}", err));
         }
-    }));
 
-    rpc.stop();
-
-    match result {
-        Ok(v) => {
-            let tx_hash = v["result"]["tx_hash"].as_str()
-                .or_else(|| v["result"]["tx_hash_list"][0].as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            // Log without amount or address for security
-            let prefix_len = std::cmp::min(8, tx_hash.len());
-            log::info!("[Treasurer] PV payment executed: id={} tx_prefix={}…", payment.id, &tx_hash[..prefix_len]);
-            Ok(tx_hash)
+        if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"refresh","method":"refresh","params":{}
+        }), 600) {
+            log::warn!("[Treasurer] refresh failed (continuing): {}", e);
         }
-        Err(e) => Err(format!("Payment failed: {e}")),
-    }
+
+        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"tx","method":"transfer",
+            "params":{
+                "destinations":[{"amount": amount_pico, "address": dest}],
+                "account_index": 0,
+                "priority": 1,
+                "get_tx_key": false
+            }
+        })).map_err(|e| e.to_string());
+        mgr.stop();
+        let resp = resp?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            log::error!("[Treasurer] PV id={} — transfer error: {}", pv_id, msg);
+            return Err(format!("Payment failed: {}", msg));
+        }
+        let tx_hash = resp["result"]["tx_hash"].as_str().unwrap_or("").to_string();
+        if tx_hash.is_empty() {
+            return Err("Payment failed: transfer returned no tx_hash".to_string());
+        }
+        log::info!("[Treasurer] PV payment executed: id={} tx_prefix={}…", pv_id, &tx_hash[..8.min(tx_hash.len())]);
+        Ok(tx_hash)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Minimum interval between Monero sends (10 confirmations ≈ 20 min, use 25 min safely).
@@ -2135,7 +2129,6 @@ pub fn run() {
             detect_rpc_binary,
             get_rpc_status,
             save_rpc_config,
-            start_wallet_rpc,
             stop_wallet_rpc,
         ])
         .run(tauri::generate_context!())

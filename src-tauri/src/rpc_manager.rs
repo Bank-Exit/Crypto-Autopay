@@ -5,7 +5,8 @@
 //!
 //! ## Lifecycle
 //!  1. User unlocks vault → wallet file restored from seed if missing.
-//!  2. Scheduler fires (payment due) → `start()` called.
+//!  2. Refresh / payment → `start_for_dir()` then `open_wallet` over JSON-RPC
+//!     (the password is never passed on the command line).
 //!  3. Payment sent → `stop()` called (wallet-rpc shut down to minimise attack surface).
 //!  4. On app close → `stop()` always called.
 
@@ -166,45 +167,6 @@ impl RpcManager {
 
     /// Expose local RPC port for logging.
     pub fn config_port(&self) -> u16 { self.config.rpc_port }
-
-    /// Start the wallet-rpc process.
-    /// `wallet_file`: path to the wallet file (without extension).
-    /// `wallet_password`: wallet password.
-    pub fn start(&mut self, wallet_file: &Path, wallet_password: &str) -> Result<(), String> {
-        if matches!(self.status, RpcStatus::Running) {
-            return Ok(()); // already running
-        }
-        let binary = self.detect_binary()
-            .ok_or_else(|| "monero-wallet-rpc not found. Install it or set the path in Settings.".to_string())?;
-
-        let daemon_addr = self.daemon_address();
-        let port = self.config.rpc_port;
-
-        log::info!("Starting wallet-rpc: binary={:?}, daemon={}, port={}", binary, daemon_addr, port);
-        self.status = RpcStatus::Starting;
-
-        let child = Command::new(&binary)
-            .args([
-                "--daemon-address", &daemon_addr,
-                "--rpc-bind-ip", "127.0.0.1",
-                "--rpc-bind-port", &port.to_string(),
-                "--wallet-file", wallet_file.to_str().unwrap_or(""),
-                "--password", wallet_password,
-                "--disable-rpc-login",   // localhost only, no login needed
-                "--log-level", "0",      // suppress logs
-                "--log-file", "/dev/null", // prevent 100MB+ log files in project dir
-                "--non-interactive",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn wallet-rpc: {e}"))?;
-
-        self.process = Some(child);
-        self.status = RpcStatus::Running;
-        log::info!("wallet-rpc started on 127.0.0.1:{}", port);
-        Ok(())
-    }
 
     /// Stop the wallet-rpc process gracefully.
     pub fn stop(&mut self) {

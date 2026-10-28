@@ -126,6 +126,11 @@
   let showAlertsOverlay = false;
   // Semi-auto mode: pending confirmation modal
   let pendingPaymentModal = null; // { sub_id, sub_label, amount_xmr, schedule, payments_sent, last_payment_at }
+  // Upper bound of a standard Monero transfer fee, so "enough balance" is not off by the fee.
+  const FEE_MARGIN_XMR = 0.0001;
+  $: pendingShortfall = pendingPaymentModal && balanceXmr !== null
+    ? Math.max(0, Number(pendingPaymentModal.amount_xmr) + FEE_MARGIN_XMR - balanceXmr)
+    : 0;
 
   function formatRelativeDate(isoStr) {
     if (!isoStr) return null;
@@ -206,6 +211,12 @@
            setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
 
   // Tauri shell.open for external links (safe fallback for browser dev)
+  async function goToGuide(sectionId) {
+    page = "howto";
+    await tick();
+    document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   async function openExternal(url) {
     try {
       const { open } = await import("@tauri-apps/plugin-shell");
@@ -1343,11 +1354,19 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true">
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document" style="max-width:400px;text-align:center">
-      <div style="font-size:36px;margin-bottom:12px">🔔</div>
-      <h2 style="margin:0 0 6px;font-size:18px">Paiement en attente</h2>
-      <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
-        Mode semi-auto — confirmez avant envoi
-      </p>
+      {#if pendingShortfall > 0}
+        <div style="font-size:36px;margin-bottom:12px">⚠</div>
+        <h2 style="margin:0 0 6px;font-size:18px">Solde insuffisant</h2>
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
+          Rechargez votre portefeuille avant de pouvoir envoyer ce paiement.
+        </p>
+      {:else}
+        <div style="font-size:36px;margin-bottom:12px">🔔</div>
+        <h2 style="margin:0 0 6px;font-size:18px">Paiement en attente</h2>
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
+          Mode semi-auto — confirmez avant envoi
+        </p>
+      {/if}
       <div class="card" style="padding:14px 18px;margin-bottom:18px;text-align:left">
         <div style="font-size:14px;font-weight:700;margin-bottom:6px">{pendingPaymentModal.sub_label}</div>
         <div style="font-size:24px;font-weight:800;color:var(--accent);margin-bottom:8px">{pendingPaymentModal.amount_xmr} XMR</div>
@@ -1368,6 +1387,30 @@
           {/if}
         </div>
       </div>
+      {#if pendingShortfall > 0}
+        <div class="card" style="padding:12px 16px;margin-bottom:18px;text-align:left;font-size:12.5px;border-color:#f97316">
+          <div>Solde disponible : <strong>{balanceXmr.toFixed(4)} XMR</strong></div>
+          <div>Manque : <strong style="color:#ef4444">{pendingShortfall.toFixed(4)} XMR</strong>
+            <span class="text-muted" style="font-size:11px"> (frais réseau estimés inclus)</span></div>
+          <div class="text-muted" style="font-size:11px;margin-top:6px">
+            Après réception, les fonds sont utilisables au bout d'environ 20 minutes (10 confirmations).
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;justify-content:center">
+          <button class="btn-ghost" style="flex:1;padding:10px"
+            on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; }}>
+            Reporter
+          </button>
+          <button class="btn-primary" style="flex:1;padding:10px;font-size:14px"
+            on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; page = "receive"; }}>
+            Recharger le portefeuille
+          </button>
+        </div>
+        <button class="btn-inline" style="margin-top:12px;font-size:11.5px"
+          on:click={() => { pendingPaymentModal = null; goToGuide("get-monero"); }}>
+          Comment obtenir du Monero ?
+        </button>
+      {:else}
       <div style="display:flex;gap:10px;justify-content:center">
         <button class="btn-ghost" style="flex:1;padding:10px"
           on:click={() => { tauriInvoke("reject_payment", { subId: pendingPaymentModal.sub_id }); pendingPaymentModal = null; }}>
@@ -1383,6 +1426,7 @@
           Confirmer l'envoi
         </button>
       </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -2248,6 +2292,9 @@
       <div class="page-header">
         <h1>{$t.createCodeTitle || 'Créer un code AutoPay de partage'}</h1>
         <p class="subs-subtitle">{$t.createCodeSubtitle || 'Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés'}</p>
+        <button class="btn-inline guide-link" on:click={() => goToGuide("create-wallet")}>
+          Pas encore d'adresse Monero ? Créez un portefeuille libre et anonyme en 5 minutes →
+        </button>
       </div>
       <div class="create-code-page">
         <SubscriptionCodeEditor
@@ -2425,6 +2472,56 @@
             <div><h3>{$t.welcomeStep3Title}</h3><p>{$t.welcomeStep3Desc}</p></div>
           </div>
         </div>
+
+        <hr class="howto-sep" />
+
+        <section class="howto-guide card" id="create-wallet">
+          <h2>Créer un portefeuille (wallet) Monero libre, anonyme et intraçable par défaut</h2>
+          <p class="text-muted">
+            Avec Monero, l'expéditeur, le destinataire et le montant sont masqués par défaut : aucun réglage à activer.
+            Deux applications open source, gratuites et sans compte :
+          </p>
+          <ul>
+            <li>
+              <strong>Monero GUI</strong> — le portefeuille officiel du projet Monero, pour ordinateur (Windows, macOS, Linux).
+              <button class="btn-inline" on:click={() => openExternal("https://www.getmonero.org/downloads/")}>getmonero.org/downloads</button>
+            </li>
+            <li>
+              <strong>Cake Wallet</strong> — sur mobile (Android, iOS) et ordinateur, simple à prendre en main.
+              <button class="btn-inline" on:click={() => openExternal("https://cakewallet.com")}>cakewallet.com</button>
+            </li>
+          </ul>
+          <ol>
+            <li>Téléchargez uniquement depuis le site officiel (ou le store officiel sur mobile).</li>
+            <li>Choisissez « Créer un nouveau portefeuille » et définissez un mot de passe solide.</li>
+            <li>Notez la <strong>phrase de récupération</strong> (25 mots, ou 16 sur Cake Wallet selon le type de portefeuille) sur papier, hors ligne.
+              Jamais en photo ni dans un cloud : quiconque la possède contrôle vos fonds.</li>
+            <li>Votre adresse de réception commence par <code>4</code> (adresse principale) ou <code>8</code> (sous-adresse).
+              Utilisez une sous-adresse différente par usage pour cloisonner vos activités.</li>
+          </ol>
+        </section>
+
+        <section class="howto-guide card" id="get-monero">
+          <h2>Comment obtenir du Monero pour payer vos abonnements</h2>
+          <ul>
+            <li>
+              <strong>De pair à pair (P2P)</strong> — achetez directement à une autre personne, sans intermédiaire centralisé :
+              sur <button class="btn-inline" on:click={() => openExternal("https://haveno.exchange")}>Haveno</button>
+              (plateforme d'échange décentralisée et open source), ou en main propre lors d'une rencontre Monero locale.
+            </li>
+            <li>
+              <strong>Conversion depuis Bitcoin</strong> — un agrégateur d'échanges instantanés sans compte comme
+              <button class="btn-inline" on:click={() => openExternal("https://trocador.app")}>Trocador.app</button>
+              convertit vos BTC en XMR : indiquez votre adresse Monero comme destination, vérifiez-la, puis envoyez les BTC.
+            </li>
+          </ul>
+          <p class="text-muted">
+            Envoyez ensuite les XMR vers votre adresse AutoPay. Ils deviennent utilisables après environ 20 minutes (10 confirmations).
+          </p>
+          <button class="btn-primary btn-sm" style="width:fit-content" on:click={() => page = "receive"}>
+            Voir mon adresse de réception AutoPay
+          </button>
+        </section>
       </div>
     {/if}
   </main>
@@ -2802,7 +2899,7 @@
     display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
   }
   .lock-nav-btn {
-    background: none; border: 2px solid var(--accent); border-radius: 8px;
+    background: none; border: none; border-radius: 8px;
     width: 42px; height: 36px; padding: 0; display: flex; align-items: center; justify-content: center;
     cursor: pointer; transition: all 0.15s; opacity: 0.75;
   }
@@ -3076,6 +3173,12 @@
   /* ----- How it works ----- */
   .howto-body { display: flex; flex-direction: column; gap: 14px; }
   .howto-anim { padding: 16px; max-width: 360px; }
+  .howto-sep { border: none; border-top: 1px solid var(--border); margin: 18px 0 4px; }
+  .howto-guide { padding: 18px 22px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; line-height: 1.55; scroll-margin-top: 16px; }
+  .howto-guide h2 { font-size: 15px; margin: 0; }
+  .howto-guide ul, .howto-guide ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+  .howto-guide .btn-inline { font-size: inherit; }
+  .guide-link { font-size: 12.5px; margin-top: 6px; text-align: left; }
   .howto { padding: 0; overflow: hidden; }
   .howto-step {
     display: flex; align-items: flex-start; gap: 14px;
