@@ -1,5 +1,5 @@
 <script>
-  import { onMount, tick } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import Welcome from "./lib/Welcome.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
@@ -40,19 +40,24 @@
     : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"))
   ).slice().reverse();
 
+  // onMount is async, so its returned cleanup would be ignored: detach listeners here,
+  // otherwise every hot reload in dev stacks one more Rust log listener.
+  let unsubLogs = null;
+  let unlistenRust = null;
+  let unlistenDeepLink = null;
+  let devKeyHandler = null;
+  onDestroy(() => {
+    unsubLogs?.(); unlistenRust?.(); unlistenDeepLink?.();
+    if (devKeyHandler) document.removeEventListener("keydown", devKeyHandler);
+  });
+
   onMount(async () => {
-    const unsub = subscribeToLogs(entries => { liveLogs = [...entries]; });
+    unsubLogs = subscribeToLogs(entries => { liveLogs = [...entries]; });
 
     // Forward Rust log events (tauri-plugin-log webview target) into AppLogger
     try {
       const { attachLogger } = await import("@tauri-apps/plugin-log");
-      // The same Rust record must only be shown once, even if the listener ends up attached twice.
-      let lastRust = "";
-      if (window.__autopayRustLogAttached) throw new Error("already attached");
-      window.__autopayRustLogAttached = true;
-      await attachLogger(({ level, message, location }) => {
-        if (message === lastRust) return;
-        lastRust = message;
+      unlistenRust = await attachLogger(({ level, message, location }) => {
         const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
         if (level >= 4) logError(mod, message);      // ERROR = 4
         else if (level >= 3) logWarn(mod, message);  // WARN  = 3
@@ -61,8 +66,6 @@
     } catch (e) {
       // In browser dev mode tauri-plugin-log is not available — ignore
     }
-
-    return unsub;
   });
 
   /** Poll Rust state for any deep link that arrived before the frontend was ready */
@@ -84,7 +87,7 @@
     // Deep link real-time listener (Tauri events)
     try {
       const { listen } = await import("@tauri-apps/api/event");
-      listen("autopay://open-subscription", async (event) => {
+      unlistenDeepLink = await listen("autopay://open-subscription", async (event) => {
         const url = event.payload;
         console.log("[DeepLink] Event received, appState=", appState);
         // Reset to null first so Svelte triggers reactivity even for same URL
@@ -100,9 +103,10 @@
 
     // Dev shortcut: Ctrl+Shift+D → jump to dashboard (browser-only, no Tauri)
     if (import.meta.env.DEV) {
-      document.addEventListener("keydown", (e) => {
+      devKeyHandler = (e) => {
         if (e.ctrlKey && e.shiftKey && e.key === "D") { appState = "dashboard"; e.preventDefault(); }
-      });
+      };
+      document.addEventListener("keydown", devKeyHandler);
     }
 
     try {

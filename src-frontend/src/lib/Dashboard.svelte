@@ -295,6 +295,9 @@
     const v = await tauriInvoke("get_treasurer_mode");
     if (v !== null) treasurerMode = !!v;
   }
+  const isWindows = typeof navigator !== "undefined" && /Windows/.test(navigator.userAgent);
+  const isWinOrMac = isWindows || (typeof navigator !== "undefined" && /Macintosh|Mac OS X/.test(navigator.userAgent));
+
   let autostartEnabled = null; // null = unknown (browser dev mode)
   async function loadAutostart() {
     const v = await tauriInvoke("get_autostart");
@@ -1649,7 +1652,7 @@
           <li><strong>{$t.rpcMissingManualTitle}</strong><br/>{$t.rpcMissingManualDetail}</li>
         </ol>
         <div class="rpc-missing-actions">
-          <a class="btn-ghost" href="https://www.getmonero.org/downloads/#cli" target="_blank">{$t.rpcDownload} ↗</a>
+          <a class="btn-ghost" href="https://www.getmonero.org/downloads/#cli" on:click|preventDefault={() => openExternal("https://www.getmonero.org/downloads/#cli")}>{$t.rpcDownload} ↗</a>
           <button class="btn-ghost" on:click={() => { showRpcBinaryPopup = false; page = "settings"; }}>⚙️ {$t.diagBinaryAction}</button>
           <button class="btn-primary" on:click={() => { showRpcBinaryPopup = false; tauriInvoke('lock_wallet').finally(() => dispatch('lock')); }}>↻ {$t.rpcMissingRetry}</button>
         </div>
@@ -2403,7 +2406,7 @@
 
       <!-- RPC / Wallet section -->
       <h2 class="section-title">Wallet RPC <span class="badge-v2">v0.2</span></h2>
-      <div class="settings-section card">
+      <div class="settings-section card" style="overflow:visible">
         <div class="rpc-status-row">
           <span class="setting-label">{$t.rpcStatus}</span>
           <span class="rpc-badge rpc-{rpcStatus}">
@@ -2412,6 +2415,21 @@
              rpcStatus === 'stopped' ? ($t.rpcStopped) : ($t.rpcError)}
           </span>
         </div>
+        <p class="rpc-info rpc-official">
+          {rpcBinaryPath?.includes("autopay-wallet-rpc") ? $t.rpcOfficialBundled : $t.rpcOfficialIntro}
+          <a class="rpc-link" href="https://www.getmonero.org/" on:click|preventDefault={() => openExternal("https://www.getmonero.org/")}>getmonero.org ↗</a>
+          ·
+          <a class="rpc-link" href="https://github.com/monero-project/monero" on:click|preventDefault={() => openExternal("https://github.com/monero-project/monero")}>github.com/monero-project/monero ↗</a>
+          {#if isWinOrMac}
+            <span class="info-tip" tabindex="0" role="note">
+              ⓘ {$t.rpcAvTipLabel}
+              <span class="info-tip-body">
+                <strong>{$t.rpcAvTipWhy}</strong><br/>
+                {isWindows ? $t.rpcAvTipWindows : $t.rpcAvTipMac}
+              </span>
+            </span>
+          {/if}
+        </p>
         {#if rpcBinaryPath}
           <p class="rpc-info">{$t.rpcBinaryFound}{colon} <code>{rpcBinaryPath}</code></p>
         {:else}
@@ -3510,4 +3528,13 @@
   .rpc-missing-body ol { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
   .rpc-missing-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
   .rpc-missing-actions a { text-decoration:none; }
+  .rpc-official { display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px; }
+  .info-tip { position:relative; cursor:help; color:var(--accent); font-size:12px; outline:none; }
+  .info-tip-body {
+    display:none; position:absolute; z-index:20; left:0; top:calc(100% + 6px); width:340px;
+    padding:10px 12px; border-radius:8px; background:var(--bg-card, #fff); color:var(--text);
+    border:1px solid var(--border); box-shadow:0 6px 20px rgba(0,0,0,.18);
+    font-size:12px; line-height:1.5; white-space:normal;
+  }
+  .info-tip:hover .info-tip-body, .info-tip:focus .info-tip-body { display:block; }
 </style>

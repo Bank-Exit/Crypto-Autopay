@@ -1322,6 +1322,10 @@ async fn set_payment_limits(
     limits.save(&dir)?;
     log::info!("[Policy] Limits updated: large_amounts={}, short_cadence={}", allow_large_amounts, allow_short_cadence);
     s.payment_limits = limits;
+    // Blocks raised under the previous limits are stale; the scheduler re-raises them if still relevant.
+    s.alerts.retain(|a| a.kind != "PAYMENT_BLOCKED_LIMITS");
+    drop(s);
+    refresh_alerts_and_tray(&app_handle);
     Ok(())
 }
 

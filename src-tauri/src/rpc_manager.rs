@@ -146,22 +146,56 @@ pub struct RpcManager {
 
 const PID_FILE_NAME: &str = "wallet-rpc.pid";
 
-/// True if `pid` is a monero-wallet-rpc serving our wallet dir (guards against PID reuse).
+fn is_wallet_rpc_cmd(cmd: &str) -> bool {
+    cmd.contains("autopay-wallet-rpc") || cmd.contains("monero-wallet-rpc")
+}
+
+/// True if `pid` is a wallet-rpc started by this app (guards against PID reuse and
+/// never matches another program's wallet-rpc).
 fn is_our_wallet_rpc(pid: u32, wallet_dir: &std::path::Path) -> bool {
     #[cfg(target_os = "linux")]
     {
         std::fs::read(format!("/proc/{}/cmdline", pid))
             .map(|c| {
                 let cmd = String::from_utf8_lossy(&c);
-                cmd.contains("monero-wallet-rpc") && cmd.contains(&*wallet_dir.to_string_lossy())
+                is_wallet_rpc_cmd(&cmd) && cmd.contains(&*wallet_dir.to_string_lossy())
             })
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        command("ps").args(["-p", &pid.to_string(), "-o", "command="]).output()
+            .map(|o| {
+                let cmd = String::from_utf8_lossy(&o.stdout);
+                is_wallet_rpc_cmd(&cmd) && cmd.contains(&*wallet_dir.to_string_lossy())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        // tasklist exposes the image name only; the PID file already ties it to this app.
+        let _ = wallet_dir;
+        command("tasklist").args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("autopay-wallet-rpc"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (pid, wallet_dir);
-        true
+        false
     }
+}
+
+fn port_in_use(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(100),
+    ).is_ok()
+}
+
+/// A free local port picked by the OS, used when the configured one is taken.
+fn free_local_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok().map(|a| a.port())
 }
 
 /// wallet-rpc left behind by a previous run of this app: from the PID file, or on Linux
@@ -275,28 +309,31 @@ impl RpcManager {
         };
 
         // --- 2. Port availability check ---
-        let port = self.config.rpc_port;
-        let addr_str = format!("127.0.0.1:{}", port);
-        if std::net::TcpStream::connect_timeout(
-            &addr_str.parse().unwrap(),
-            Duration::from_millis(100),
-        ).is_ok() {
-            // Only a wallet-rpc left behind by this app (crash) may be killed;
-            // anything else on the port belongs to another program.
-            match find_stale_wallet_rpc(wallet_dir) {
-                Some(pid) => {
-                    log::warn!("[RPC] Port {} held by a stale wallet-rpc from this app (PID {}) — stopping it", port, pid);
-                    kill_pid(pid);
-                    let _ = std::fs::remove_file(wallet_dir.join(PID_FILE_NAME));
-                    std::thread::sleep(Duration::from_millis(800));
-                }
-                None => {
-                    let msg = format!("Port {} is used by another program. Close it or change the RPC port in Settings.", port);
-                    log::error!("[RPC] {}", msg);
-                    return Err(msg);
+        // Only a wallet-rpc left behind by this app (crash, killed dev build) may be stopped;
+        // a port held by any other program is left alone and another port is used instead.
+        if port_in_use(self.config.rpc_port) {
+            if let Some(pid) = find_stale_wallet_rpc(wallet_dir) {
+                log::warn!("[RPC] Port {} held by a stale wallet-rpc from this app (PID {}) — stopping it",
+                    self.config.rpc_port, pid);
+                kill_pid(pid);
+                let _ = std::fs::remove_file(wallet_dir.join(PID_FILE_NAME));
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while port_in_use(self.config.rpc_port) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(200));
                 }
             }
         }
+        if port_in_use(self.config.rpc_port) {
+            let fallback = free_local_port().ok_or_else(|| {
+                let msg = format!("Port {} is in use and no free local port is available.", self.config.rpc_port);
+                log::error!("[RPC] {}", msg);
+                msg
+            })?;
+            log::warn!("[RPC] Port {} is used by another program — using free port {} for this session",
+                self.config.rpc_port, fallback);
+            self.config.rpc_port = fallback;
+        }
+        let port = self.config.rpc_port;
 
         // --- 3. Daemon address ---
         let daemon_addr = self.daemon_address();
@@ -319,7 +356,7 @@ impl RpcManager {
             "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
             "--disable-rpc-login",
             "--log-level", "0",        // suppress logs
-            "--log-file", "/dev/null", // prevent 100MB+ log files in project dir
+            "--log-file", if cfg!(windows) { "NUL" } else { "/dev/null" }, // no 100MB+ log files
             "--non-interactive",
         ];
         log::info!("[RPC] Spawning: {:?} {:?}", binary, args);
