@@ -64,9 +64,11 @@ jobs:
         run: npm ci
 
       # ── Rust toolchain ────────────────────────
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.92.0
+        # Pinned so new clippy lints or compiler changes only land on a deliberate bump.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.92.0
           targets: ${{ matrix.target }}
 
       - name: Rust cache
