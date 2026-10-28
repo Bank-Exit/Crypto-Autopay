@@ -491,111 +491,13 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
     Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic, daemon_reachable: s.last_daemon_contact_at.is_some() })
 }
 
-/// Send all funds (sweep_all) to a destination address.
-/// Requires the wallet to be unlocked (session_password must be set).
-/// Send a specific amount to a destination address (for scheduled payments).
-/// Security: logs only the subscription ID — no amounts, no addresses in logs.
-#[tauri::command]
-async fn send_payment(
-    destination_address: String,
-    amount_xmr: f64,
-    subscription_id: String,
-    state: tauri::State<'_, Mutex<AppState>>,
-    app_handle: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    let dest = destination_address.trim().to_string();
-    if dest.len() < 90 || dest.len() > 110 {
-        return Err("Invalid destination address".to_string());
-    }
-    if amount_xmr <= 0.0 || amount_xmr > 100.0 {
-        return Err("Invalid amount".to_string());
-    }
-    let atomic_units = (amount_xmr * 1e12) as u64;
-
-    let (wallet_name, wallet_dir, password, rpc_busy) = {
-        let s = state.lock().map_err(|e| e.to_string())?;
-        if !s.unlocked { return Err("Wallet is locked.".to_string()); }
-        let wn = s.wallet_file_path.file_name()
-            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
-        let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-        let pw = s.session_password.clone().ok_or("No session password")?;
-        let busy = Arc::clone(&s.rpc_busy);
-        (wn, wd, pw, busy)
-    };
-
-    // Exclusive RPC access — reject if already in use (refresh_balance running)
-    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return Err("RPC busy: balance refresh in progress. Retry in a moment.".to_string());
-    }
-
-    log::info!("[Payment] Sending payment for subscription #{}", subscription_id);
-
-    let busy_clone = Arc::clone(&rpc_busy);
-    let app_rpc = app_handle.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // RAII guard: always clear rpc_busy when this closure exits
-        struct RpcGuard(Arc<AtomicBool>);
-        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
-        let _guard = RpcGuard(Arc::clone(&busy_clone));
-
-        let (mut mgr, _) = live_rpc_manager(&app_rpc);
-        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
-
-        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"open","method":"open_wallet",
-            "params":{"filename":wallet_name,"password":password}
-        })).map_err(|e| e.to_string())?;
-        if let Some(err) = open.get("error") {
-            mgr.stop();
-            return Err(format!("open_wallet: {}", err));
-        }
-
-        if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
-        }), 600) {
-            log::warn!("[Payment] refresh before transfer failed (continuing): {}", e);
-        }
-
-        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"tx","method":"transfer",
-            "params":{
-                "destinations":[{"amount": atomic_units, "address": dest}],
-                "account_index": 0,
-                "priority": 1,
-                "get_tx_key": false
-            }
-        })).map_err(|e| e.to_string())?;
-
-        mgr.stop();
-
-        if let Some(err) = resp.get("error") {
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-            log::error!("[Payment] sub #{} — RPC error: {}", subscription_id, msg);
-            return Err(format!("transfer RPC error: {}", msg));
-        }
-
-        let tx_hash = resp["result"]["tx_hash"].as_str().unwrap_or("").to_string();
-        if tx_hash.is_empty() {
-            log::error!("[Payment] sub #{} — transfer returned no tx_hash. Full result: {:?}", subscription_id, resp["result"]);
-            return Err("transfer returned empty tx_hash".to_string());
-        }
-        log::info!("[Payment] sub #{} — SUCCESS. tx_hash={}...", subscription_id, &tx_hash[..12.min(tx_hash.len())]);
-        Ok(serde_json::json!({ "tx_hash": tx_hash }))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    Ok(result)
-}
-
-/// Update a subscription's next_payment_at after a successful payment.
 /// Next due date of a cron schedule (computed here so the frontend never re-implements cron).
 #[tauri::command]
 fn next_occurrence_of(schedule: String) -> String {
     next_occurrence(&schedule, chrono::Utc::now()).to_rfc3339()
 }
 
+/// Update a subscription's next_payment_at (deferred or skipped payment).
 #[tauri::command]
 async fn update_subscription_next_payment(
     id: String,
@@ -607,6 +509,8 @@ async fn update_subscription_next_payment(
         .map_err(|e| e.to_string())
 }
 
+/// Send all funds (sweep_all) to a destination address.
+/// Requires the wallet to be unlocked (session_password must be set).
 #[tauri::command]
 async fn sweep_all(
     destination: String,
@@ -1946,7 +1850,7 @@ async fn execute_pv_payment(
     let pv_id = payment.id.clone();
     let dest = payment.address.clone();
 
-    // Same flow as send_payment: wallet-dir mode + open_wallet, so the password
+    // Same flow as execute_subscription_payment: wallet-dir mode + open_wallet, so the password
     // never appears on the wallet-rpc command line (visible to any local user via `ps`).
     tokio::task::spawn_blocking(move || {
         struct RpcGuard(Arc<AtomicBool>);
@@ -2005,10 +1909,224 @@ const MONERO_MIN_SEND_INTERVAL_SECS: u64 = 25 * 60;
 
 /// Background scheduler: check for due subscriptions and send payments.
 /// Called every 60 seconds from a tokio::spawn task.
+const RPC_BUSY: &str = "RPC busy";
+
+/// Pay a subscription right away at the user's explicit request (pending-payment popup or
+/// "pay now"). Limits still apply; the click counts as approval of the current terms.
+#[tauri::command]
+async fn pay_subscription_now(sub_id: String, app_handle: tauri::AppHandle) -> Result<String, String> {
+    let sub = app_handle.state::<Mutex<Database>>().lock().map_err(|e| e.to_string())?
+        .list_subscriptions().map_err(|e| e.to_string())?
+        .into_iter().find(|s| s.id == sub_id)
+        .ok_or("Subscription not found")?;
+    let limits = {
+        let st = app_handle.state::<Mutex<AppState>>();
+        let mut s = st.lock().map_err(|e| e.to_string())?;
+        s.pending_approvals.remove(&sub_id);
+        s.approved_payments.remove(&sub_id);
+        s.payment_limits.clone()
+    };
+    payment_policy::validate_currency(&sub.currency)
+        .and_then(|_| payment_policy::validate_address(&sub.destination_address))
+        .and_then(|_| payment_policy::validate_terms(&sub.amount, &sub.schedule, &limits))
+        .map_err(|e| e.to_string())?;
+
+    let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut terms = payment_policy::load_approved_terms(&dir);
+    terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+    payment_policy::save_approved_terms(&dir, &terms);
+
+    log::info!("[Payment] Manual payment requested for sub {}", &sub_id[..8.min(sub_id.len())]);
+    let res = execute_subscription_payment(&app_handle, &sub).await;
+    refresh_alerts_and_tray(&app_handle);
+    res
+}
+
+/// Send one subscription payment and do all the bookkeeping (DB, history, alerts, events).
+/// Shared by the scheduler and the manual "pay now" command so both behave the same.
+async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription) -> Result<String, String> {
+    use chrono::Utc;
+    let (session_pw, wallet_dir, wallet_name) = {
+        let st = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?;
+        let s = st.lock().map_err(|e| e.to_string())?;
+        if !s.unlocked { return Err("Wallet is locked.".into()); }
+        let pw = s.session_password.clone().ok_or("No session password")?;
+        let name = s.wallet_file_path.file_name()
+            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
+        (pw, app.path().app_data_dir().map_err(|e| e.to_string())?, name)
+    };
+    let db_state = app.state::<Mutex<Database>>();
+    let dest = sub.destination_address.clone();
+    let amount_xmr = payment_policy::parse_amount(&sub.amount).unwrap_or(0.0);
+    let amount_pico = (amount_xmr * 1e12) as u64;
+    let sub_id = sub.id.clone();
+
+    // Without the lock, start_for_dir would kill the wallet-rpc of a running refresh (or payment).
+    let rpc_busy = match app.try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| Arc::clone(&s.rpc_busy)))
+    {
+        Some(b) => b,
+        None => return Err("App state unavailable".into()),
+    };
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err(RPC_BUSY.into());
+    }
+
+    log::info!("[Scheduler] Sending payment for sub {}", &sub_id[..8.min(sub_id.len())]);
+
+    let wallet_dir2 = wallet_dir.clone();
+    let wallet_name2 = wallet_name.clone();
+    let pw2 = session_pw.clone();
+    let app_rpc = app.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(rpc_busy);
+
+        let (mut mgr, _) = live_rpc_manager(&app_rpc);
+        mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
+        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
+
+        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"o","method":"open_wallet",
+            "params":{"filename":wallet_name2,"password":pw2}
+        })).map_err(|e| e.to_string())?;
+        if let Some(err) = open.get("error") {
+            return Err(format!("open_wallet: {}", err));
+        }
+
+        // Spend from an up-to-date wallet, otherwise stale outputs make the transfer fail.
+        if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
+        }), 600) {
+            log::warn!("[Scheduler] refresh before transfer failed (continuing): {}", e);
+        }
+
+        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"tx","method":"transfer",
+            "params":{
+                "destinations":[{"amount": amount_pico, "address": dest}],
+                "account_index": 0, "priority": 1
+            }
+        })).map_err(|e| e.to_string());
+        mgr.stop();
+        let resp = resp?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+            return Err(format!("transfer error: {}", msg));
+        }
+        Ok(resp["result"]["tx_hash"].as_str().unwrap_or("").to_string())
+    }).await;
+
+    match result {
+        Ok(Ok(tx_hash)) => {
+            let tx_hash_out = tx_hash.clone();
+            log::info!("[Scheduler] Payment sent for sub {} (tx={}…)", &sub_id[..8.min(sub_id.len())], &tx_hash[..8.min(tx_hash.len())]);
+            // Update last_payment_sent_at in AppState
+            if let Some(state) = app.try_state::<Mutex<AppState>>() {
+                if let Ok(mut s) = state.lock() {
+                    s.last_payment_sent_at = Some(Utc::now().timestamp());
+                    s.alerts.retain(|a| a.sub_id.as_deref() != Some(sub_id.as_str()));
+                }
+            }
+            // Next occurrence after now: a long-overdue subscription must not
+            // trigger a burst of catch-up payments.
+            let new_next = next_occurrence(&sub.schedule, Utc::now());
+            {
+                if let Ok(db) = db_state.lock() {
+                    if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {
+                        log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
+                    } else {
+                        log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", new_next.to_rfc3339(), sub_id);
+                    }
+                }
+            }
+            // Emit event so frontend can refresh balance and subscription list
+            let new_next_iso = new_next.to_rfc3339();
+            app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
+            // Append to encrypted payment history
+            if let Some(app_state) = app.try_state::<Mutex<AppState>>() {
+                if let Ok(s) = app_state.lock() {
+                    let tx_prefix = if tx_hash.len() >= 12 { tx_hash[..12].to_string() } else { tx_hash.clone() };
+                    let entry = HistoryEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        sub_id: sub_id.clone(),
+                        sub_label: sub.label.clone(),
+                        amount_xmr: sub.amount.parse::<f64>().unwrap_or(0.0),
+                        sent_at: chrono::Utc::now().to_rfc3339(),
+                        tx_prefix,
+                    };
+                    append_history_entry(&s, entry);
+                }
+            }
+            Ok(tx_hash_out)
+        }
+        Ok(Err(e)) => {
+            let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
+            if is_locked {
+                // Outputs locked: reschedule for 25 min later (one Monero block confirmation cycle)
+                log::warn!("[Scheduler] Sub {} — outputs still locked, rescheduling +25min", sub_id);
+                let retry_at = chrono::Utc::now() + chrono::Duration::minutes(25);
+                if let Some(db_rc) = app.try_state::<Mutex<Database>>() {
+                    if let Ok(db) = db_rc.lock() {
+                        if let Err(e) = db.update_next_payment(&sub_id, Some(retry_at), sub.payments_sent) {
+                            log::error!("[Scheduler] DB retry-defer failed for sub {}: {}", sub_id, e);
+                        } else {
+                            log::info!("[Scheduler] next_payment_at deferred +25min to {} for sub {}", retry_at.to_rfc3339(), sub_id);
+                        }
+                    }
+                }
+                // Orange alert: outputs locked, retry scheduled
+                if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+                    if let Ok(mut s) = state_rc.lock() {
+                        s.alerts.retain(|a| a.kind != "OUTPUTS_LOCKED" || a.sub_id.as_deref() != Some(&sub_id));
+                        s.alerts.push(AppAlert {
+                            level: AlertLevel::Orange,
+                            kind: "OUTPUTS_LOCKED".into(),
+                            sub_id: Some(sub_id.clone()),
+                            message: format!("Sub #{} — fonds verrouilles (confirmation en cours), retry dans 25 min", sub_id),
+                            created_at: chrono::Utc::now().timestamp(),
+                        });
+                        let count = s.alerts.len();
+                        drop(s);
+                        update_tray_icon(app, Some(AlertLevel::Orange), count);
+                    }
+                }
+                app.emit("payment-locked", serde_json::json!({"sub_id": sub_id, "retry_in_min": 25, "next_payment_at": retry_at.to_rfc3339()})).ok();
+                Err(format!("OUTPUTS_LOCKED: {e}"))
+            } else {
+                log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
+                if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+                    if let Ok(mut s) = state_rc.lock() {
+                        s.alerts.retain(|a| a.kind != "PAYMENT_FAILED" || a.sub_id.as_deref() != Some(&sub_id));
+                        s.alerts.push(AppAlert {
+                            level: AlertLevel::Orange,
+                            kind: "PAYMENT_FAILED".into(),
+                            sub_id: Some(sub_id.clone()),
+                            message: format!("Payment failed for sub #{}: {}", sub_id, e),
+                            created_at: chrono::Utc::now().timestamp(),
+                        });
+                        let count = s.alerts.len();
+                        drop(s);
+                        update_tray_icon(app, Some(AlertLevel::Orange), count);
+                    }
+                }
+                Err(e)
+            }
+        }
+        Err(e) => {
+            log::error!("[Scheduler] Task panic for sub {}: {}", sub_id, e);
+            Err(e.to_string())
+        }
+    }
+}
+
 async fn run_payment_scheduler(app: &tauri::AppHandle) {
     use chrono::Utc;
 
-    let (session_pw, wallet_dir, wallet_name, last_sent) = {
+    let last_sent = {
         let state = match app.try_state::<Mutex<AppState>>() {
             Some(s) => s,
             None => return,
@@ -2026,18 +2144,8 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 return;
             }
         }
-        let pw = match &s.session_password {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        let dir = match app.path().app_data_dir() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let name = s.wallet_file_path.file_name()
-            .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
-        let last = s.last_payment_sent_at;
-        (pw, dir, name, last)
+        if s.session_password.is_none() { return; }
+        s.last_payment_sent_at
     };
 
     // Enforce 25-minute minimum between Monero sends
@@ -2099,9 +2207,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
     let mut approved_terms = payment_policy::load_approved_terms(&data_dir);
 
     for sub in due {
-        let dest = sub.destination_address.clone();
         let amount_xmr = payment_policy::parse_amount(&sub.amount).unwrap_or(0.0);
-        let amount_pico = (amount_xmr * 1e12) as u64;
         let sub_id = sub.id.clone();
         let short_id = sub_id[..8.min(sub_id.len())].to_string();
 
@@ -2175,160 +2281,17 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             continue; // skip to next sub — scheduler will retry next cycle
         }
 
-        // Without the lock, start_for_dir would kill the wallet-rpc of a running refresh (or payment).
-        let rpc_busy = match app.try_state::<Mutex<AppState>>()
-            .and_then(|st| st.lock().ok().map(|s| Arc::clone(&s.rpc_busy)))
-        {
-            Some(b) => b,
-            None => return,
-        };
-        if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            log::info!("[Scheduler] RPC busy — payment for sub {} retried next cycle", short_id);
-            restore_approvals(&approved_ids);
-            return;
-        }
-
-        log::info!("[Scheduler] Sending payment for sub {}", &sub_id[..8.min(sub_id.len())]);
-
-        let wallet_dir2 = wallet_dir.clone();
-        let wallet_name2 = wallet_name.clone();
-        let pw2 = session_pw.clone();
-        let app_rpc = app.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            struct RpcGuard(Arc<AtomicBool>);
-            impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
-            let _guard = RpcGuard(rpc_busy);
-
-            let (mut mgr, _) = live_rpc_manager(&app_rpc);
-            mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
-            mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
-
-            let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-                "jsonrpc":"2.0","id":"o","method":"open_wallet",
-                "params":{"filename":wallet_name2,"password":pw2}
-            })).map_err(|e| e.to_string())?;
-            if let Some(err) = open.get("error") {
-                return Err(format!("open_wallet: {}", err));
+        match execute_subscription_payment(app, &sub).await {
+            Err(e) if e == RPC_BUSY => {
+                log::info!("[Scheduler] RPC busy — payment for sub {} retried next cycle", short_id);
+                restore_approvals(&approved_ids);
+                return;
             }
-
-            // Spend from an up-to-date wallet, otherwise stale outputs make the transfer fail.
-            if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
-                "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
-            }), 600) {
-                log::warn!("[Scheduler] refresh before transfer failed (continuing): {}", e);
+            _ => {
+                let others: std::collections::HashSet<String> =
+                    approved_ids.iter().filter(|id| **id != sub_id).cloned().collect();
+                restore_approvals(&others);
             }
-
-            let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-                "jsonrpc":"2.0","id":"tx","method":"transfer",
-                "params":{
-                    "destinations":[{"amount": amount_pico, "address": dest}],
-                    "account_index": 0, "priority": 1
-                }
-            })).map_err(|e| e.to_string());
-            mgr.stop();
-            let resp = resp?;
-
-            if let Some(err) = resp.get("error") {
-                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                return Err(format!("transfer error: {}", msg));
-            }
-            Ok(resp["result"]["tx_hash"].as_str().unwrap_or("").to_string())
-        }).await;
-
-        match result {
-            Ok(Ok(tx_hash)) => {
-                log::info!("[Scheduler] Payment sent for sub {} (tx={}…)", &sub_id[..8.min(sub_id.len())], &tx_hash[..8.min(tx_hash.len())]);
-                // Update last_payment_sent_at in AppState
-                if let Some(state) = app.try_state::<Mutex<AppState>>() {
-                    if let Ok(mut s) = state.lock() {
-                        s.last_payment_sent_at = Some(Utc::now().timestamp());
-                        s.alerts.retain(|a| a.sub_id.as_deref() != Some(sub_id.as_str()));
-                    }
-                }
-                // Next occurrence after now: a long-overdue subscription must not
-                // trigger a burst of catch-up payments.
-                let new_next = next_occurrence(&sub.schedule, Utc::now());
-                {
-                    if let Ok(db) = db_state.lock() {
-                        if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {
-                            log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
-                        } else {
-                            log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", new_next.to_rfc3339(), sub_id);
-                        }
-                    }
-                }
-                // Emit event so frontend can refresh balance and subscription list
-                let new_next_iso = new_next.to_rfc3339();
-                app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
-                // Append to encrypted payment history
-                if let Some(app_state) = app.try_state::<Mutex<AppState>>() {
-                    if let Ok(s) = app_state.lock() {
-                        let tx_prefix = if tx_hash.len() >= 12 { tx_hash[..12].to_string() } else { tx_hash.clone() };
-                        let entry = HistoryEntry {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            sub_id: sub_id.clone(),
-                            sub_label: sub.label.clone(),
-                            amount_xmr: sub.amount.parse::<f64>().unwrap_or(0.0),
-                            sent_at: chrono::Utc::now().to_rfc3339(),
-                            tx_prefix,
-                        };
-                        append_history_entry(&s, entry);
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
-                if is_locked {
-                    // Outputs locked: reschedule for 25 min later (one Monero block confirmation cycle)
-                    log::warn!("[Scheduler] Sub {} — outputs still locked, rescheduling +25min", sub_id);
-                    let retry_at = chrono::Utc::now() + chrono::Duration::minutes(25);
-                    if let Some(db_rc) = app.try_state::<Mutex<Database>>() {
-                        if let Ok(db) = db_rc.lock() {
-                            if let Err(e) = db.update_next_payment(&sub_id, Some(retry_at), sub.payments_sent) {
-                                log::error!("[Scheduler] DB retry-defer failed for sub {}: {}", sub_id, e);
-                            } else {
-                                log::info!("[Scheduler] next_payment_at deferred +25min to {} for sub {}", retry_at.to_rfc3339(), sub_id);
-                            }
-                        }
-                    }
-                    // Orange alert: outputs locked, retry scheduled
-                    if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
-                        if let Ok(mut s) = state_rc.lock() {
-                            s.alerts.retain(|a| a.kind != "OUTPUTS_LOCKED" || a.sub_id.as_deref() != Some(&sub_id));
-                            s.alerts.push(AppAlert {
-                                level: AlertLevel::Orange,
-                                kind: "OUTPUTS_LOCKED".into(),
-                                sub_id: Some(sub_id.clone()),
-                                message: format!("Sub #{} — fonds verrouilles (confirmation en cours), retry dans 25 min", sub_id),
-                                created_at: chrono::Utc::now().timestamp(),
-                            });
-                            let count = s.alerts.len();
-                            drop(s);
-                            update_tray_icon(app, Some(AlertLevel::Orange), count);
-                        }
-                    }
-                    app.emit("payment-locked", serde_json::json!({"sub_id": sub_id, "retry_in_min": 25, "next_payment_at": retry_at.to_rfc3339()})).ok();
-                } else {
-                    log::error!("[Scheduler] Payment failed for sub {}: {}", sub_id, e);
-                    if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
-                        if let Ok(mut s) = state_rc.lock() {
-                            s.alerts.retain(|a| a.kind != "PAYMENT_FAILED" || a.sub_id.as_deref() != Some(&sub_id));
-                            s.alerts.push(AppAlert {
-                                level: AlertLevel::Orange,
-                                kind: "PAYMENT_FAILED".into(),
-                                sub_id: Some(sub_id.clone()),
-                                message: format!("Payment failed for sub #{}: {}", sub_id, e),
-                                created_at: chrono::Utc::now().timestamp(),
-                            });
-                            let count = s.alerts.len();
-                            drop(s);
-                            update_tray_icon(app, Some(AlertLevel::Orange), count);
-                        }
-                    }
-                }
-            }
-            Err(e) => log::error!("[Scheduler] Task panic for sub {}: {}", sub_id, e),
         }
         // Only send one payment per cycle to respect 25-min Monero rule
         break;
@@ -2577,6 +2540,7 @@ pub fn run() {
             create_wallet,
             unlock_wallet,
             unlock_lockout_remaining,
+            pay_subscription_now,
             get_autostart,
             set_autostart,
             get_wallet_info,
@@ -2603,7 +2567,6 @@ pub fn run() {
             get_balance,
             refresh_balance,
             sweep_all,
-            send_payment,
             update_subscription_next_payment,
             next_occurrence_of,
             get_subscriptions,

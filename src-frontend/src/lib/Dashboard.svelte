@@ -872,19 +872,17 @@
     paymentInProgress = false;
   }
 
+  // Goes through the same backend path as the scheduler (limits, DB, history, alerts);
+  // the "payment-sent" / "payment-locked" events update the list.
   async function processPayment(sub, retryOnBusy = true) {
     logInfo("Scheduler", `Processing payment for sub #${sub.id}`);
     if (retryOnBusy) startPaymentLoader(); // show loader immediately
 
-    let result = null;
+    let txHash = null;
     let invokeError = null;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      result = await invoke("send_payment", {
-        destinationAddress: sub.destination_address || sub.address || "",
-        amountXmr: parseFloat(sub.amount),
-        subscriptionId: sub.id,
-      });
+      txHash = await invoke("pay_subscription_now", { subId: sub.id });
     } catch (e) {
       invokeError = String(e);
     }
@@ -899,59 +897,23 @@
     if (invokeError) {
       if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
       showPayLoader = false;
-      const isLockedOutputs = invokeError.includes("rejected by daemon") || invokeError.includes("not enough") || invokeError.includes("unlocked");
-      if (isLockedOutputs) {
+      if (invokeError.includes("OUTPUTS_LOCKED")) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
-        // Defer next_payment_at by 25 min so the scheduler retries at the right time
-        const retryAt = new Date(Date.now() + 25 * 60 * 1000).toISOString();
-        const idx = subscriptions.findIndex(s => s.id === sub.id);
-        if (idx !== -1) {
-          subscriptions[idx] = { ...subscriptions[idx], next_payment_at: retryAt };
-          subscriptions = [...subscriptions];
-        }
-        await tauriInvoke("update_subscription_next_payment", { id: sub.id, nextPaymentAt: retryAt });
-        await refreshAlerts();
       } else {
         logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
+        const why = policyMessage(invokeError, $t);
+        alert(why || invokeError);
       }
+      await refreshAlerts();
       return;
     }
 
-    if (result?.tx_hash) {
-      logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${result.tx_hash.slice(0, 12)}...`);
-      lastPaymentSentAt = Date.now();
-      // Optimistic balance subtraction — avoids showing stale balance while locked outputs settle
-      const sentAmt = parseFloat(sub.amount) || 0;
-      if (balanceXmr !== null && sentAmt > 0) {
-        balanceXmr = Math.max(0, balanceXmr - sentAmt);
-        if (wallets.length > 0) wallets[0] = { ...wallets[0], balance: balanceXmr.toFixed(4) };
-      }
-      showPaymentAnimation(); // fullscreen animation
-      // Log to in-session history
-      sessionPayments = [...sessionPayments, {
-        label: sub.label,
-        amount: sub.amount,
-        currency: sub.currency || 'XMR',
-        sent_at: new Date().toISOString(),
-        tx_hash: result.tx_hash || null,
-      }];
-      const rawSched = sub._raw_schedule || sub.schedule;
-      const nextIso = await tauriInvoke("next_occurrence_of", { schedule: rawSched })
-        || new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
-      const idx = subscriptions.findIndex(s => s.id === sub.id);
-      if (idx !== -1) {
-        subscriptions[idx] = { ...subscriptions[idx], next_payment_at: nextIso, status: "Active", payments_sent: (sub.payments_sent || 0) + 1 };
-        subscriptions = [...subscriptions];
-      }
-      await tauriInvoke("update_subscription_next_payment", {
-        id: sub.id,
-        nextPaymentAt: nextIso
-      });
-      balanceLoading = true;
-      setTimeout(async () => { await refreshBalance(); }, 5000);
-    } else {
-      logWarn("Scheduler", `[WARN] Pas de tx_hash dans la reponse pour sub #${sub.id} — paiement non confirme`);
-    }
+    logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${String(txHash).slice(0, 12)}...`);
+    lastPaymentSentAt = Date.now();
+    // Optimistic balance subtraction — avoids showing stale balance while locked outputs settle
+    const sentAmt = parseFloat(sub.amount) || 0;
+    if (balanceXmr !== null && sentAmt > 0) balanceXmr = Math.max(0, balanceXmr - sentAmt);
+    showPaymentAnimation(); // fullscreen animation
   }
 
   async function doSweepAll() {
@@ -1288,11 +1250,10 @@
             sent_at: new Date().toISOString(), tx_hash: payload.tx_hash || null,
           }];
           // Update in-memory next_payment_at so frontend shows correct countdown
-          if (payload.next_payment_at) {
-            subscriptions = subscriptions.map(s =>
-              s.id === payload.sub_id ? { ...s, next_payment_at: payload.next_payment_at } : s
-            );
-          }
+          subscriptions = subscriptions.map(s => s.id === payload.sub_id
+            ? { ...s, status: "Active", payments_sent: (s.payments_sent || 0) + 1,
+                next_payment_at: payload.next_payment_at || s.next_payment_at }
+            : s);
         }
       }
       balanceLoading = true;
@@ -1561,10 +1522,16 @@
           on:click={async () => {
             const subId = pendingPaymentModal.sub_id;
             pendingPaymentModal = null;
-            try { await invokeStrict("approve_payment", { subId }); }
-            catch (e) { logWarn("Scheduler", `approve_payment failed: ${e}`); }
-            // Trigger immediate scheduler cycle
-            setTimeout(() => refreshBalance(), 2000);
+            _pendingQueue = _pendingQueue.filter(q => q.sub_id !== subId);
+            const sub = subscriptions.find(s => s.id === subId);
+            const coolingDown = lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS;
+            if (sub && !paymentInProgress && !coolingDown) {
+              await triggerNow(sub);
+            } else {
+              // Another send is running or too recent: the scheduler sends it as soon as possible.
+              try { await invokeStrict("approve_payment", { subId }); }
+              catch (e) { logWarn("Scheduler", `approve_payment failed: ${e}`); }
+            }
           }}>
           {$t.pendingConfirm}
         </button>
