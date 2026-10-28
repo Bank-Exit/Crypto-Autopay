@@ -1,7 +1,7 @@
 <script>
   import { createEventDispatcher, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { t, currentLang, LANGUAGES } from "./i18n.js";
+  import { t, fmt, currentLang, LANGUAGES } from "./i18n.js";
   import { theme, toggleTheme } from "./theme.js";
 
   const dispatch = createEventDispatcher();
@@ -191,8 +191,8 @@
 
         {#if mode === "restore"}
           <div class="info-box info-green">
-            <div class="info-box-title">🔄 Restauration</div>
-            <p>Entrez vos 25 mots de seed pour restaurer votre wallet. L'historique sera re-synchronisé depuis la blockchain.</p>
+            <div class="info-box-title">{$t.restoreTitle}</div>
+            <p>{$t.restoreDesc}</p>
           </div>
         {:else}
           <p class="step-desc text-muted">{$t.stepSeedDesc}</p>
@@ -229,11 +229,11 @@
             {#if seedLoading}
               <div class="seed-loading">
                 <span class="spinner"></span>
-                Génération de votre seed sécurisée…
+                {$t.seedGenerating}
               </div>
             {:else}
               <div class="seed-words">{generatedSeed}</div>
-              <p class="seed-note">⚠ Notez ces 25 mots sur papier avant de continuer.</p>
+              <p class="seed-note">{$t.seedWriteDown}</p>
             {/if}
           </div>
         {:else}
@@ -283,29 +283,29 @@
                 <div class="verify-ok">
                   <span class="verify-check">✓</span>
                   <span>{$t.checkPaperSeed}</span>
-                  <span class="verify-proof text-muted">(mot n°{verifyIndex} : « {expectedWord} » ✓)</span>
+                  <span class="verify-proof text-muted">{fmt($t.verifyWordProof, { n: verifyIndex, word: expectedWord })}</span>
                 </div>
               {:else}
                 <div class="verify-challenge">
                   <p class="verify-prompt">
-                    Pour confirmer que vous avez bien noté votre seed,
-                    <strong>tapez le mot n°{verifyIndex}</strong> de votre phrase seed :
+                    {$t.verifyPromptBefore}
+                    <strong>{fmt($t.verifyPromptStrong, { n: verifyIndex })}</strong> {$t.verifyPromptAfter}
                   </p>
                   <div class="verify-input-row">
                     <input
                       bind:value={verifyInput}
-                      placeholder="Mot #{verifyIndex}..."
+                      placeholder={fmt($t.verifyPlaceholder, { n: verifyIndex })}
                       on:keydown={e => e.key === "Enter" && checkWord()}
                       class:input-error={verifyError}
                       autocomplete="off"
                       spellcheck="false"
                     />
                     <button class="btn-primary" style="padding:9px 16px;font-size:13px" on:click={checkWord}>
-                      Vérifier
+                      {$t.verifyButton}
                     </button>
                   </div>
                   {#if verifyError}
-                    <p class="error-msg">Mot incorrect — réessayez.</p>
+                    <p class="error-msg">{$t.verifyWrong}</p>
                   {/if}
                 </div>
               {/if}
@@ -338,7 +338,7 @@
           on:click={finish}
         >
           {#if finishLoading}
-            <span class="spinner"></span> Création du wallet…
+            <span class="spinner"></span> {$t.walletCreating}
           {:else}
             🚀 {$t.launchButton}
           {/if}

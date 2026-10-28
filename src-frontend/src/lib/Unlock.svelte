@@ -11,14 +11,11 @@
   let error = "";
   let rpcWarning = null; // non-blocking warning after unlock
   let loading = false;
-  let loadingMsg = "Déverrouillage…";
-
   async function unlock() {
     if (!password) return;
     loading = true;
     error = "";
     rpcWarning = null;
-    loadingMsg = "Déverrouillage…";
     logInfo("Unlock", "unlock_wallet invoked");
     try {
       const result = await invoke("unlock_wallet", { password });
@@ -41,20 +38,16 @@
     } catch (e) {
       const msg = typeof e === "string" ? e : String(e);
       logError("Unlock", `unlock_wallet threw: ${msg}`);
-      error = msg.includes("Incorrect") ? "Mot de passe incorrect." : msg;
+      error = msg.includes("Incorrect") ? $t.unlockWrongPassword : msg;
       loading = false;
     }
   }
 
-  function friendlyRpcError(w) {
+  function friendlyRpcError(w, tObj) {
     if (!w) return "";
-    if (w.type === "seed_invalid") {
-      return "⚠️ Votre phrase secrète semble corrompue (ancienne version de l'app). Vos abonnements sont accessibles, mais le solde Monero ne peut pas être affiché. Pour corriger : réinitialisez votre wallet (bouton ci-dessous) puis recréez-le avec les 25 mots notés.";
-    }
-    if (w.type === "network") {
-      return "⚠️ Impossible de joindre le réseau Monero. Vérifiez votre connexion internet. Vos abonnements restent accessibles, le solde sera affiché à la prochaine connexion.";
-    }
-    return "⚠️ Erreur réseau : " + w.raw;
+    if (w.type === "seed_invalid") return tObj.unlockSeedInvalid;
+    if (w.type === "network") return tObj.unlockNetworkWarn;
+    return tObj.unlockNetworkError + w.raw;
   }
 
   function onKey(e) {
@@ -87,7 +80,7 @@
     <div class="lock-logo">
       <img src="/logo.png" alt="Crypto AutoPay" width="140" height="140" style="border-radius:20px;display:block;margin:0 auto 16px"/>
       <div>
-        <div class="lock-hint">{$t.unlockHint || "Entrez votre mot de passe pour déverrouiller"}</div>
+        <div class="lock-hint">{$t.unlockHint}</div>
       </div>
     </div>
 
@@ -100,7 +93,7 @@
     </div>
 
     <label class="pw-label">
-      {$t.masterPassword || "Mot de passe"}
+      {$t.masterPasswordMin}
       <div class="pw-row">
         <!-- svelte-ignore a11y-autofocus -->
         <input
@@ -140,14 +133,14 @@
 
     {#if rpcWarning}
       <div class="rpc-warning">
-        <p>{friendlyRpcError(rpcWarning)}</p>
+        <p>{friendlyRpcError(rpcWarning, $t)}</p>
         {#if rpcWarning.type === "seed_invalid"}
           <button class="btn-link warn-reset" on:click={() => dispatch("reset")}>
-            → Réinitialiser mon wallet
+            {$t.unlockResetMine}
           </button>
         {/if}
         <button class="btn-link warn-close" on:click={() => dispatch("unlocked", { address: "", balance: 0 })}>
-          → Continuer quand même
+          {$t.unlockContinueAnyway}
         </button>
       </div>
     {:else}
@@ -157,14 +150,14 @@
         disabled={!password || loading}
       >
         {#if loading}
-          <span class="spinner"></span> {loadingMsg}
+          <span class="spinner"></span> {$t.unlockLoading}
         {:else}
-          {$t.unlock || "Déverrouiller"} →
+          {$t.unlock} →
         {/if}
       </button>
 
       <button class="btn-link" on:click={() => dispatch("reset")}>
-        {$t.resetWallet || "Réinitialiser le wallet (seed perdu)"}
+        {$t.resetWallet}
       </button>
     {/if}
   </div>

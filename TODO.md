@@ -11,6 +11,9 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **Tray zombie on crash**: If the app is force-killed (`kill -9`), the tray icon may remain. Add a PID lockfile or use the single-instance plugin's cleanup hook to remove the tray on startup if a stale one exists.
 - [ ] **Window restore**: Single-instance plugin now correctly calls `show() + unminimize() + set_focus()`. Verify on all 3 platforms (Linux, Windows, macOS) that clicking the tray icon always brings the window to front.
 - [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
+- [ ] **Review "AutoPay account" creation (UX + security)**: the notion of "account" makes no sense here (nothing is registered anywhere, it is a local encrypted vault + a Monero wallet). Find better wording ("coffre local", "profil sur cet appareil"...) and re-review the whole flow: seed generation, seed backup/verification, restoration from 25 words, reset when the seed is lost, master password change.
+- [ ] **Multi-year subscriptions**: `repeat_every > 1` is refused (`POLICY:UNSUPPORTED_REPEAT`) because cron cannot express "every N years" and the scheduler would pay every year. Needs a dedicated column + scheduler support before re-enabling the "Pluriannuel" preset.
+- [ ] **Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
 - [ ] **monero-wallet-rpc bundled**: Currently users must download and configure the binary separately. Bundle it inside the installer for one-click setup. Legal check: MIT license of monero-wallet-rpc allows bundling.
 
 ---
@@ -40,6 +43,8 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 ## Developer / Infrastructure
 
+- [ ] **monero-wallet-rpc version pinning**: ship a pinned version with its SHA-256 (verified against binaryFate's signed `hashes.txt`), check `get_version` at startup and refuse/alert on an unknown major version. CI job watching Monero releases + hard-fork dates, run the RPC integration tests against the new binary, release before the fork height.
+- [ ] **App update channel**: Tauri updater with a minisign public key embedded in the binary. Signed manifest fetched from the hardcoded domain, with Tor onion and IPFS mirrors as fallbacks; the signature is mandatory whatever the source. Notification only (no silent install), link to the official repository. Aim for reproducible builds.
 - [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
 - [ ] **macOS code signing**: Set `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` secrets in GitHub repo settings. Without signing, macOS shows Gatekeeper warning.
 - [ ] **Windows code signing**: Set `TAURI_SIGNING_PRIVATE_KEY` in GitHub secrets. Without signing, Windows Defender flags the installer.

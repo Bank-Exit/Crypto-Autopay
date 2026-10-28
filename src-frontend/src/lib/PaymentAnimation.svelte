@@ -23,11 +23,11 @@
   onDestroy(() => clearInterval(interval));
 
   $: current = subjects[cycleIdx];
-  $: toLabel = current.toLabel || (cycleIdx === 0 ? $t.mediaLabel || "Le Média Libre" : $t.vpnLabel || "VPN");
+  $: toLabel = current.toLabel || (cycleIdx === 0 ? $t.mediaLabel : $t.vpnLabel);
   $: amount = ($currentNetwork.id === "bitcoin" ? current.btcAmount : current.xmrAmount)
-              + " " + $currentNetwork.symbol + ($t.animSuffix || "/mois");
-  $: fromLabel = $t.myWallet || "Mon wallet";
-  $: dm = $t.dayMinus || "J-";
+              + " " + $currentNetwork.symbol + ($t.animSuffix);
+  $: fromLabel = $t.myWallet;
+  $: dm = $t.dayMinus;
 </script>
 
 <div class="anim-wrap" aria-hidden="true">

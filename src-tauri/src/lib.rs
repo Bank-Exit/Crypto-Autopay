@@ -1506,6 +1506,10 @@ async fn save_subscription(
     use uuid::Uuid;
 
     let now = Utc::now();
+    // "Every N years" is not expressible in cron and the scheduler would pay every year.
+    if payload["repeat_every"].as_u64().unwrap_or(1) > 1 {
+        return Err(payment_policy::PolicyError::UnsupportedRepeat.to_string());
+    }
     let label = payment_policy::clean_text(payload["custom_label"].as_str().unwrap_or("—"), 80);
     let dest = payload["destination_address"].as_str().unwrap_or("").trim().to_string();
     let amount = payload["amount"].as_str().unwrap_or("0").to_string();

@@ -42,14 +42,12 @@
     monero: {
       // Mainnet primary (4..., 95 chars) | subaddress (8..., 95) | integrated (4..., 106)
       re: /^[48][1-9A-HJ-NP-Za-km-z]{93,94}$|^4[1-9A-HJ-NP-Za-km-z]{105}$/,
-      hint: "Adresse Monero (95 caractères, commence par 4 ou 8)",
-      hint_en: "Monero address (95 chars, starts with 4 or 8)",
+      hint: ["Adresse Monero (95 caractères, commence par 4 ou 8)", "Monero address (95 chars, starts with 4 or 8)"],
     },
     bitcoin: {
       // Legacy P2PKH (1...) | P2SH (3...) | bech32 segwit (bc1q...) | bech32m taproot (bc1p...)
       re: /^[13][1-9A-HJ-NP-Za-km-z]{25,33}$|^bc1[qp][0-9a-z]{38,87}$/,
-      hint: "Adresse Bitcoin (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)",
-      hint_en: "Bitcoin address (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)",
+      hint: ["Adresse Bitcoin (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)", "Bitcoin address (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)"],
     },
   };
 
@@ -61,7 +59,7 @@
   }
 
   $: addressValid = validateAddress(payload.destination_address, payload.network);
-  $: addressHint = ADDRESS_RULES[payload.network]?.[lang === "fr" ? "hint" : "hint_en"] || "";
+  $: addressHint = ADDRESS_RULES[payload.network] ? l(...ADDRESS_RULES[payload.network].hint) : "";
 
   // ---- "create" mode state ----
   let payload = {
@@ -154,21 +152,17 @@
     const preset = SCHEDULE_PRESETS.find(p => p.id === schedulePresetId);
     if (!preset) return payload.schedule;
     if (schedulePresetId === "custom") return payload.schedule || "—";
-    const base = lang === "fr" ? preset.label_fr : preset.label_en;
-    if (schedulePresetId === "yearly" && payload.repeat_every > 1) {
-      return lang === "fr" ? `Tous les ${payload.repeat_every} ans` : `Every ${payload.repeat_every} years`;
-    }
-    return base;
+    return presetLabel(preset);
   })();
 
   // ---- Shared payload validation & building ----
   function buildCleanPayload() {
     const amountStr = String(payload.amount ?? "").trim();
     let err = null;
-    if (!payload.custom_label.trim()) err = lang === "fr" ? "Nom requis." : "Label required.";
-    else if (!payload.destination_address.trim()) err = lang === "fr" ? "Adresse requise." : "Address required.";
-    else if (addressValid === false) err = lang === "fr" ? "Adresse invalide pour ce réseau." : "Invalid address for this network.";
-    else if (!amountStr || isNaN(parseFloat(amountStr)) || parseFloat(amountStr) <= 0) err = lang === "fr" ? "Montant invalide (> 0 requis)." : "Invalid amount (must be > 0).";
+    if (!payload.custom_label.trim()) err = l("Nom requis.", "Label required.");
+    else if (!payload.destination_address.trim()) err = l("Adresse requise.", "Address required.");
+    else if (addressValid === false) err = l("Adresse invalide pour ce réseau.", "Invalid address for this network.");
+    else if (!amountStr || isNaN(parseFloat(amountStr)) || parseFloat(amountStr) <= 0) err = l("Montant invalide (> 0 requis).", "Invalid amount (must be > 0).");
     if (err) return { error: err };
     const clean = {
       version: 1,
@@ -242,7 +236,7 @@
       if (rate) fiatValue = parseFloat(payload.amount) * parseFloat(rate);
       else throw new Error("No rate in response");
     } catch (e) {
-      fiatError = "Erreur API"; fiatValue = null;
+      fiatError = l("Erreur API", "API error"); fiatValue = null;
       console.warn("[SCE] Fiat rate fetch failed:", e);
     } finally { fiatLoading = false; }
   }
@@ -320,12 +314,12 @@
     ? `https://autopay.libre-market.com/add?code=${encodeURIComponent(generatedCode)}`
     : "";
   $: shareHtmlButton = generatedCode && generatedPayloadForShare
-    ? `<a href="${generatedCode}">\n  <button>S'abonner – ${generatedPayloadForShare.amount} ${generatedPayloadForShare.currency || 'XMR'}</button>\n</a>`
+    ? `<a href="${generatedCode}">\n  <button>${l("S'abonner", "Subscribe")} – ${generatedPayloadForShare.amount} ${generatedPayloadForShare.currency || 'XMR'}</button>\n</a>`
     : "";
 
   let copiedField = null;
   async function copyField(text, field) {
-    try { await navigator.clipboard.writeText(text); } catch { prompt("Copier :", text); }
+    try { await navigator.clipboard.writeText(text); } catch { prompt(l("Copier :", "Copy:"), text); }
     copiedField = field;
     setTimeout(() => copiedField = null, 2000);
   }
@@ -366,8 +360,102 @@
     }
   }
 
-  // ---- i18n helpers (minimal, works standalone too) ----
-  function l(fr, en) { return lang === "fr" ? fr : en; }
+  // ---- i18n helpers (self-contained so the component also works in the web generator) ----
+  // German and Spanish, keyed by the English source string.
+  const TR = {
+    "Crypto network": { de: "Krypto-Netzwerk", es: "Red cripto" },
+    "Token symbol": { de: "Token-Symbol", es: "Símbolo del token" },
+    "Contract address": { de: "Vertragsadresse", es: "Dirección del contrato" },
+    "(optional but recommended)": { de: "(optional, aber empfohlen)", es: "(opcional pero recomendado)" },
+    "Subscription name": { de: "Name des Abonnements", es: "Nombre de la suscripción" },
+    "My Service — Monthly": { de: "Mein Dienst — Monatlich", es: "Mi servicio — Mensual" },
+    "Receiving address": { de: "Empfangsadresse", es: "Dirección de recepción" },
+    "bc1q... or 1... or 3...": { de: "bc1q... oder 1... oder 3...", es: "bc1q... o 1... o 3..." },
+    "Invalid format.": { de: "Ungültiges Format.", es: "Formato no válido." },
+    "Valid address": { de: "Gültige Adresse", es: "Dirección válida" },
+    "Monero address (95 chars, starts with 4 or 8)": { de: "Monero-Adresse (95 Zeichen, beginnt mit 4 oder 8)", es: "Dirección Monero (95 caracteres, empieza por 4 u 8)" },
+    "Bitcoin address (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)": { de: "Bitcoin-Adresse (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)", es: "Dirección Bitcoin (Legacy 1…, P2SH 3…, Segwit bc1q…, Taproot bc1p…)" },
+    "Amount": { de: "Betrag", es: "Importe" },
+    "Currency": { de: "Währung", es: "Moneda" },
+    "Fiat equivalent": { de: "Fiat-Gegenwert", es: "Equivalente fiat" },
+    "Enable (⚠ privacy)": { de: "Aktivieren (⚠ Privatsphäre)", es: "Activar (⚠ privacidad)" },
+    "Enable fiat conversion": { de: "Fiat-Umrechnung aktivieren", es: "Activar la conversión fiat" },
+    "The LibreMonero.com API will be used to fetch the current rate. It is a volunteer service that guarantees anonymity and keeps no logs.": { de: "Die API von LibreMonero.com wird verwendet, um den aktuellen Kurs abzurufen. Es ist ein ehrenamtlicher Dienst, der Anonymität garantiert und keine Protokolle speichert.", es: "Se usará la API de LibreMonero.com para obtener la cotización actual. Es un servicio voluntario que garantiza el anonimato y no guarda registros." },
+    "For maximum anonymity, it is recommended to leave this field disabled.": { de: "Für maximale Anonymität wird empfohlen, dieses Feld deaktiviert zu lassen.", es: "Para un anonimato máximo, se recomienda dejar este campo desactivado." },
+    "API error": { de: "API-Fehler", es: "Error de la API" },
+    "Enable": { de: "Aktivieren", es: "Activar" },
+    "Cancel": { de: "Abbrechen", es: "Cancelar" },
+    "Frequency": { de: "Häufigkeit", es: "Frecuencia" },
+    "Every": { de: "Alle", es: "Cada" },
+    "years": { de: "Jahre", es: "años" },
+    "Cron:": { de: "Cron:", es: "Cron:" },
+    "Number of payments": { de: "Anzahl der Zahlungen", es: "Número de pagos" },
+    "unlimited": { de: "unbegrenzt", es: "ilimitado" },
+    "Start date": { de: "Startdatum", es: "Fecha de inicio" },
+    "When to start?": { de: "Wann starten?", es: "¿Cuándo empezar?" },
+    "(required)": { de: "(erforderlich)", es: "(obligatorio)" },
+    "Start mode": { de: "Startmodus", es: "Modo de inicio" },
+    "Wait": { de: "Warten", es: "Esperar" },
+    "Required choice": { de: "Auswahl erforderlich", es: "Elección obligatoria" },
+    "Immediately": { de: "Sofort", es: "Inmediatamente" },
+    "First send at the next scheduled occurrence": { de: "Erste Zahlung beim nächsten geplanten Termin", es: "Primer envío en la próxima fecha programada" },
+    "Send triggered as soon as subscription is added": { de: "Zahlung wird ausgelöst, sobald das Abonnement hinzugefügt ist", es: "El envío se activa en cuanto se añade la suscripción" },
+    "Advanced options": { de: "Erweiterte Optionen", es: "Opciones avanzadas" },
+    "Description": { de: "Beschreibung", es: "Descripción" },
+    "Subscription details…": { de: "Details zum Abonnement…", es: "Detalles de la suscripción…" },
+    "Free trial (days)": { de: "Kostenlose Testphase (Tage)", es: "Prueba gratuita (días)" },
+    "none": { de: "keine", es: "ninguna" },
+    "Canary URL (recommended)": { de: "Canary-URL (empfohlen)", es: "URL Canary (recomendada)" },
+    "Choose when to start sending": { de: "Wählen Sie, wann die Zahlungen beginnen", es: "Elige cuándo empezar los envíos" },
+    "Choose start mode ↑": { de: "Startmodus wählen ↑", es: "Elegir el modo de inicio ↑" },
+    "Add to my subscriptions": { de: "Zu meinen Abonnements hinzufügen", es: "Añadir a mis suscripciones" },
+    "Generate AutoPay code →": { de: "AutoPay-Code erzeugen →", es: "Generar el código AutoPay →" },
+    "Code generated — share with your subscribers": { de: "Code erzeugt — teilen Sie ihn mit Ihren Abonnenten", es: "Código generado — compártelo con tus suscriptores" },
+    "Raw URI": { de: "Rohe URI", es: "URI en bruto" },
+    "Web link (email / SMS)": { de: "Web-Link (E-Mail / SMS)", es: "Enlace web (email / SMS)" },
+    "HTML button for your website": { de: "HTML-Schaltfläche für Ihre Website", es: "Botón HTML para tu sitio web" },
+    "Button preview": { de: "Vorschau der Schaltfläche", es: "Vista previa del botón" },
+    "✓ Copied": { de: "✓ Kopiert", es: "✓ Copiado" },
+    "Copy": { de: "Kopieren", es: "Copiar" },
+    "Copy:": { de: "Kopieren:", es: "Copiar:" },
+    "Copy HTML": { de: "HTML kopieren", es: "Copiar HTML" },
+    "Subscribe": { de: "Abonnieren", es: "Suscribirse" },
+    "Rendered preview as it will appear on your site. Clickable to test.": { de: "Vorschau, wie sie auf Ihrer Website erscheint. Zum Testen anklickbar.", es: "Vista previa tal como aparecerá en tu sitio. Se puede pulsar para probar." },
+    "period": { de: "Zeitraum", es: "periodo" },
+    "Edit code": { de: "Code bearbeiten", es: "Editar el código" },
+    "Paste an autopay or monero-request code": { de: "Fügen Sie einen autopay- oder monero-request-Code ein", es: "Pega un código autopay o monero-request" },
+    "Paste from clipboard": { de: "Aus der Zwischenablage einfügen", es: "Pegar desde el portapapeles" },
+    "crypto-autopay:1:H4sI...  or  monero-request:1:H4sI...": { de: "crypto-autopay:1:H4sI...  oder  monero-request:1:H4sI...", es: "crypto-autopay:1:H4sI...  o  monero-request:1:H4sI..." },
+    "Decoding…": { de: "Wird dekodiert…", es: "Decodificando…" },
+    "Decode →": { de: "Dekodieren →", es: "Decodificar →" },
+    "Identical subscription already exists": { de: "Identisches Abonnement bereits vorhanden", es: "Ya existe una suscripción idéntica" },
+    "Similar subscription may exist": { de: "Möglicherweise existiert ein ähnliches Abonnement", es: "Puede que exista una suscripción similar" },
+    " — same address and schedule.": { de: " — gleiche Adresse und Häufigkeit.", es: " — misma dirección y frecuencia." },
+    " — same name, amount and currency.": { de: " — gleicher Name, Betrag und Währung.", es: " — mismo nombre, importe y moneda." },
+    "Do you still want to add it?": { de: "Möchten Sie es trotzdem hinzufügen?", es: "¿Quieres añadirla de todos modos?" },
+    "No — close": { de: "Nein — schließen", es: "No — cerrar" },
+    "Yes, show anyway": { de: "Ja, trotzdem anzeigen", es: "Sí, mostrar de todos modos" },
+    "Are you really sure?": { de: "Sind Sie wirklich sicher?", es: "¿Estás realmente seguro?" },
+    "This duplicate will be added. Solve to confirm.": { de: "Dieses Duplikat wird hinzugefügt. Lösen Sie die Rechnung zur Bestätigung.", es: "Este duplicado se añadirá. Resuelve el cálculo para confirmar." },
+    "Wrong answer.": { de: "Falsche Antwort.", es: "Respuesta incorrecta." },
+    "Confirm": { de: "Bestätigen", es: "Confirmar" },
+    "converted": { de: "umgewandelt", es: "convertido" },
+    "First send at next scheduled occurrence": { de: "Erste Zahlung beim nächsten geplanten Termin", es: "Primer envío en la próxima fecha programada" },
+    "Send triggered as soon as added": { de: "Zahlung wird sofort nach dem Hinzufügen ausgelöst", es: "El envío se activa en cuanto se añade" },
+    "Add this subscription →": { de: "Dieses Abonnement hinzufügen →", es: "Añadir esta suscripción →" },
+    "Label required.": { de: "Name erforderlich.", es: "Nombre obligatorio." },
+    "Address required.": { de: "Adresse erforderlich.", es: "Dirección obligatoria." },
+    "Invalid address for this network.": { de: "Ungültige Adresse für dieses Netzwerk.", es: "Dirección no válida para esta red." },
+    "Invalid amount (must be > 0).": { de: "Ungültiger Betrag (muss > 0 sein).", es: "Importe no válido (debe ser > 0)." },
+  };
+  function translate(language, fr, en) {
+    if (language === "fr") return fr;
+    if (language === "en") return en;
+    return TR[en]?.[language] ?? en;
+  }
+  // Reactive so that every {l(...)} in the markup re-renders when `lang` changes.
+  $: l = (fr, en) => translate(lang, fr, en);
+  $: presetLabel = (preset) => preset[`label_${lang}`] || preset.label_en;
 </script>
 
 <div class="sce" class:compact>
@@ -409,7 +497,7 @@
         </div>
       {:else if payload.token && payload.token_contract !== null}
         <label class="field">
-          <span>{l("Adresse du contrat", "Contract address")} <span class="hint">(optionnel mais recommandé)</span></span>
+          <span>{l("Adresse du contrat", "Contract address")} <span class="hint">{l("(optionnel mais recommandé)", "(optional but recommended)")}</span></span>
           <input type="text" bind:value={payload.token_contract} placeholder="0x..." />
         </label>
       {/if}
@@ -424,7 +512,7 @@
       <label class="field">
         <span>{l("Adresse de réception", "Receiving address")} <span class="required">*</span></span>
         <input type="text" bind:value={payload.destination_address}
-               placeholder={payload.network === "monero" ? "4At3X5rvVypTofgmueN9s9..." : "bc1q... ou 1... ou 3..."}
+               placeholder={payload.network === "monero" ? "4At3X5rvVypTofgmueN9s9..." : l("bc1q... ou 1... ou 3...", "bc1q... or 1... or 3...")}
                class="monospace"
                class:input-ok={addressValid === true}
                class:input-error={addressValid === false} />
@@ -506,18 +594,10 @@
               on:click={() => { schedulePresetId = preset.id; onPresetChange(); }}
               type="button"
             >
-              {lang === "fr" ? preset.label_fr : preset.label_en}
+              {presetLabel(preset)}
             </button>
           {/each}
-          <!-- Multi-year button -->
-          <button
-            class="preset-btn"
-            class:active={schedulePresetId === "yearly" && payload.repeat_every > 1}
-            on:click={() => { schedulePresetId = "yearly"; payload.schedule = "0 9 1 1 *"; payload.repeat_every = multiYearN; }}
-            type="button"
-          >
-            {l("Pluriannuel", "Multi-year")}
-          </button>
+
         </div>
 
         {#if schedulePresetId === "yearly" && payload.repeat_every > 1}
@@ -627,33 +707,33 @@
           <div class="share-success">✅ {l("Code généré — à partager avec vos abonnés", "Code generated — share with your subscribers")}</div>
 
           <div class="share-block">
-            <span class="share-label">🔗 URI brut</span>
+            <span class="share-label">🔗 {l("URI brut", "Raw URI")}</span>
             <div class="share-code">{generatedCode}</div>
             <button class="btn-copy-sm" type="button" on:click={() => copyField(generatedCode, 'uri')}>
-              {copiedField === 'uri' ? '✓ Copié' : 'Copier'}
+              {copiedField === 'uri' ? l("✓ Copié", "✓ Copied") : l("Copier", "Copy")}
             </button>
           </div>
 
           <div class="share-block">
-            <span class="share-label">🌐 Lien web (email / SMS)</span>
+            <span class="share-label">🌐 {l("Lien web (email / SMS)", "Web link (email / SMS)")}</span>
             <div class="share-code">{shareWebUrl}</div>
             <button class="btn-copy-sm" type="button" on:click={() => copyField(shareWebUrl, 'web')}>
-              {copiedField === 'web' ? '✓ Copié' : 'Copier'}
+              {copiedField === 'web' ? l("✓ Copié", "✓ Copied") : l("Copier", "Copy")}
             </button>
           </div>
 
           <div class="share-block">
-            <span class="share-label">🖥 Bouton HTML pour votre site</span>
+            <span class="share-label">🖥 {l("Bouton HTML pour votre site", "HTML button for your website")}</span>
             <pre class="share-code share-pre">{shareHtmlButton}</pre>
             <button class="btn-copy-sm" type="button" on:click={() => copyField(shareHtmlButton, 'html')}>
-              {copiedField === 'html' ? '✓ Copié' : 'Copier HTML'}
+              {copiedField === 'html' ? l("✓ Copié", "✓ Copied") : l("Copier HTML", "Copy HTML")}
             </button>
           </div>
 
           <!-- Live preview of the button (only shown in full-page mode="create") -->
           {#if !compact}
             <div class="share-block">
-              <span class="share-label">👁 Prévisualisation du bouton</span>
+              <span class="share-label">👁 {l("Prévisualisation du bouton", "Button preview")}</span>
               <p class="share-preview-hint" style="font-size:11px;color:var(--text-muted)">
                 {l("Aperçu rendu tel qu'il apparaîtra sur votre site. Cliquable pour tester.", "Rendered preview as it will appear on your site. Clickable to test.")}
               </p>
@@ -667,7 +747,7 @@
                      }
                    }}>
                   <button class="preview-btn" type="button">
-                    S'abonner — {generatedPayloadForShare?.amount} {generatedPayloadForShare?.currency || "XMR"} / {l("période", "period")}
+                    {l("S'abonner", "Subscribe")} — {generatedPayloadForShare?.amount} {generatedPayloadForShare?.currency || "XMR"} / {l("période", "period")}
                   </button>
                 </a>
               </div>
@@ -695,7 +775,7 @@
         <textarea
           bind:value={importInput}
           rows="3"
-          placeholder="crypto-autopay:1:H4sI...  ou  monero-request:1:H4sI..."
+          placeholder={l("crypto-autopay:1:H4sI...  ou  monero-request:1:H4sI...", "crypto-autopay:1:H4sI...  or  monero-request:1:H4sI...")}
           class="monospace"
         />
       </label>

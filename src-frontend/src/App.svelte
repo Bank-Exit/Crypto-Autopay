@@ -8,12 +8,13 @@
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
   import { subscribeToLogs, logInfo, logWarn, logError } from "./lib/AppLogger.js";
+  import { t } from "./lib/i18n.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
   let appState = "checking";
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
-  // ===== Auto-lock after 2 min of inactivity =====
+  // ===== Auto-lock after 3 min of inactivity =====
   const AUTO_LOCK_MS = 3 * 60 * 1000; // 3 minutes
   let autoLockTimer = null;
 
@@ -115,7 +116,7 @@
 
   function onReset() {
     // TODO: show confirmation dialog before deleting vault
-    if (confirm("Effacer le wallet local ? Cette action est irréversible si vous n'avez pas votre seed.")) {
+    if (confirm($t.resetConfirm)) {
       invoke("reset_wallet").catch(() => {});
       appState = "welcome";
     }
@@ -200,14 +201,14 @@
 
   <!-- Logs drawer -->
   {#if showLogs}
-    <div class="logs-overlay" role="button" tabindex="-1" aria-label="Fermer les logs" on:click={() => showLogs = false} on:keydown={e => e.key === 'Escape' && (showLogs = false)}></div>
+    <div class="logs-overlay" role="button" tabindex="-1" aria-label={$t.logsDrawerClose} on:click={() => showLogs = false} on:keydown={e => e.key === 'Escape' && (showLogs = false)}></div>
     <div class="logs-drawer">
       <div class="logs-header">
-        <span>📋 Logs <span style="font-size:10px;color:#aaa;font-weight:400">↑ plus récent en haut</span></span>
+        <span>📋 Logs <span style="font-size:10px;color:#aaa;font-weight:400">{$t.logsDrawerNewest}</span></span>
         <div class="logs-filters">
-          <button class:active={logFilter==="all"} on:click={() => logFilter="all"}>Tous</button>
-          <button class:active={logFilter==="warn"} on:click={() => logFilter="warn"}>⚠️ Warnings</button>
-          <button class:active={logFilter==="error"} on:click={() => logFilter="error"}>🔴 Erreurs</button>
+          <button class:active={logFilter==="all"} on:click={() => logFilter="all"}>{$t.logsDrawerAll}</button>
+          <button class:active={logFilter==="warn"} on:click={() => logFilter="warn"}>⚠️ {$t.logsDrawerWarnings}</button>
+          <button class:active={logFilter==="error"} on:click={() => logFilter="error"}>🔴 {$t.logsDrawerErrors}</button>
         </div>
         <button class="logs-close" on:click={() => showLogs = false}>✕</button>
       </div>

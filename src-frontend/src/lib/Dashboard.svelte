@@ -1,7 +1,7 @@
 <script>
   import { tick, onMount, onDestroy, createEventDispatcher } from "svelte";
   const dispatch = createEventDispatcher();
-  import { t, currentLang, LANGUAGES } from "./i18n.js";
+  import { t, fmt, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
   import { paymentMode } from "./paymentMode.js";
@@ -36,7 +36,7 @@
   let limitPrompt = null;      // { key } while the password is asked to unlock a limit
   let limitPassword = "";
   let limitError = "";
-  let policyNotice = null;     // { message, canConfirm, resolve, retry }
+  let policyNotice = null;     // { raw, canConfirm, resolve, retry }
 
   async function loadPaymentLimits() {
     const l = await tauriInvoke("get_payment_limits");
@@ -68,28 +68,34 @@
       await loadPaymentLimits();
       await refreshAlerts();
     } catch (e) {
-      limitError = String(e).includes("Incorrect password") ? "Mot de passe incorrect." : String(e);
+      limitError = String(e).includes("Incorrect password") ? $t.unlockWrongPassword : String(e);
       limitPassword = "";
     }
   }
 
   /** Backend refusal "POLICY:<CODE>[:detail]" as a plain explanation, or null for other errors. */
-  function policyMessage(err) {
+  function policyMessage(err, tObj) {
     const m = String(err).match(/POLICY:([A-Z_]+)(?::([\d.]+))?/);
     if (!m) return null;
     const L = paymentLimits;
     switch (m[1]) {
-      case "UNSUPPORTED_CURRENCY": return "Seuls les abonnements en XMR peuvent être payés pour l'instant.";
-      case "INVALID_ADDRESS": return "L'adresse du destinataire n'est pas une adresse Monero valide.";
-      case "INVALID_AMOUNT": return "Le montant n'est pas valide.";
-      case "AMOUNT_TOO_LOW": return `Montant trop faible : le minimum pour un abonnement est de ${L.min_amount_xmr} XMR.`;
-      case "AMOUNT_ABOVE_MAX": return `Montant supérieur à ${L.max_amount_xmr} XMR par envoi. Pour l'autoriser, activez « Montants élevés » dans Paramètres, Limites de sécurité.`;
-      case "INVALID_SCHEDULE": return "La cadence de l'abonnement n'est pas reconnue.";
-      case "CADENCE_BELOW_FLOOR": return "Cadence trop rapprochée : au plus un envoi toutes les 25 minutes.";
-      case "CADENCE_TOO_SHORT": return `Cadence de moins de ${L.min_cadence_days} jours. Pour l'autoriser, activez « Cadences très courtes » dans Paramètres, Limites de sécurité.`;
-      case "MONTHLY_TOTAL": return `Avec cet abonnement, l'ensemble de vos abonnements représentera environ ${m[2]} XMR par mois.`;
-      default: return "Abonnement refusé par les limites de sécurité.";
+      case "UNSUPPORTED_CURRENCY": return tObj.policyUnsupportedCurrency;
+      case "UNSUPPORTED_REPEAT": return tObj.policyUnsupportedRepeat;
+      case "INVALID_ADDRESS": return tObj.policyInvalidAddress;
+      case "INVALID_AMOUNT": return tObj.policyInvalidAmount;
+      case "AMOUNT_TOO_LOW": return fmt(tObj.policyAmountTooLow, { min: L.min_amount_xmr });
+      case "AMOUNT_ABOVE_MAX": return fmt(tObj.policyAmountAboveMax, { max: L.max_amount_xmr });
+      case "INVALID_SCHEDULE": return tObj.policyInvalidSchedule;
+      case "CADENCE_BELOW_FLOOR": return tObj.policyCadenceBelowFloor;
+      case "CADENCE_TOO_SHORT": return fmt(tObj.policyCadenceTooShort, { days: L.min_cadence_days });
+      case "MONTHLY_TOTAL": return fmt(tObj.policyMonthlyTotal, { total: m[2] });
+      default: return tObj.policyDefault;
     }
+  }
+
+  /** Refusals that a setting in "Security limits" can lift. */
+  function policyNeedsSettings(err) {
+    return /POLICY:(AMOUNT_ABOVE_MAX|CADENCE_TOO_SHORT)/.test(String(err));
   }
 
   async function reloadSubscriptions() {
@@ -106,14 +112,13 @@
     try {
       return await invokeStrict(cmd, args);
     } catch (e) {
-      const message = policyMessage(e);
-      if (!message) { logWarn("Dashboard", `${cmd} failed: ${e}`); return null; }
+      if (!policyMessage(e, $t)) { logWarn("Dashboard", `${cmd} failed: ${e}`); return null; }
       logInfo("Policy", `Subscription refused (${String(e).match(/POLICY:[A-Z_]+/)?.[0]})`);
       await reloadSubscriptions();
       const monthly = String(e).includes("POLICY:MONTHLY_TOTAL");
       return await new Promise(resolve => {
         policyNotice = {
-          message, canConfirm: monthly, resolve,
+          raw: String(e), canConfirm: monthly, resolve,
           retry: monthly ? () => persistNewSubscription(cmd, { ...args, confirmMonthly: true }) : null,
         };
       });
@@ -127,12 +132,15 @@
     notice.resolve(confirmed && notice.retry ? await notice.retry() : false);
   }
 
-  const PENDING_REASON_LABELS = {
-    first_payment: "Premier envoi vers ce destinataire",
-    terms_changed: "Les conditions ont changé depuis votre dernière validation",
-    high_amount: "Montant élevé (1 XMR ou plus)",
-    semi_auto: "Mode semi-auto : chaque envoi est confirmé",
-  };
+  function pendingReasonLabel(reason, tObj) {
+    switch (reason) {
+      case "first_payment": return tObj.reasonFirstPayment;
+      case "terms_changed": return tObj.reasonTermsChanged;
+      case "high_amount": return fmt(tObj.reasonHighAmount, { n: paymentLimits.high_amount_xmr });
+      case "semi_auto": return tObj.reasonSemiAuto;
+      default: return reason;
+    }
+  }
 
   async function tauriListen(event, cb) {
     try {
@@ -187,53 +195,53 @@
     const thresh = threshMatch ? parseInt(threshMatch[1]) : 7;
     switch (alert.kind) {
       case 'BALANCE_LOW':
-        if (num !== null && num < 1) return tObj.alertBalanceLowSoon || `${tObj.refillLessThanOneDay || 'moins de 1 jour'} (${tObj.alertThreshold || 'seuil'}: ${thresh}j)`;
-        return (tObj.alertBalanceLow || 'Portefeuille vide dans ~{n} jour(s) (seuil: {t}j)').replace('{n}', num ?? '?').replace('{t}', thresh);
-      case 'BALANCE_EMPTY': return tObj.alertBalanceEmpty || 'Solde nul — les paiements récurrents ne peuvent pas être envoyés';
+        if (num !== null && num < 1) return tObj.alertBalanceLowSoon;
+        return (tObj.alertBalanceLow).replace('{n}', num ?? '?').replace('{t}', thresh);
+      case 'BALANCE_EMPTY': return tObj.alertBalanceEmpty;
       case 'CANARY_EXPIRED': {
         const label = subLabelForAlert(alert);
-        return (tObj.alertCanaryExpired || 'Canary expiré').replace('{label}', label);
+        return (tObj.alertCanaryExpired).replace('{label}', label);
       }
       case 'CANARY_UNREACHABLE': {
         const label = subLabelForAlert(alert);
-        return (tObj.alertCanaryUnreachable || 'Canary inaccessible').replace('{label}', label);
+        return (tObj.alertCanaryUnreachable).replace('{label}', label);
       }
       case 'PAYMENT_OVERDUE_SOFT': {
         const label = subLabelForAlert(alert);
         return label
-          ? (tObj.alertOverdueSoft || 'Paiement en retard').replace('{label}', label)
-          : (tObj.alertOverdueSoft || 'Paiement en retard');
+          ? (tObj.alertOverdueSoft).replace('{label}', label)
+          : (tObj.alertOverdueSoft);
       }
       case 'PAYMENT_OVERDUE_HARD': {
         const label = subLabelForAlert(alert);
         return label
-          ? (tObj.alertOverdueHard || 'Paiement en retard critique').replace('{label}', label)
-          : (tObj.alertOverdueHard || 'Paiement en retard critique');
+          ? (tObj.alertOverdueHard).replace('{label}', label)
+          : (tObj.alertOverdueHard);
       }
       case 'OUTPUTS_LOCKED': {
         const label = subLabelForAlert(alert);
         return label
-          ? `${tObj.alertOutputsLocked || 'Fonds verrouillés'} — ${label}`
-          : (tObj.alertOutputsLocked || 'Fonds verrouillés (confirmations en cours), nouvel essai dans 25 min');
+          ? `${tObj.alertOutputsLocked} — ${label}`
+          : (tObj.alertOutputsLocked);
       }
       case 'PAYMENT_FAILED': {
         const label = subLabelForAlert(alert);
         return label
-          ? `${tObj.alertPaymentFailed || 'Échec paiement'} — ${label}`
-          : (tObj.alertPaymentFailed || 'Échec d\'un paiement');
+          ? `${tObj.alertPaymentFailed} — ${label}`
+          : (tObj.alertPaymentFailed);
       }
       case 'PAYMENT_BLOCKED_LIMITS': {
         const label = subLabelForAlert(alert);
-        const why = policyMessage(alert.message) || '';
-        return `${label ? label + ' — ' : ''}envoi suspendu. ${why}`.trim();
+        const why = policyMessage(alert.message, tObj) || '';
+        return `${label ? label + ' — ' : ''}${tObj.alertBlockedSuffix} ${why}`.trim();
       }
       case 'BALANCE_SHORT_UPCOMING':
-        return `${num ?? 'Des'} paiement(s) prévu(s) dans les 48 h dépassent le solde disponible. Rechargez le portefeuille pour qu'ils partent à l'heure.`;
-      case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced || 'Wallet non synchronisé avec la blockchain';
+        return fmt(tObj.alertBalanceShortUpcoming, { n: num ?? '?' });
+      case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced;
       case 'OFFLINE_WITH_PENDING': {
         const hoursMatch = alert.message.match(/(\d+)h/);
         const h = hoursMatch ? hoursMatch[1] : '?';
-        return (tObj.alertOfflineWithPending || 'Hors ligne depuis {h}h — paiements prevus dans 7 j').replace('{h}', h);
+        return (tObj.alertOfflineWithPending).replace('{h}', h);
       }
       default: {
         // Strip any "Sub #<uuid>" prefix from raw Rust messages
@@ -261,25 +269,11 @@
     const diffMin = Math.round(diffMs / 60000);
     const diffH = Math.round(diffMs / 3600000);
     const diffD = Math.round(diffMs / 86400000);
-    if (diffMin < 2) return "a l'instant";
-    if (diffMin < 60) return `il y a ${diffMin} min`;
-    if (diffH < 24) return `il y a ${diffH}h`;
-    if (diffD < 31) return `il y a ${diffD} j`;
-    return `il y a ${Math.round(diffD / 30)} mois`;
-  }
-
-  function scheduleLabel(sched) {
-    if (!sched) return sched;
-    const m = sched.match(/(\d+)\s*min/i);
-    if (m) return `Toutes les ${m[1]} min`;
-    const h = sched.match(/(\d+)\s*h(?!eure)/i);
-    if (h) return `Toutes les ${h[1]}h`;
-    const d = sched.match(/(\d+)\s*(day|jour)/i);
-    if (d) return `Tous les ${d[1]} j`;
-    const w = sched.match(/(\d+)\s*(week|semaine)/i);
-    if (w) return `Toutes les ${w[1]} semaines`;
-    if (/month|mois/i.test(sched)) return 'Mensuel';
-    return sched;
+    if (diffMin < 2) return $t.agoJustNow;
+    if (diffMin < 60) return fmt($t.agoMinutes, { n: diffMin });
+    if (diffH < 24) return fmt($t.agoHours, { n: diffH });
+    if (diffD < 31) return fmt($t.agoDays, { n: diffD });
+    return fmt($t.agoMonths, { n: Math.round(diffD / 30) });
   }
   let sessionPayments = []; // in-memory payment log for current session (superset of historyEntries)
   let historyEntries = [];  // loaded from encrypted DB vault
@@ -307,11 +301,11 @@
     try {
       const doc = await invokeStrict("validate_pv", { pvJson });
       if (doc) { pvDoc = doc; }
-      else { pvError = "Réponse vide du backend."; }
+      else { pvError = $t.pvEmptyResponse; }
     } catch (e) { pvError = String(e); }
   }
   async function executePvPayment(payment) {
-    if (!confirm(($t.treasurerConfirmMsg || 'Confirmer le paiement de {amount} XMR à {recipient} ?')
+    if (!confirm(($t.treasurerConfirmMsg)
       .replace('{amount}', payment.amount_xmr).replace('{recipient}', payment.recipient))) return;
     pvExecuting = true;
     pvResults = { ...pvResults, [payment.id]: { status: 'pending' } };
@@ -366,30 +360,8 @@
   // External code pre-fill (from deep link)
   export let externalCode = null;
 
-  // ---- Subscriptions list (mock data + live additions) ----
-  let subscriptions = [
-    {
-      id: 1, label: "Le Média Libre",
-      description: "Soutien mensuel au journalisme indépendant",
-      amount: "0.05", currency: "XMR", schedule: "Mensuel",
-      next_payment_at: "2026-11-01", status: "Active", canary_status: "Ok",
-      payments_sent: 8, wallet_id: 1,
-    },
-    {
-      id: 2, label: "Libre-Market épicerie",
-      description: "Abonnement légumes de saison",
-      amount: "0.12", currency: "XMR", schedule: "Bimensuel",
-      next_payment_at: "2026-10-28", status: "Active", canary_status: "Ok",
-      payments_sent: 3, wallet_id: 2,
-    },
-    {
-      id: 3, label: "Radio Pirate FR",
-      description: "Podcast libertaire hebdomadaire",
-      amount: "0.02", currency: "XMR", schedule: "Mensuel",
-      next_payment_at: null, status: "Suspended", canary_status: "Expired",
-      payments_sent: 12, wallet_id: 1,
-    },
-  ];
+  $: colon = $currentLang === "fr" ? " :" : ":";
+  let subscriptions = [];
 
   /** Convert a payload from SubscriptionCodeEditor into a subscription row */
   function payloadToSubscription(payload) {
@@ -649,6 +621,14 @@
   /** Import tab dispatches this after "Ajouter cet abonnement" */
   async function onSubImported({ detail }) {
     logInfo("Dashboard", "onSubImported fired");
+    // add_subscription drops repeat_every: the scheduler would pay every year instead.
+    if ((parseInt(detail.payload?.repeat_every, 10) || 1) > 1) {
+      showImportModal = false;
+      await new Promise(resolve => {
+        policyNotice = { raw: "POLICY:UNSUPPORTED_REPEAT", canConfirm: false, resolve, retry: null };
+      });
+      return;
+    }
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
     addOrConfirmDuplicate(sub);
     showImportModal = false;
@@ -735,12 +715,12 @@
   async function saveRpcConfig() {
     rpcConfig.daemon_address = nodeChoice === CUSTOM_NODE ? customNode.trim() : nodeChoice;
     if (nodeChoice === CUSTOM_NODE && !/^[^\s:/]+:\d{1,5}$/.test(rpcConfig.daemon_address)) {
-      rpcSaveMsg = "Adresse invalide — format attendu : hote:port (ex. node.example.org:18089)";
+      rpcSaveMsg = $t.rpcInvalidNode;
       return;
     }
     try {
       await tauriInvoke("save_rpc_config", { config: rpcConfig });
-      rpcSaveMsg = "Configuration enregistrée — prise en compte au prochain rafraîchissement";
+      rpcSaveMsg = $t.rpcSaved;
       logInfo("RPC", `Config saved: node=${rpcConfig.daemon_address || "auto"}`);
     } catch (e) {
       rpcSaveMsg = String(e);
@@ -754,7 +734,7 @@
   let balanceXmr = null;        // null = not loaded yet
   let balanceLoading = false;
   let lastBalanceRefresh = null; // Date of last successful balance fetch
-  let refreshAgoLabel = "";      // "il y a X" string, updated every 30s
+  let refreshAgoSecs = null;     // seconds since the last successful refresh, updated every 30s
   let rpcOk = null;             // null=unknown, true=connected, false=error
   let rpcError = null;          // last error string
   let walletAddress = null;
@@ -839,10 +819,10 @@
   }
 
   async function triggerNow(sub) {
-    if (paymentInProgress) { alert("Un paiement est deja en cours"); return; }
+    if (paymentInProgress) { alert($t.paymentAlreadyRunning); return; }
     if (lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS) {
       const remaining = Math.ceil((MONERO_MIN_INTERVAL_MS - (Date.now() - lastPaymentSentAt)) / 60000);
-      alert(`Monero: attendre encore ${remaining} min (confirmations blocs)`);
+      alert(fmt($t.paymentCooldown, { n: remaining }));
       return;
     }
     paymentInProgress = true;
@@ -978,7 +958,7 @@
         await tauriInvoke("refresh_balance");
         await loadWalletInfo();
       } else {
-        sweepError = "Aucun hash retourné";
+        sweepError = $t.sweepNoHash;
       }
     } catch (e) {
       sweepError = String(e);
@@ -1000,35 +980,35 @@
   }
 
   // RPC state → user-friendly diagnosis
-  function rpcDiagnosis(err) {
+  function rpcDiagnosis(err, tObj) {
     if (!err) return null;
     if (err.includes("word list") || err.includes("Electrum") || err.includes("checksum")) {
       return {
         icon: "🔴", level: "error",
-        title: "Seed de récupération invalide",
-        detail: "Votre phrase secrète a été créée avec une ancienne version bugguée. L'app tente de la corriger automatiquement au prochain déverrouillage.",
+        title: tObj.diagSeedTitle,
+        detail: tObj.diagSeedDetail,
         action: "reset",
-        actionLabel: "Réinitialiser le wallet",
+        actionLabel: tObj.diagSeedAction,
       };
     }
     if (err.includes("not found") || err.includes("PATH") || err.includes("binary")) {
       return {
         icon: "🔴", level: "error",
-        title: "Outil Monero introuvable",
-        detail: "monero-wallet-rpc n'est pas installé ou n'est pas dans le PATH. Installez les outils Monero CLI.",
+        title: tObj.diagBinaryTitle,
+        detail: tObj.diagBinaryDetail,
         action: "settings",
-        actionLabel: "Configurer dans Paramètres",
+        actionLabel: tObj.diagBinaryAction,
         link: "https://getmonero.org/downloads/",
-        linkLabel: "Télécharger Monero CLI",
+        linkLabel: tObj.rpcDownload,
       };
     }
     if (err.includes("timeout") || err.includes("not ready") || err.includes("attempt")) {
       return {
         icon: "🟠", level: "warn",
-        title: "monero-wallet-rpc n'a pas démarré",
-        detail: "Le processus s'est lancé mais n'a pas répondu dans les 15 secondes. Vérifiez qu'aucun autre processus n'utilise le port 18083.",
+        title: tObj.diagTimeoutTitle,
+        detail: tObj.diagTimeoutDetail,
         action: "retry",
-        actionLabel: "Réessayer",
+        actionLabel: tObj.commonRetry,
       };
     }
     if (err.includes("connect") || err.includes("TCP") || err.includes("Connexion refusée")
@@ -1036,28 +1016,28 @@
         || err.includes("No route") || err.includes("unreachable") || err.includes("offline")) {
       return {
         icon: "📡", level: "warn",
-        title: "Hors ligne — pas de connexion Internet",
-        detail: "Le nœud Monero est inaccessible. Vérifiez votre connexion réseau. Le solde affiché est celui de la dernière synchronisation.",
+        title: tObj.diagOfflineTitle,
+        detail: tObj.diagOfflineDetail,
         action: "retry",
-        actionLabel: "Réessayer",
+        actionLabel: tObj.commonRetry,
         offline: true,
       };
     }
     if (err.includes("Task spawn") || err.includes("Internal task")) {
       return {
         icon: "🔴", level: "error",
-        title: "Erreur interne",
-        detail: "Une erreur inattendue s'est produite. Copiez les logs et signalez-la.",
+        title: tObj.diagInternalTitle,
+        detail: tObj.diagInternalDetail,
         action: "logs",
-        actionLabel: "Copier les logs",
+        actionLabel: tObj.diagInternalAction,
       };
     }
     return {
       icon: "🟠", level: "warn",
-      title: "RPC indisponible",
+      title: tObj.diagRpcTitle,
       detail: err.length > 120 ? err.slice(0, 120) + "…" : err,
       action: "settings",
-      actionLabel: "Voir Paramètres",
+      actionLabel: tObj.diagSettingsAction,
     };
   }
 
@@ -1086,7 +1066,7 @@
   }
 
   async function clearHistory() {
-    if (!confirm("Effacer tout l'historique ? Cette action est irréversible.")) return;
+    if (!confirm($t.historyClearConfirm)) return;
     await tauriInvoke("clear_payment_history");
     historyEntries = [];
   }
@@ -1112,12 +1092,12 @@
   }
 
   function updateRefreshAgo() {
-    if (!lastBalanceRefresh) { refreshAgoLabel = ""; return; }
-    const secs = Math.round((Date.now() - lastBalanceRefresh) / 1000);
-    if (secs < 60)        refreshAgoLabel = `il y a ${secs}s`;
-    else if (secs < 3600) refreshAgoLabel = `il y a ${Math.round(secs/60)} min`;
-    else                  refreshAgoLabel = `il y a ${Math.round(secs/3600)} h`;
+    refreshAgoSecs = lastBalanceRefresh ? Math.round((Date.now() - lastBalanceRefresh) / 1000) : null;
   }
+  $: refreshAgoLabel = refreshAgoSecs === null ? ""
+    : refreshAgoSecs < 60   ? fmt($t.agoSeconds, { n: refreshAgoSecs })
+    : refreshAgoSecs < 3600 ? fmt($t.agoMinutes, { n: Math.round(refreshAgoSecs / 60) })
+    : fmt($t.agoHours, { n: Math.round(refreshAgoSecs / 3600) });
 
   function formatDuration(secs) {
     secs = Math.max(0, Math.round(secs));
@@ -1130,15 +1110,15 @@
     ? syncStep.blocks_behind / SYNC_BLOCKS_PER_SEC : 0;
   $: syncPhaseElapsed = syncPhaseStartedAt ? (nowMs - syncPhaseStartedAt) / 1000 : 0;
   $: syncPct = syncEstimate > 0 ? Math.min(95, Math.max(2, (syncPhaseElapsed / syncEstimate) * 100)) : null;
-  $: syncLabel = !syncStep ? "Préparation…"
-    : syncStep.phase === "node" ? "Recherche d'un nœud Monero disponible…"
-    : syncStep.phase === "starting" ? `Connexion au nœud ${syncStep.node ?? ""}…`
-    : syncStep.phase === "opening" ? "Ouverture du wallet…"
+  $: syncLabel = !syncStep ? $t.syncPreparing
+    : syncStep.phase === "node" ? $t.syncNode
+    : syncStep.phase === "starting" ? fmt($t.syncStarting, { node: syncStep.node ?? "" })
+    : syncStep.phase === "opening" ? $t.syncOpening
     : syncStep.phase === "syncing" ? (syncStep.blocks_behind > 0
-        ? `Synchronisation : ${syncStep.blocks_behind.toLocaleString()} blocs à rattraper`
-        : "Synchronisation avec le réseau…")
-    : syncStep.phase === "reading" ? "Lecture du solde…"
-    : "Synchronisation…";
+        ? fmt($t.syncBlocks, { n: syncStep.blocks_behind.toLocaleString($currentLang) })
+        : $t.syncNetwork)
+    : syncStep.phase === "reading" ? $t.syncReading
+    : $t.syncGeneric;
 
   async function refreshBalance() {
     if (destroyed) return;
@@ -1352,7 +1332,7 @@
   // Mock wallets with monthly spend estimates
   let wallets = [
     // Single real wallet — balance starts null (unknown), updated after first RPC refresh
-    { id: 1, name: "Wallet principal", desc: "", balance: null, color: "#f26822", monthlyOut: 0 },
+    { id: 1, name: "", desc: "", balance: null, color: "#f26822", monthlyOut: 0 },
   ];
 
   // Derive totalBalance from live balanceXmr — pure read, no loop
@@ -1405,19 +1385,19 @@
     const h = Math.floor(ms / 3600000);
     const m = Math.floor(ms / 60000);
     const s = Math.floor(ms / 1000);
-    const inPfx = t_snap.inPrefix || "dans";
-    const dSfx = t_snap.inDaysSuffix || "jours";
+    const inPfx = t_snap.inPrefix;
+    const dSfx = t_snap.inDaysSuffix;
     let label_time;
     if (s <= 0) {
       const late = Math.abs(ms);
       const lm = Math.floor(late / 60000);
       const lh = Math.floor(lm / 60);
       const ld = Math.floor(lh / 24);
-      label_time = ld >= 1 ? `J+${ld}` : lh >= 1 ? `+${lh}h` : lm >= 1 ? `+${lm}min` : (t_snap.now || 'maintenant');
+      label_time = ld >= 1 ? `J+${ld}` : lh >= 1 ? `+${lh}h` : lm >= 1 ? `+${lm}min` : (t_snap.now);
     } else if (s < 60) label_time = `${inPfx} ${s}s`;
     else if (m < 60) label_time = `${inPfx} ${m} min`;
     else if (h < 24) label_time = `${inPfx} ${h}h`;
-    else label_time = `${t_snap.dayMinus || 'J-'}${days}`;
+    else label_time = `${t_snap.dayMinus}${days}`;
     return { label: soonest.label, amount: soonest.amount, in_days: days, label_time, sub: soonest };
   })();
 
@@ -1471,7 +1451,7 @@
     if (weeks >= 2)   return `~${Math.round(weeks)} ${t.refillWeeks}`;
     const days = months * 30;
     if (days >= 1)    return `~${Math.round(days)} ${t.refillDays}`;
-    return t.refillLessThanOneDay || 'moins de 1 jour !';
+    return t.refillLessThanOneDay;
   }
 
   // Total refill estimate
@@ -1499,15 +1479,15 @@
     <div class="modal-panel" on:click|stopPropagation role="document" style="max-width:400px;text-align:center">
       {#if pendingShortfall > 0}
         <div style="font-size:36px;margin-bottom:12px">⚠</div>
-        <h2 style="margin:0 0 6px;font-size:18px">Solde insuffisant</h2>
+        <h2 style="margin:0 0 6px;font-size:18px">{$t.pendingInsufficientTitle}</h2>
         <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
-          Rechargez votre portefeuille avant de pouvoir envoyer ce paiement.
+          {$t.pendingInsufficientDesc}
         </p>
       {:else}
         <div style="font-size:36px;margin-bottom:12px">🔔</div>
-        <h2 style="margin:0 0 6px;font-size:18px">Paiement en attente</h2>
+        <h2 style="margin:0 0 6px;font-size:18px">{$t.pendingTitle}</h2>
         <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
-          Rien ne part sans votre accord.
+          {$t.pendingSubtitle}
         </p>
       {/if}
       <div class="card" style="padding:14px 18px;margin-bottom:18px;text-align:left">
@@ -1515,53 +1495,53 @@
         <div style="font-size:24px;font-weight:800;color:var(--accent);margin-bottom:8px">{pendingPaymentModal.amount_xmr} XMR</div>
         <div style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text-muted)">
           {#if pendingPaymentModal.schedule}
-            <div>Cadence : <strong style="color:var(--text)">{scheduleLabel(pendingPaymentModal.schedule)}</strong></div>
+            <div>{$t.pendingCadence}{colon} <strong style="color:var(--text)">{scheduleToHuman(pendingPaymentModal.schedule, 1, $currentLang)}</strong></div>
           {/if}
           {#if pendingPaymentModal.payments_sent > 0}
-            <div>Envois précédents : <strong style="color:var(--text)">{pendingPaymentModal.payments_sent}</strong></div>
+            <div>{$t.pendingPrevSends}{colon} <strong style="color:var(--text)">{pendingPaymentModal.payments_sent}</strong></div>
           {/if}
           {#if pendingPaymentModal.reasons?.length}
-            <div style="margin-top:6px;color:var(--text)">Pourquoi cette confirmation :</div>
+            <div style="margin-top:6px;color:var(--text)">{$t.pendingWhy}</div>
             <ul style="margin:2px 0 0 16px;padding:0">
               {#each pendingPaymentModal.reasons as r}
-                <li>{PENDING_REASON_LABELS[r] || r}</li>
+                <li>{pendingReasonLabel(r, $t)}</li>
               {/each}
             </ul>
           {/if}
           {#if pendingPaymentModal.last_payment_at && pendingPaymentModal.payments_sent > 0}
             {@const rel = formatRelativeDate(pendingPaymentModal.last_payment_at)}
             {#if rel}
-              <div>Dernier envoi : <strong style="color:var(--text)">{rel}</strong></div>
+              <div>{$t.pendingLastSend}{colon} <strong style="color:var(--text)">{rel}</strong></div>
             {/if}
           {/if}
         </div>
       </div>
       {#if pendingShortfall > 0}
         <div class="card" style="padding:12px 16px;margin-bottom:18px;text-align:left;font-size:12.5px;border-color:#f97316">
-          <div>Solde disponible : <strong>{balanceXmr.toFixed(4)} XMR</strong></div>
-          <div>Manque : <strong style="color:#ef4444">{pendingShortfall.toFixed(4)} XMR</strong>
-            <span class="text-muted" style="font-size:11px"> (frais réseau estimés inclus)</span></div>
+          <div>{$t.pendingAvailable}{colon} <strong>{balanceXmr.toFixed(4)} XMR</strong></div>
+          <div>{$t.pendingMissing}{colon} <strong style="color:#ef4444">{pendingShortfall.toFixed(4)} XMR</strong>
+            <span class="text-muted" style="font-size:11px"> {$t.pendingFeesIncluded}</span></div>
           <div class="text-muted" style="font-size:11px;margin-top:6px">
-            Après réception, les fonds sont utilisables au bout d'environ 20 minutes (10 confirmations).
+            {$t.pendingFundsDelay}
           </div>
         </div>
         <div style="display:flex;gap:10px;justify-content:center">
           <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => declinePending(false)}>
-            Reporter d'1 h
+            {$t.pendingPostpone}
           </button>
           <button class="btn-primary" style="flex:1;padding:10px;font-size:14px"
             on:click={() => { declinePending(false); page = "receive"; }}>
-            Recharger le portefeuille
+            {$t.pendingTopUp}
           </button>
         </div>
         <button class="btn-inline" style="margin-top:12px;font-size:11.5px"
           on:click={() => { declinePending(false); goToGuide("get-monero"); }}>
-          Comment obtenir du Monero ?
+          {$t.pendingHowToGet}
         </button>
       {:else}
       <div style="display:flex;gap:10px;justify-content:center">
         <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => declinePending(false)}>
-          Reporter d'1 h
+          {$t.pendingPostpone}
         </button>
         <button class="btn-primary" style="flex:1;padding:10px;font-size:15px"
           on:click={async () => {
@@ -1572,11 +1552,11 @@
             // Trigger immediate scheduler cycle
             setTimeout(() => refreshBalance(), 2000);
           }}>
-          Confirmer l'envoi
+          {$t.pendingConfirm}
         </button>
       </div>
       <button class="btn-inline" style="margin-top:12px;font-size:11.5px" on:click={() => declinePending(true)}>
-        Passer cette échéance (pas d'envoi, prochaine selon la cadence)
+        {$t.pendingSkip}
       </button>
       {/if}
     </div>
@@ -1588,25 +1568,25 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true">
     <div class="modal-panel" role="document" style="max-width:420px;text-align:center">
       <h2 style="margin:0 0 10px;font-size:17px">
-        {policyNotice.canConfirm ? "Confirmer le budget mensuel" : "Abonnement non ajouté"}
+        {policyNotice.canConfirm ? $t.policyMonthlyTitle : $t.policyRefusedTitle}
       </h2>
-      <p style="font-size:13px;margin-bottom:8px">{policyNotice.message}</p>
+      <p style="font-size:13px;margin-bottom:8px">{policyMessage(policyNotice.raw, $t)}</p>
       {#if policyNotice.canConfirm}
         <p class="text-muted" style="font-size:12px;margin-bottom:16px">
-          Une confirmation est demandée au-delà de {paymentLimits.monthly_confirm_xmr} XMR par mois. Rien n'a été envoyé.
+          {fmt($t.policyMonthlyHint, { max: paymentLimits.monthly_confirm_xmr })}
         </p>
         <div style="display:flex;gap:10px;justify-content:center">
-          <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>Annuler</button>
-          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(true)}>Ajouter quand même</button>
+          <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>{$t.commonCancel}</button>
+          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(true)}>{$t.policyAddAnyway}</button>
         </div>
       {:else}
-        <p class="text-muted" style="font-size:12px;margin-bottom:16px">Rien n'a été enregistré ni envoyé.</p>
+        <p class="text-muted" style="font-size:12px;margin-bottom:16px">{$t.policyNothingSaved}</p>
         <div style="display:flex;gap:10px;justify-content:center">
-          {#if /Paramètres/.test(policyNotice.message)}
+          {#if policyNeedsSettings(policyNotice.raw)}
             <button class="btn-ghost" style="flex:1;padding:10px"
-              on:click={() => { closePolicyNotice(false); page = "settings"; }}>Ouvrir les Paramètres</button>
+              on:click={() => { closePolicyNotice(false); page = "settings"; }}>{$t.policyOpenSettings}</button>
           {/if}
-          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>Compris</button>
+          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>{$t.commonGotIt}</button>
         </div>
       {/if}
     </div>
@@ -1618,22 +1598,22 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true">
     <div class="modal-panel" role="document" style="max-width:400px">
       <h2 style="margin:0 0 8px;font-size:17px">
-        {limitPrompt.key === "allow_large_amounts" ? "Autoriser les montants élevés" : "Autoriser les cadences très courtes"}
+        {limitPrompt.key === "allow_large_amounts" ? $t.limitLargeTitle : $t.limitShortTitle}
       </h2>
       <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">
         {limitPrompt.key === "allow_large_amounts"
-          ? `Les abonnements de plus de ${paymentLimits.max_amount_xmr} XMR par envoi deviennent possibles. Chaque envoi d'au moins ${paymentLimits.high_amount_xmr} XMR reste confirmé.`
-          : `Les cadences de moins de ${paymentLimits.min_cadence_days} jours (de tous les 6 jours à toutes les 25 min) deviennent possibles.`}
-        Saisissez votre mot de passe pour confirmer.
+          ? fmt($t.limitLargeDesc, { max: paymentLimits.max_amount_xmr, high: paymentLimits.high_amount_xmr })
+          : fmt($t.limitShortDesc, { days: paymentLimits.min_cadence_days })}
+        {$t.limitEnterPassword}
       </p>
       <form on:submit|preventDefault={() => applyLimits({ ...paymentLimits, [limitPrompt.key]: true }, limitPassword)}>
         <input type="password" bind:value={limitPassword} autocomplete="current-password"
-          placeholder="Mot de passe" style="width:100%;margin-bottom:8px" />
+          placeholder={$t.commonPassword} style="width:100%;margin-bottom:8px" />
         {#if limitError}<p style="color:#ef4444;font-size:12px;margin:0 0 8px">{limitError}</p>{/if}
         <div style="display:flex;gap:10px">
           <button type="button" class="btn-ghost" style="flex:1;padding:10px"
-            on:click={() => { limitPrompt = null; limitPassword = ""; }}>Annuler</button>
-          <button type="submit" class="btn-primary" style="flex:1;padding:10px" disabled={!limitPassword}>Confirmer</button>
+            on:click={() => { limitPrompt = null; limitPassword = ""; }}>{$t.commonCancel}</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px" disabled={!limitPassword}>{$t.commonConfirm}</button>
         </div>
       </form>
     </div>
@@ -1649,14 +1629,14 @@
       <div class="modal-header">
         <h2 class="modal-title">
           {activeAlerts.some(a => a.level === 'Red')
-            ? `🔴 ${$t.alertOverlayCritical || 'Alertes critiques'}`
-            : `🟠 ${$t.alertOverlayWarning || 'Avertissements'}`}
+            ? `🔴 ${$t.alertOverlayCritical}`
+            : `🟠 ${$t.alertOverlayWarning}`}
         </h2>
-        <button class="modal-close" on:click={() => showAlertsOverlay = false} aria-label={$t.alertOverlayClose || 'Fermer'}>✕</button>
+        <button class="modal-close" on:click={() => showAlertsOverlay = false} aria-label={$t.alertOverlayClose}>✕</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;padding:16px">
         {#if activeAlerts.length === 0}
-          <p style="color:var(--text-muted);text-align:center">{$t.alertOverlayNone || 'Aucune alerte active.'}</p>
+          <p style="color:var(--text-muted);text-align:center">{$t.alertOverlayNone}</p>
         {:else}
           {#each activeAlerts as alert}
             <div class="alert-detail-card" class:alert-detail-red={alert.level === 'Red'} class:alert-detail-orange={alert.level === 'Orange'}>
@@ -1664,12 +1644,12 @@
               <div class="alert-detail-body">
                 <div class="alert-detail-kind">{alert.kind}</div>
                 <div class="alert-detail-msg">{translateAlertMsg(alert, $t)}</div>
-                <div class="alert-detail-time">{new Date(alert.created_at * 1000).toLocaleTimeString()}</div>
+                <div class="alert-detail-time">{new Date(alert.created_at * 1000).toLocaleTimeString($currentLang)}</div>
               </div>
             </div>
           {/each}
         {/if}
-        <button class="btn-ghost" on:click={() => showAlertsOverlay = false} style="margin-top:8px">{$t.alertOverlayClose || 'Fermer'}</button>
+        <button class="btn-ghost" on:click={() => showAlertsOverlay = false} style="margin-top:8px">{$t.alertOverlayClose}</button>
       </div>
     </div>
   </div>
@@ -1680,7 +1660,7 @@
   <div class="pay-anim-overlay pay-loader-overlay" role="presentation">
     <div class="pay-loader-ring"></div>
     <div class="pay-loader-countdown">{payLoaderCountdown}</div>
-    <div class="pay-anim-label" style="font-size:15px;margin-top:8px">Envoi en cours…</div>
+    <div class="pay-anim-label" style="font-size:15px;margin-top:8px">{$t.commonSending}</div>
   </div>
 {/if}
 
@@ -1701,7 +1681,7 @@
       <circle class="orbit-dot od2" cx="200" cy="164" r="4" fill="var(--accent)" opacity="0.6"/>
       <circle class="orbit-dot od3" cx="200" cy="164" r="3" fill="var(--accent)" opacity="0.4"/>
     </svg>
-    <div class="pay-anim-label">{$currentLang === 'fr' ? 'Paiement envoyé !' : 'Payment sent!'}</div>
+    <div class="pay-anim-label">{$t.paymentSentAnim}</div>
   </div>
 {/if}
 
@@ -1723,13 +1703,13 @@
               </span>
               <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
               <span class="tray-label" style="color:{activeAlerts.some(a=>a.level==='Red') ? '#ef4444' : '#f97316'};cursor:pointer"
-                on:click={() => showAlertsOverlay = true}>{activeAlerts.some(a => a.level === 'Red') ? 'Alerte critique' : 'Avertissement'}</span>
+                on:click={() => showAlertsOverlay = true}>{activeAlerts.some(a => a.level === 'Red') ? $t.trayCritical : $t.trayWarning}</span>
             {:else}
               <span class="tray-label">OK</span>
             {/if}
           </div>
           <div class="tray-row mode-tray">
-            <span class="tray-label mode-tray-label">{($t.paymentModeLabel || 'Mode : {mode}').replace('{mode}', $paymentMode === 'semi-auto' ? ($t.paymentModeSemiAuto || 'Semi-auto') : ($t.paymentModeAuto || 'Auto'))}</span>
+            <span class="tray-label mode-tray-label">{($t.paymentModeLabel).replace('{mode}', $paymentMode === 'semi-auto' ? ($t.paymentModeSemiAuto) : ($t.paymentModeAuto))}</span>
           </div>
         </div>
       </div>
@@ -1770,19 +1750,19 @@
         {$t.navHowItWorks}
       </button>
       <button class="nav-item" class:active={page === "create-code"} on:click={() => page = "create-code"}>
-        🔗 {$t.navCreateCode || 'Créer un code AutoPay'}
+        🔗 {$t.navCreateCode}
       </button>
       <button class="nav-item" class:active={page === "settings"} on:click={() => page = "settings"}>
         {$t.navSettings}
       </button>
       {#if treasurerMode}
         <button class="nav-item nav-item-treasurer" class:active={page === "treasurer"} on:click={() => page = "treasurer"}>
-          ⚖ {$t.treasurerNavItem || 'Trésorier'}
+          ⚖ {$t.treasurerNavItem}
         </button>
       {/if}
       <!-- Lock button — centered below settings -->
       <div style="display:flex;justify-content:center;padding:12px 0 4px">
-        <button class="lock-nav-btn" title="Verrouiller la session"
+        <button class="lock-nav-btn" title={$t.lockSession}
           on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock')).catch(() => dispatch('lock'))}>
           <!-- Padlock SVG — use style= for CSS vars (WebKitGTK doesn't resolve vars in presentation attrs) -->
           <svg width="20" height="20" viewBox="0 0 24 24"
@@ -1799,16 +1779,16 @@
       <div class="balance-label">
         <!-- RPC status dot -->
         {#if isOffline}
-          <span class="rpc-dot dot-offline" title="Hors ligne">●</span>
+          <span class="rpc-dot dot-offline" title={$t.rpcDotOffline}>●</span>
         {:else if rpcOk === null}
-          <span class="rpc-dot dot-unknown" title="Vérification en cours…">●</span>
+          <span class="rpc-dot dot-unknown" title={$t.rpcDotChecking}>●</span>
         {:else if rpcOk}
-          <span class="rpc-dot dot-ok" title="Connecté au réseau Monero">●</span>
+          <span class="rpc-dot dot-ok" title={$t.rpcDotOk}>●</span>
         {:else}
-          <span class="rpc-dot dot-err" title="RPC indisponible">●</span>
+          <span class="rpc-dot dot-err" title={$t.rpcDotErr}>●</span>
         {/if}
-        {$t.balance || 'Solde'}
-        <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title={$t.balanceRefresh || 'Actualiser le solde'}>
+        {$t.balance}
+        <button class="refresh-btn" on:click={refreshBalance} disabled={balanceLoading} title={$t.balanceRefresh}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
                stroke-linecap="round" stroke-linejoin="round"
                style={balanceLoading ? "animation: spin 1s linear infinite" : ""}>
@@ -1819,8 +1799,8 @@
       </div>
       {#if isOffline}
         <div class="offline-banner">
-          📡 Hors ligne — connectez-vous à Internet pour synchroniser
-          <button class="btn-inline" on:click={() => { isOffline = false; refreshBalance(); }}>Réessayer</button>
+          {$t.offlineBanner}
+          <button class="btn-inline" on:click={() => { isOffline = false; refreshBalance(); }}>{$t.commonRetry}</button>
         </div>
       {:else if balanceLoading}
         <div class="refresh-ago sync-pulse">{syncLabel}</div>
@@ -1832,10 +1812,10 @@
           {/if}
         </div>
         <span class="sync-progress-label">
-          {formatDuration(syncElapsed)} écoulées{#if syncEstimate > 0} · estimé ~{formatDuration(Math.max(syncEstimate - syncPhaseElapsed, 0))} restantes{/if}
+          {fmt($t.syncElapsed, { t: formatDuration(syncElapsed) })}{#if syncEstimate > 0} · {fmt($t.syncRemaining, { t: formatDuration(Math.max(syncEstimate - syncPhaseElapsed, 0)) })}{/if}
         </span>
         {#if syncElapsed > 20}
-          <div class="sync-progress-label-small">Vous pouvez continuer à utiliser l'application pendant la synchronisation.</div>
+          <div class="sync-progress-label-small">{$t.syncKeepUsing}</div>
         {/if}
       {:else if refreshAgoLabel}
         <div class="refresh-ago">{refreshAgoLabel} · ↺ 2 min</div>
@@ -1844,7 +1824,7 @@
         {#if isOffline && balanceXmr !== null}
           <!-- Offline but we have a cached balance: show it greyed -->
           <div class="balance-amount" style="color:var(--text-muted)">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
-          <div class="balance-hint" style="color:var(--text-muted);font-size:11px">Solde de la dernière synchro — non actualisé</div>
+          <div class="balance-hint" style="color:var(--text-muted);font-size:11px">{$t.balanceLastSync}</div>
         {:else if isOffline}
           <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
         {:else if balanceXmr === null}
@@ -1854,8 +1834,8 @@
         <!-- Connected: just show the balance -->
         <div class="balance-amount text-accent">{balanceXmr.toFixed(4)} {$currentNetwork.symbol}</div>
         {#if balanceXmr === 0}
-          <div class="balance-hint">{$t.balanceEmpty || 'Wallet vide — rechargez-le en Monero pour commencer.'}</div>
-          <button class="btn-receive" on:click={() => page = "receive"}>⬇ {$t.receiveTitle || 'Recharger le wallet'}</button>
+          <div class="balance-hint">{$t.balanceEmpty}</div>
+          <button class="btn-receive" on:click={() => page = "receive"}>⬇ {$t.receiveTitle}</button>
         {/if}
 
       {:else if rpcOk === false}
@@ -1866,7 +1846,7 @@
           <div class="balance-amount" style="font-size:18px;color:var(--text-muted);letter-spacing:0.08em">-.---- {$currentNetwork.symbol}</div>
         {/if}
         {#if rpcError}
-          {@const diag = rpcDiagnosis(rpcError)}
+          {@const diag = rpcDiagnosis(rpcError, $t)}
           {#if diag}
             <div class="rpc-diag rpc-diag-{diag.level}">
               <div class="rpc-diag-title">{diag.icon} {diag.title}</div>
@@ -1886,7 +1866,7 @@
             </div>
           {/if}
         {:else}
-          <div class="balance-hint">Solde non actualisé — <button class="btn-inline" on:click={refreshBalance}>Réessayer</button></div>
+          <div class="balance-hint">{$t.balanceNotRefreshed} <button class="btn-inline" on:click={refreshBalance}>{$t.commonRetry}</button></div>
         {/if}
 
       {:else}
@@ -1903,15 +1883,15 @@
     {#if page === "subscriptions"}
       <div class="page-header">
         <div>
-          <h1>{($t.subscriptionsTitle || 'Mes abonnements récurrents en {network}').replace('{network}', $currentNetwork.label)}</h1>
+          <h1>{($t.subscriptionsTitle).replace('{network}', $currentNetwork.label)}</h1>
           <p class="subs-subtitle">
             {#if subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length === 1}
-              {($t.subscriptionsCount || '{n} abonnement').replace('{n}', 1)}
+              {($t.subscriptionsCount).replace('{n}', 1)}
             {:else}
-              {($t.subscriptionsCountPlural || '{n} abonnements').replace('{n}', subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length)}
+              {($t.subscriptionsCountPlural).replace('{n}', subscriptions.filter(s => !["Cancelled","Expired"].includes(s.status)).length)}
             {/if}
             {#if duplicateCount > 0}
-              &nbsp;·&nbsp;<span class="dup-warning">Doublons : {duplicateCount}</span>
+              &nbsp;·&nbsp;<span class="dup-warning">{fmt($t.duplicatesCount, { n: duplicateCount })}</span>
             {/if}
           </p>
         </div>
@@ -1933,14 +1913,14 @@
 
       <!-- Refill estimate banner -->
       <div class="refill-banner card" class:refill-urgent={refillUrgent}>
-        <span class="text-muted">{$t.nextRefillLabel} :</span>
+        <span class="text-muted">{$t.nextRefillLabel}{colon}</span>
         <strong class:refill-urgent-text={refillUrgent}>{$t.refillIn} {totalRefillText($t)}</strong>
         <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut})</span>
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <span class="refill-help-link" role="link" tabindex="0"
           on:click={() => openExternal("https://libre-market.com/m/epicerie/tutorial")}
           on:keydown={e => e.key === "Enter" && openExternal("https://libre-market.com/m/epicerie/tutorial")}>
-          Comment se procurer du Monero ?
+          {$t.howToGetMoneroLink}
         </span>
       </div>
 
@@ -1982,8 +1962,8 @@
               <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
             </svg>
             <div>
-              <strong>{$t.featurePrivacyTitle || 'Vie privée maximale'}</strong>
-              <p>{$t.featurePrivacyDesc || 'Aucune donnée envoyée à l\'extérieur. Zéro tracking, zéro analytics.'}</p>
+              <strong>{$t.featurePrivacyTitle}</strong>
+              <p>{$t.featurePrivacyDesc}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -1991,8 +1971,8 @@
               <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
             </svg>
             <div>
-              <strong>{$t.featureMoneroTitle || 'Anonymat Monero'}</strong>
-              <p>{$t.featureMoneroDesc || 'Transactions confidentielles par protocole. Montants et identités masqués.'}</p>
+              <strong>{$t.featureMoneroTitle}</strong>
+              <p>{$t.featureMoneroDesc}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -2000,8 +1980,8 @@
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
             <div>
-              <strong>{$t.featureSeedTitle || 'Seed chiffrée post-quantique'}</strong>
-              <p>{$t.featureSeedDesc || 'Argon2id + AES-256-GCM. Résistant aux attaques quantiques.'}</p>
+              <strong>{$t.featureSeedTitle}</strong>
+              <p>{$t.featureSeedDesc}</p>
             </div>
           </div>
           <div class="sub-footer-item">
@@ -2009,12 +1989,12 @@
               <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
             </svg>
             <div>
-              <strong>{$t.featureOpenSourceTitle || 'Open source'}</strong>
-              <p>{$t.featureOpenSourceDesc || 'Code auditable. Pas de tiers de confiance. Vous contrôlez vos clés.'}</p>
+              <strong>{$t.featureOpenSourceTitle}</strong>
+              <p>{$t.featureOpenSourceDesc}</p>
             </div>
           </div>
         </div>
-        <p class="sub-footer-version">Crypto AutoPay v0.2 · 2026 · open source · <span class="sub-footer-tagline">{$t.footerTagline || 'Vos paiements, vos règles.'}</span></p>
+        <p class="sub-footer-version">Crypto AutoPay v0.2 · 2026 · open source · <span class="sub-footer-tagline">{$t.footerTagline}</span></p>
       </div>
 
     <!-- ====== WALLETS ====== -->
@@ -2029,17 +2009,17 @@
       {#if editingWallet}
         <!-- Edit wallet inline -->
         <div class="wallet-edit-panel card">
-          <h2>Modifier le wallet</h2>
+          <h2>{$t.walletEditTitle}</h2>
           <label>
             {$t.walletName}
-            <input bind:value={editingWallet.name} />
+            <input bind:value={editingWallet.name} placeholder={$t.walletMainName} />
           </label>
           <label>
             {$t.walletDesc}
             <input bind:value={editingWallet.desc} />
           </label>
           <div class="edit-actions">
-            <button class="btn-primary" on:click={saveWallet}>Enregistrer</button>
+            <button class="btn-primary" on:click={saveWallet}>{$t.commonSave}</button>
             <button class="btn-ghost" on:click={() => editingWallet = null}>{$t.back}</button>
           </div>
         </div>
@@ -2051,12 +2031,12 @@
               <div class="wallet-body">
                 <div class="wallet-top">
                   <div>
-                    <div class="wallet-name">{w.name}</div>
+                    <div class="wallet-name">{w.name || $t.walletMainName}</div>
                     {#if w.desc}<div class="wallet-desc text-muted">{w.desc}</div>{/if}
                   </div>
                   <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start">
                     <button class="btn-recharge" on:click={() => { page = 'receive'; }}>
-                      {$t.receiveTitle || 'Recharger le wallet'}
+                      {$t.receiveTitle}
                     </button>
                     <button class="btn-ghost btn-sm" on:click={() => startEditWallet(w)}>{$t.walletEdit}</button>
                   </div>
@@ -2082,7 +2062,7 @@
                   {/if}
                 </div>
                 {:else}
-                  <p style="font-size:11px;color:var(--text-muted);margin:4px 0">Solde en attente de synchronisation…</p>
+                  <p style="font-size:11px;color:var(--text-muted);margin:4px 0">{$t.walletSyncPending}</p>
                 {/if}
               </div><!-- /wallet-limit-warn -->
             </div><!-- /wallet-body -->
@@ -2145,15 +2125,15 @@
           <h1>{$t.navPaymentHistory}</h1>
           <p class="text-muted" style="font-size:12px;margin-top:4px">
             {historyEnabled
-              ? ($t.historyEncryptedLabel || 'Chiffré · {days} jours de rétention').replace('{days}', historyDays)
-              : ($t.historyDisabledLabel || 'Historique désactivé (vie privée)')}
+              ? ($t.historyEncryptedLabel).replace('{days}', historyDays)
+              : ($t.historyDisabledLabel)}
           </p>
         </div>
         <!-- iOS-style toggle for history -->
         <div style="display:flex;align-items:center;gap:10px">
-          <span style="font-size:12px;color:var(--text-muted)">{historyEnabled ? ($t.historyEnabled || 'Activé') : ($t.historyDisabled || 'Désactivé')}</span>
+          <span style="font-size:12px;color:var(--text-muted)">{historyEnabled ? ($t.historyEnabled) : ($t.historyDisabled)}</span>
           <button class="ios-toggle-btn" class:ios-on={historyEnabled}
-            on:click={toggleHistoryEnabled} title="Activer/désactiver l'enregistrement de l'historique">
+            on:click={toggleHistoryEnabled} title={$t.historyToggleTitle}>
             <span class="ios-thumb-btn"></span>
           </button>
         </div>
@@ -2162,23 +2142,23 @@
       {#if historyEnabled}
         <!-- Retention setting -->
         <div class="card" style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <span style="font-size:13px">{$t.historyRetentionLabel || 'Durée de conservation'}</span>
+          <span style="font-size:13px">{$t.historyRetentionLabel}</span>
           <div style="display:flex;align-items:center;gap:8px">
             <input type="number" min="7" max="3650" bind:value={historyDays}
               on:change={() => saveHistoryConfig()}
               style="width:60px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:13px;text-align:center"/>
-            <span style="font-size:12px;color:var(--text-muted)">{$t.historyRetentionUnit || 'jours'}</span>
+            <span style="font-size:12px;color:var(--text-muted)">{$t.historyRetentionUnit}</span>
           </div>
         </div>
 
         {#if historyEntries.length === 0}
           <div class="card" style="padding:24px;text-align:center;color:var(--text-muted)">
-            {$t.historyEmpty || 'Aucun paiement enregistré.'}
+            {$t.historyEmpty}
           </div>
         {:else}
           <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
             <button class="btn-ghost btn-sm" style="color:#ef4444;font-size:11px"
-              on:click={clearHistory}>Effacer l'historique</button>
+              on:click={clearHistory}>{$t.historyClearBtn}</button>
           </div>
           <div class="history-list">
             {#each [...historyEntries].reverse() as p}
@@ -2188,7 +2168,7 @@
                   <span class="history-amount">{p.amount_xmr.toFixed(4)} XMR</span>
                 </div>
                 <div class="history-row history-meta">
-                  <span class="text-muted">{new Date(p.sent_at).toLocaleString()}</span>
+                  <span class="text-muted">{new Date(p.sent_at).toLocaleString($currentLang)}</span>
                   {#if p.tx_prefix}
                     <span class="history-tx">tx: {p.tx_prefix}…</span>
                   {/if}
@@ -2198,7 +2178,7 @@
           </div>
           <!-- Totals by sub -->
           <div class="card" style="margin-top:12px;padding:12px 16px">
-            <div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:8px">TOTAUX (HISTORIQUE CHIFFRÉ)</div>
+            <div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:8px">{$t.historyTotals}</div>
             {#each Object.entries(historyEntries.reduce((acc, p) => {
               acc[p.sub_label] = (acc[p.sub_label] || 0) + p.amount_xmr; return acc;
             }, {})) as [label, total]}
@@ -2213,7 +2193,7 @@
         <div class="card" style="padding:24px;text-align:center">
           <p style="font-size:20px;margin-bottom:8px">🔒</p>
           <p style="color:var(--text-muted);font-size:13px">
-            L'enregistrement de l'historique est désactivé.<br/>Réactivez-le pour enregistrer les paiements futurs.
+            {$t.historyOffLine1}<br/>{$t.historyOffLine2}
           </p>
         </div>
       {/if}
@@ -2296,10 +2276,10 @@
       </div>
 
       <!-- Treasurer mode section -->
-      <h2 class="section-title">⚖ {$t.treasurerModeLabel || 'Mode Trésorier (PV)'}</h2>
+      <h2 class="section-title">⚖ {$t.treasurerModeLabel}</h2>
       <div class="settings-section card">
         <div class="setting-row">
-          <span class="setting-label">{$t.treasurerModeLabel || 'Mode Trésorier'}</span>
+          <span class="setting-label">{$t.treasurerModeLabel}</span>
           <label class="toggle">
             <input type="checkbox" bind:checked={treasurerMode}
               on:change={e => toggleTreasurerMode(e.target.checked)} />
@@ -2307,7 +2287,7 @@
           </label>
         </div>
         <p class="mode-desc" style="font-size:12px;color:var(--text-muted)">
-          {$t.treasurerModeDesc || 'Importer et exécuter des ordres de paiement issus d\'un Procès-Verbal.'}
+          {$t.treasurerModeDesc}
         </p>
       </div>
 
@@ -2324,12 +2304,12 @@
         </div>
         {#if notifSettings.lowBalance}
         <div class="setting-row" style="padding-left:16px;gap:8px">
-          <span class="setting-label" style="font-size:12px;color:var(--text-muted)">Solde bas si moins de</span>
+          <span class="setting-label" style="font-size:12px;color:var(--text-muted)">{$t.notifLowBalanceBefore}</span>
           <input type="number" bind:value={notifSettings.lowBalanceThresholdDays}
             on:change={applyAlertConfig}
             min="1" max="60" step="1"
             style="width:52px;padding:4px 6px;font-size:13px;text-align:center" />
-          <span class="text-muted" style="font-size:12px">jours de réserve</span>
+          <span class="text-muted" style="font-size:12px">{$t.notifLowBalanceAfter}</span>
         </div>
         {/if}
         <div class="setting-row">
@@ -2357,79 +2337,77 @@
       <h2 class="section-title">Wallet RPC <span class="badge-v2">v0.2</span></h2>
       <div class="settings-section card">
         <div class="rpc-status-row">
-          <span class="setting-label">{$t.rpcStatus || 'Statut wallet-rpc'}</span>
+          <span class="setting-label">{$t.rpcStatus}</span>
           <span class="rpc-badge rpc-{rpcStatus}">
-            {rpcStatus === 'running' ? ($t.rpcRunning || 'En marche') :
-             rpcStatus === 'starting' ? ($t.rpcStarting || 'Démarrage…') :
-             rpcStatus === 'stopped' ? ($t.rpcStopped || 'Arrêté') : ($t.rpcError || 'Erreur')}
+            {rpcStatus === 'running' ? ($t.rpcRunning) :
+             rpcStatus === 'starting' ? ($t.rpcStarting) :
+             rpcStatus === 'stopped' ? ($t.rpcStopped) : ($t.rpcError)}
           </span>
         </div>
         {#if rpcBinaryPath}
-          <p class="rpc-info">{$t.rpcBinaryFound || 'Binaire détecté'} : <code>{rpcBinaryPath}</code></p>
+          <p class="rpc-info">{$t.rpcBinaryFound}{colon} <code>{rpcBinaryPath}</code></p>
         {:else}
           <p class="rpc-warn">
-            ⚠ <code>monero-wallet-rpc</code> {$t.rpcBinaryMissing || 'introuvable dans PATH'}.<br>
+            ⚠ <code>monero-wallet-rpc</code> {$t.rpcBinaryMissing}.<br>
             <a class="rpc-link" href="https://www.getmonero.org/downloads/" on:click|preventDefault={() => openExternal("https://www.getmonero.org/downloads/")}>
-              {$t.rpcDownload || 'Télécharger Monero CLI'} →
+              {$t.rpcDownload} →
             </a>
-            {$t.rpcOrSetPath || 'ou renseigner le chemin ci-dessous.'}
+            {$t.rpcOrSetPath}
           </p>
           <label class="field" style="margin-top:8px">
-            <span>{$t.rpcBinaryPath || 'Chemin du binaire (optionnel)'}</span>
+            <span>{$t.rpcBinaryPath}</span>
             <input type="text" bind:value={rpcConfig.binary_path} placeholder="/usr/bin/monero-wallet-rpc" />
           </label>
         {/if}
 
         <label class="field" style="margin-top:10px">
-          <span>{$t.rpcPublicNode || 'Nœud Monero public'}</span>
+          <span>{$t.rpcPublicNode}</span>
           <select bind:value={nodeChoice} class="setting-select" style="width:100%">
-            <option value="">{$t.rpcNodeAuto || 'Automatique (premier nœud disponible)'}</option>
+            <option value="">{$t.rpcNodeAuto}</option>
             {#each publicNodes as node}
               <option value={node}>{node}</option>
             {/each}
-            <option value={CUSTOM_NODE}>{$t.rpcNodeCustom || 'Nœud personnalisé…'}</option>
+            <option value={CUSTOM_NODE}>{$t.rpcNodeCustom}</option>
           </select>
         </label>
         {#if nodeChoice === CUSTOM_NODE}
           <label class="field" style="margin-top:8px">
-            <span>{$t.rpcNodeCustomLabel || 'Adresse du nœud (hôte:port)'}</span>
+            <span>{$t.rpcNodeCustomLabel}</span>
             <input type="text" bind:value={customNode} placeholder="node.example.org:18089" spellcheck="false" />
           </label>
         {/if}
         <p class="rpc-info" style="margin-top:6px">
-          {$t.rpcActiveNode || 'Nœud utilisé actuellement'} :
-          <code>{activeNode ?? ($t.rpcActiveNodeNone || 'aucun pour l\'instant')}</code>
+          {$t.rpcActiveNode}{colon}
+          <code>{activeNode ?? ($t.rpcActiveNodeNone)}</code>
         </p>
         <p class="text-muted" style="font-size:11px;margin-top:2px">
           {nodeChoice === ""
-            ? ($t.rpcNodeAutoHint || 'En mode automatique, si le nœud ne répond plus (panne, blocage), le suivant de la liste est utilisé.')
-            : ($t.rpcNodePinnedHint || 'Nœud fixé : aucune bascule automatique si ce nœud ne répond plus.')}
+            ? ($t.rpcNodeAutoHint)
+            : ($t.rpcNodePinnedHint)}
         </p>
 
         <label class="field" style="margin-top:10px">
-          <span>{$t.rpcTolerance || 'Tolérance paiement'} <strong>{rpcConfig.tolerance_pct}%</strong>
-            <span class="text-muted" style="font-size:10px"> — {$t.rpcToleranceHint || 'ex: 20% = ±6j sur mensuel'}</span>
+          <span>{$t.rpcTolerance} <strong>{rpcConfig.tolerance_pct}%</strong>
+            <span class="text-muted" style="font-size:10px"> — {$t.rpcToleranceHint}</span>
           </span>
           <input type="range" min="5" max="50" step="5" bind:value={rpcConfig.tolerance_pct} />
         </label>
 
         <button class="btn-primary btn-sm" style="margin-top:10px;width:fit-content" on:click={saveRpcConfig}>
-          Enregistrer la config RPC
+          {$t.rpcSaveBtn}
         </button>
         {#if rpcSaveMsg}
           <p class="text-muted" style="font-size:11px;margin-top:6px">{rpcSaveMsg}</p>
         {/if}
       </div>
 
-      <h2 class="section-title">Limites de sécurité</h2>
+      <h2 class="section-title">{$t.limitsTitle}</h2>
       <div class="settings-section card">
         <p class="text-muted" style="font-size:12px;margin:0 0 10px">
-          Toujours actives : minimum {paymentLimits.min_amount_xmr} XMR par envoi ; confirmation pour un premier envoi,
-          des conditions modifiées, un envoi d'au moins {paymentLimits.high_amount_xmr} XMR, ou un total
-          de plus de {paymentLimits.monthly_confirm_xmr} XMR par mois.
+          {fmt($t.limitsAlwaysOn, { min: paymentLimits.min_amount_xmr, high: paymentLimits.high_amount_xmr, monthly: paymentLimits.monthly_confirm_xmr })}
         </p>
         <div class="setting-row">
-          <span class="setting-label">Montants élevés (plus de {paymentLimits.max_amount_xmr} XMR par envoi)</span>
+          <span class="setting-label">{fmt($t.limitsLarge, { max: paymentLimits.max_amount_xmr })}</span>
           <label class="toggle">
             <input type="checkbox" checked={paymentLimits.allow_large_amounts}
               on:change={e => onLimitToggle("allow_large_amounts", e)} />
@@ -2437,7 +2415,7 @@
           </label>
         </div>
         <div class="setting-row">
-          <span class="setting-label">Cadences très courtes (moins de {paymentLimits.min_cadence_days} jours, jusqu'à toutes les 25 min)</span>
+          <span class="setting-label">{fmt($t.limitsShort, { days: paymentLimits.min_cadence_days })}</span>
           <label class="toggle">
             <input type="checkbox" checked={paymentLimits.allow_short_cadence}
               on:change={e => onLimitToggle("allow_short_cadence", e)} />
@@ -2445,28 +2423,27 @@
           </label>
         </div>
         <p class="text-muted" style="font-size:11px;margin-top:6px">
-          Désactivées par défaut. Les activer demande votre mot de passe ; les désactiver, non.
+          {$t.limitsFooter}
         </p>
       </div>
 
       <!-- Logs section in Settings -->
-      <h2 class="section-title">Journaux techniques</h2>
+      <h2 class="section-title">{$t.logsTitle}</h2>
       <div class="settings-section card">
         <p class="log-security-note">
-          ⚠ Ces journaux ne contiennent aucun montant, adresse ou donnée personnelle.
-          Ils sont stockés uniquement en RAM et effacés à chaque redémarrage.
+          {$t.logsNote}
         </p>
         <div class="log-toolbar">
           <select bind:value={logFilter} class="setting-select log-filter-select">
-            <option value="">Tout</option>
-            <option value="info">Info</option>
-            <option value="warn">Avertissements</option>
-            <option value="error">Erreurs</option>
+            <option value="">{$t.logsFilterAll}</option>
+            <option value="info">{$t.logsFilterInfo}</option>
+            <option value="warn">{$t.logsFilterWarn}</option>
+            <option value="error">{$t.logsFilterError}</option>
           </select>
           <button class="btn-ghost btn-sm" on:click={() => showLogs = !showLogs}>
-            {showLogs ? "Masquer" : "Afficher les logs"}
+            {showLogs ? $t.commonHide : $t.logsShow}
           </button>
-          <button class="btn-ghost btn-sm" on:click={clearLogs}>Effacer</button>
+          <button class="btn-ghost btn-sm" on:click={clearLogs}>{$t.commonClear}</button>
         </div>
         {#if showLogs}
           <div class="log-list">
@@ -2477,22 +2454,22 @@
                 <span class="log-msg">{entry.msg}</span>
               </div>
             {:else}
-              <p class="text-muted" style="font-size:12px;padding:8px">Aucun log.</p>
+              <p class="text-muted" style="font-size:12px;padding:8px">{$t.logsNone}</p>
             {/each}
           </div>
         {/if}
       </div>
 
       <!-- Send logs (opt-in) -->
-      <h2 class="section-title">Journaux d'envoi <span class="badge-opt">opt-in</span></h2>
+      <h2 class="section-title">{$t.sendLogsTitle} <span class="badge-opt">opt-in</span></h2>
       <div class="settings-section card">
         <p class="log-security-note">
-          📋 Trace des envois de paiements — utile comme preuve en cas de réclamation.<br>
-          <strong>Contient uniquement l'identifiant interne et la date</strong> — aucun montant, aucun destinataire.<br>
-          Persisté chiffré en localStorage. Désactivé par défaut.
+          {$t.sendLogsNote1}<br>
+          <strong>{$t.sendLogsNote2}</strong> {$t.sendLogsNote3}<br>
+          {$t.sendLogsNote4}
         </p>
         <div class="setting-row">
-          <span class="setting-label">Activer les logs d'envoi</span>
+          <span class="setting-label">{$t.sendLogsEnable}</span>
           <label class="toggle">
             <input type="checkbox"
               checked={$sendLogsStore}
@@ -2504,9 +2481,9 @@
         {#if $sendLogsStore}
           <div class="log-toolbar">
             <button class="btn-ghost btn-sm" on:click={() => showSendLogs = !showSendLogs}>
-              {showSendLogs ? "Masquer" : "Afficher"}
+              {showSendLogs ? $t.commonHide : $t.commonShow}
             </button>
-            <button class="btn-ghost btn-sm" on:click={clearSendLogs}>Effacer</button>
+            <button class="btn-ghost btn-sm" on:click={clearSendLogs}>{$t.commonClear}</button>
           </div>
           {#if showSendLogs}
             <div class="log-list">
@@ -2517,7 +2494,7 @@
                   <span class="log-msg">{entry.event}</span>
                 </div>
               {:else}
-                <p class="text-muted" style="font-size:12px;padding:8px">Aucun log d'envoi.</p>
+                <p class="text-muted" style="font-size:12px;padding:8px">{$t.sendLogsNone}</p>
               {/each}
             </div>
           {/if}
@@ -2527,10 +2504,10 @@
     <!-- ====== CREATE CODE (full page, merchant / influencer) ====== -->
     {:else if page === "create-code"}
       <div class="page-header">
-        <h1>{$t.createCodeTitle || 'Créer un code AutoPay de partage'}</h1>
-        <p class="subs-subtitle">{$t.createCodeSubtitle || 'Pour marchands, créateurs et influenceurs — à diffuser à vos abonnés'}</p>
+        <h1>{$t.createCodeTitle}</h1>
+        <p class="subs-subtitle">{$t.createCodeSubtitle}</p>
         <button class="btn-inline guide-link" on:click={() => goToGuide("create-wallet")}>
-          Pas encore d'adresse Monero ? Créez un portefeuille libre et anonyme en 5 minutes →
+          {$t.createCodeGuideLink}
         </button>
       </div>
       <div class="create-code-page">
@@ -2545,8 +2522,8 @@
     <!-- ====== RECEIVE XMR ====== -->
     {:else if page === "receive"}
       <div class="page-header">
-          <h1>{$t.receivePageTitle || 'Recevoir des XMR'}</h1>
-        <p class="subs-subtitle">{$t.receiveDesc || 'Partagez cette adresse ou ce QR code pour recevoir des paiements Monero.'}</p>
+          <h1>{$t.receivePageTitle}</h1>
+        <p class="subs-subtitle">{$t.receiveDesc}</p>
       </div>
       <div class="receive-page">
         {#if walletAddress}
@@ -2559,56 +2536,56 @@
           <div class="receive-address-box">
             <span class="receive-address">{walletAddress}</span>
             <button class="btn-copy" on:click={() => copyAddress(walletAddress)}>
-              {copiedAddr ? ($t.receiveCopied || 'Copié !') : ($t.receiveCopy || 'Copier l\'adresse')}
+              {copiedAddr ? ($t.receiveCopied) : ($t.receiveCopy)}
             </button>
           </div>
 
           <!-- Sweep section (only when balance > 0) -->
           {#if balanceXmr !== null && balanceXmr > 0}
             <div class="sweep-section">
-              <h2>{$t.sweepTitle || 'Vider le wallet'}</h2>
-              <p class="sweep-warn">{$t.sweepWarning || '⚠️ Cette action est irréversible.'}</p>
-              <p class="subs-subtitle">{$t.sweepDesc || 'Envoyer tous les fonds disponibles vers une autre adresse Monero.'}</p>
-              <label class="sweep-label" for="sweep-dest">{$t.sweepDestLabel || 'Adresse de destination'}</label>
+              <h2>{$t.sweepTitle}</h2>
+              <p class="sweep-warn">{$t.sweepWarning}</p>
+              <p class="subs-subtitle">{$t.sweepDesc}</p>
+              <label class="sweep-label" for="sweep-dest">{$t.sweepDestLabel}</label>
               <input id="sweep-dest"
                 class="sweep-input"
                 type="text"
                 bind:value={sweepDest}
-                placeholder={$t.sweepDestPlaceholder || '4... (adresse Monero)'}
+                placeholder={$t.sweepDestPlaceholder}
               />
               {#if sweepError}
-                <div class="sweep-error">{$t.sweepError || 'Erreur'} : {sweepError}</div>
+                <div class="sweep-error">{$t.sweepError}{colon} {sweepError}</div>
               {/if}
               {#if sweepTxHash}
-                <div class="sweep-success">{$t.sweepSuccess || 'Transaction envoyée !'} <code>{sweepTxHash}</code></div>
+                <div class="sweep-success">{$t.sweepSuccess} <code>{sweepTxHash}</code></div>
               {/if}
               <button
                 class="btn-danger"
                 on:click={doSweepAll}
                 disabled={sweepLoading || sweepDest.trim().length < 90}
               >
-                {sweepLoading ? 'Envoi en cours…' : ($t.sweepConfirm || 'Vider le wallet')}
+                {sweepLoading ? $t.commonSending : $t.sweepConfirm}
               </button>
             </div>
           {/if}
         {:else}
-          <div class="balance-hint">Adresse non disponible — déverrouillez le wallet d'abord.</div>
+          <div class="balance-hint">{$t.receiveNoAddress}</div>
         {/if}
       </div>
 
     <!-- ====== TREASURER ====== -->
     {:else if page === "treasurer"}
       <div class="page-header">
-        <h1>⚖ {$t.treasurerPageTitle || 'Trésorier — Procès-Verbal'}</h1>
+        <h1>⚖ {$t.treasurerPageTitle}</h1>
       </div>
       <div class="card" style="padding:16px;margin-bottom:16px">
         <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px">
-          {$t.treasurerFormatHint || 'Format JSON standardisé : version, id, created_at, committee, resolution_number, description, payments[].'}
+          {$t.treasurerFormatHint}
         </p>
         <label class="field">
-          <span>{$t.treasurerImportLabel || 'Importer un PV (JSON)'}</span>
+          <span>{$t.treasurerImportLabel}</span>
           <textarea bind:value={pvJson} rows="8"
-            placeholder={$t.treasurerImportPlaceholder || 'Collez ici le JSON du Procès-Verbal…'}
+            placeholder={$t.treasurerImportPlaceholder}
             style="font-family:monospace;font-size:12px;width:100%;resize:vertical;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-card);color:var(--text)"></textarea>
         </label>
         {#if pvError}
@@ -2616,11 +2593,11 @@
         {/if}
         <div style="display:flex;gap:8px;margin-top:12px">
           <button class="btn-primary" on:click={validatePv} disabled={!pvJson.trim()}>
-            {$t.treasurerValidateBtn || 'Valider le PV'}
+            {$t.treasurerValidateBtn}
           </button>
           {#if pvDoc}
             <button class="btn-ghost" on:click={() => { pvDoc = null; pvJson = ""; pvResults = {}; }}>
-              Effacer
+              {$t.commonClear}
             </button>
           {/if}
         </div>
@@ -2631,7 +2608,7 @@
           <div style="margin-bottom:12px">
             <div style="font-size:15px;font-weight:700">{pvDoc.committee}</div>
             <div style="font-size:12px;color:var(--text-muted)">
-              Résolution #{pvDoc.resolution_number} · {pvDoc.created_at?.slice(0,10)}
+              {fmt($t.pvResolution, { n: pvDoc.resolution_number })} · {pvDoc.created_at?.slice(0,10)}
             </div>
             <div style="font-size:13px;margin-top:6px">{pvDoc.description}</div>
           </div>
@@ -2646,7 +2623,7 @@
                       {payment.amount_xmr} {payment.currency}
                     </div>
                     <div style="font-size:11px;color:var(--text-muted)">
-                      {payment.execution === 'immediate' ? 'Exécution immédiate' : `Différée : ${payment.execution}`}
+                      {payment.execution === 'immediate' ? $t.pvImmediate : fmt($t.pvDeferred, { when: payment.execution })}
                     </div>
                     {#if payment.note}
                       <div style="font-size:12px;font-style:italic;color:var(--text-muted)">{payment.note}</div>
@@ -2654,16 +2631,16 @@
                   </div>
                   <div style="text-align:right">
                     {#if result?.status === 'ok'}
-                      <span style="color:#22c55e;font-size:12px">✓ Envoyé</span>
+                      <span style="color:#22c55e;font-size:12px">{$t.pvSent}</span>
                     {:else if result?.status === 'error'}
-                      <span style="color:#ef4444;font-size:12px">✗ Erreur</span>
+                      <span style="color:#ef4444;font-size:12px">{$t.pvFailed}</span>
                     {:else if result?.status === 'pending'}
-                      <span style="color:var(--text-muted);font-size:12px">En cours…</span>
+                      <span style="color:var(--text-muted);font-size:12px">{$t.pvRunning}</span>
                     {:else}
                       <button class="btn-primary" style="font-size:12px;padding:6px 12px"
                         disabled={pvExecuting || payment.currency !== 'XMR'}
                         on:click={() => executePvPayment(payment)}>
-                        {$t.treasurerExecuteBtn || 'Exécuter'}
+                        {$t.treasurerExecuteBtn}
                       </button>
                     {/if}
                   </div>
@@ -2677,7 +2654,7 @@
                 {/if}
                 {#if payment.currency !== 'XMR'}
                   <div style="font-size:11px;color:#f97316;margin-top:4px">
-                    ⚠ Bitcoin non encore supporté dans cette version.
+                    {$t.pvBtcUnsupported}
                   </div>
                 {/if}
               </div>
@@ -2693,7 +2670,7 @@
       </div>
       <div class="howto-body">
         <div class="howto-anim card">
-          <PaymentAnimation fromLabel="Mon wallet" toLabel="Subscription" amount="0.05 XMR / mois"/>
+          <PaymentAnimation fromLabel={$t.myWallet} toLabel={$t.subscriptions} amount={`0.05 XMR ${$t.animSuffix}`}/>
         </div>
         <div class="howto card">
           <div class="howto-step">
@@ -2713,50 +2690,43 @@
         <hr class="howto-sep" />
 
         <section class="howto-guide card" id="create-wallet">
-          <h2>Créer un portefeuille (wallet) Monero libre, anonyme et intraçable par défaut</h2>
-          <p class="text-muted">
-            Avec Monero, l'expéditeur, le destinataire et le montant sont masqués par défaut : aucun réglage à activer.
-            Deux applications open source, gratuites et sans compte :
-          </p>
+          <h2>{$t.guideWalletTitle}</h2>
+          <p class="text-muted">{$t.guideWalletIntro}</p>
           <ul>
             <li>
-              <strong>Monero GUI</strong> — le portefeuille officiel du projet Monero, pour ordinateur (Windows, macOS, Linux).
+              <strong>Monero GUI</strong> {$t.guideWalletGui}
               <button class="btn-inline" on:click={() => openExternal("https://www.getmonero.org/downloads/")}>getmonero.org/downloads</button>
             </li>
             <li>
-              <strong>Cake Wallet</strong> — sur mobile (Android, iOS) et ordinateur, simple à prendre en main.
+              <strong>Cake Wallet</strong> {$t.guideWalletCake}
               <button class="btn-inline" on:click={() => openExternal("https://cakewallet.com")}>cakewallet.com</button>
             </li>
           </ul>
           <ol>
-            <li>Téléchargez uniquement depuis le site officiel (ou le store officiel sur mobile).</li>
-            <li>Choisissez « Créer un nouveau portefeuille » et définissez un mot de passe solide.</li>
-            <li>Notez la <strong>phrase de récupération</strong> (25 mots, ou 16 sur Cake Wallet selon le type de portefeuille) sur papier, hors ligne.
-              Jamais en photo ni dans un cloud : quiconque la possède contrôle vos fonds.</li>
-            <li>Votre adresse de réception commence par <code>4</code> (adresse principale) ou <code>8</code> (sous-adresse).
-              Utilisez une sous-adresse différente par usage pour cloisonner vos activités.</li>
+            <li>{$t.guideWalletStep1}</li>
+            <li>{$t.guideWalletStep2}</li>
+            <li>{$t.guideWalletStep3a} <strong>{$t.guideWalletStep3b}</strong> {$t.guideWalletStep3c}</li>
+            <li>{$t.guideWalletStep4a} <code>4</code> {$t.guideWalletStep4b} <code>8</code> {$t.guideWalletStep4c}</li>
           </ol>
         </section>
 
         <section class="howto-guide card" id="get-monero">
-          <h2>Comment obtenir du Monero pour payer vos abonnements</h2>
+          <h2>{$t.guideGetTitle}</h2>
           <ul>
             <li>
-              <strong>De pair à pair (P2P)</strong> — achetez directement à une autre personne, sans intermédiaire centralisé :
-              sur <button class="btn-inline" on:click={() => openExternal("https://haveno.exchange")}>Haveno</button>
-              (plateforme d'échange décentralisée et open source), ou en main propre lors d'une rencontre Monero locale.
+              <strong>{$t.guideGetP2pTitle}</strong> {$t.guideGetP2pBefore}
+              <button class="btn-inline" on:click={() => openExternal("https://retoswap.com")}>RetoSwap.com</button>
+              {$t.guideGetP2pAfter}
             </li>
             <li>
-              <strong>Conversion depuis Bitcoin</strong> — un agrégateur d'échanges instantanés sans compte comme
+              <strong>{$t.guideGetBtcTitle}</strong> {$t.guideGetBtcBefore}
               <button class="btn-inline" on:click={() => openExternal("https://trocador.app")}>Trocador.app</button>
-              convertit vos BTC en XMR : indiquez votre adresse Monero comme destination, vérifiez-la, puis envoyez les BTC.
+              {$t.guideGetBtcAfter}
             </li>
           </ul>
-          <p class="text-muted">
-            Envoyez ensuite les XMR vers votre adresse AutoPay. Ils deviennent utilisables après environ 20 minutes (10 confirmations).
-          </p>
+          <p class="text-muted">{$t.guideGetFooter}</p>
           <button class="btn-primary btn-sm" style="width:fit-content" on:click={() => page = "receive"}>
-            Voir mon adresse de réception AutoPay
+            {$t.guideGetButton}
           </button>
         </section>
       </div>
@@ -2770,9 +2740,9 @@
   <div class="dup-overlay" on:click={rejectDuplicate}>
     <div class="dup-popup card" on:click|stopPropagation>
       <div class="dup-icon">⚠️</div>
-      <p class="dup-title">Abonnement similaire déjà présent</p>
+      <p class="dup-title">{$t.dupTitle}</p>
       <p class="dup-label"><strong>{pendingDuplicateSub.label}</strong></p>
-      <p class="dup-question text-muted">Ajouter quand même ce doublon ?</p>
+      <p class="dup-question text-muted">{$t.dupQuestion}</p>
 
       <!-- Pie countdown timer -->
       <svg class="dup-pie" viewBox="0 0 48 48" width="48" height="48">
@@ -2791,10 +2761,10 @@
 
       <div class="dup-actions">
         <button class="btn-primary dup-no" on:click={rejectDuplicate}>
-          Non (défaut)
+          {$t.dupNo}
         </button>
         <button class="btn-ghost" on:click={acceptDuplicate}>
-          Oui, ajouter
+          {$t.dupYes}
         </button>
       </div>
     </div>
@@ -2808,8 +2778,8 @@
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">{editingSubData ? "Modifier l'abonnement" : "Nouvel abonnement"} <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
-        <button class="modal-close" on:click={() => { showNewSubModal = false; editingSubData = null; }} aria-label="Fermer">✕</button>
+        <h2 class="modal-title">{editingSubData ? $t.modalEditSub : $t.newSubscription} <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
+        <button class="modal-close" on:click={() => { showNewSubModal = false; editingSubData = null; }} aria-label={$t.alertOverlayClose}>✕</button>
       </div>
       <div class="modal-body">
         <SubscriptionCodeEditor
@@ -2832,8 +2802,8 @@
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-panel" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h2 class="modal-title">Importer un code AutoPay <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
-        <button class="modal-close" on:click={() => showImportModal = false} aria-label="Fermer">✕</button>
+        <h2 class="modal-title">{$t.modalImportTitle} <span style="font-size:10px;opacity:0.5;font-weight:400">format v1</span></h2>
+        <button class="modal-close" on:click={() => showImportModal = false} aria-label={$t.alertOverlayClose}>✕</button>
       </div>
       <div class="modal-body">
         <SubscriptionCodeEditor

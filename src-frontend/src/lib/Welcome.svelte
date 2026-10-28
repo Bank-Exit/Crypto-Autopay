@@ -11,7 +11,7 @@
   // Animation subjects — reactive to language and network
   $: animSubjects = [
     { toLabel: "Le Média Libre", xmrAmount: "0.05", btcAmount: "420 sats" },
-    { toLabel: $t.vpnLabel || "VPN",  xmrAmount: "0.012", btcAmount: "120 sats" },
+    { toLabel: $t.vpnLabel,  xmrAmount: "0.012", btcAmount: "120 sats" },
   ];
 </script>
 

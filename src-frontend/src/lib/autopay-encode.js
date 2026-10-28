@@ -95,12 +95,12 @@ export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
   if (minField && minField.startsWith('*/')) {
     const everyMin = parseInt(minField.slice(2));
     if (!isNaN(everyMin)) {
-      return lang === 'fr' ? `Toutes les ${everyMin} min` : `Every ${everyMin} min`;
+      return `${labels.everyMin} ${everyMin} min`;
     }
   }
   // Every hour: min=0, hour=*, dom=*, month=*, dow=*
   if (dom === '*' && month === '*' && dow === '*' && minField === '0') {
-    return lang === 'fr' ? 'Toutes les heures' : 'Hourly';
+    return labels.hourly;
   }
 
   // Match on structural pattern
@@ -116,27 +116,31 @@ export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
 
 const SCHEDULE_LABELS = {
   fr: { daily: "Quotidien", weekly: "Hebdomadaire", biweekly: "Bimensuel", monthly: "Mensuel", quarterly: "Trimestriel",
-        yearly: "Annuel", every: "Tous les", months: "mois", weeks: "semaines", years: "ans" },
+        yearly: "Annuel", every: "Tous les", months: "mois", weeks: "semaines", years: "ans",
+        everyMin: "Toutes les", hourly: "Toutes les heures" },
   en: { daily: "Daily", weekly: "Weekly", biweekly: "Biweekly", monthly: "Monthly", quarterly: "Quarterly",
-        yearly: "Yearly", every: "Every", months: "months", weeks: "weeks", years: "years" },
+        yearly: "Yearly", every: "Every", months: "months", weeks: "weeks", years: "years",
+        everyMin: "Every", hourly: "Hourly" },
   de: { daily: "Täglich", weekly: "Wöchentlich", biweekly: "Zweiwöchentlich", monthly: "Monatlich", quarterly: "Vierteljährlich",
-        yearly: "Jährlich", every: "Alle", months: "Monate", weeks: "Wochen", years: "Jahre" },
+        yearly: "Jährlich", every: "Alle", months: "Monate", weeks: "Wochen", years: "Jahre",
+        everyMin: "Alle", hourly: "Stündlich" },
   es: { daily: "Diario", weekly: "Semanal", biweekly: "Quincenal", monthly: "Mensual", quarterly: "Trimestral",
-        yearly: "Anual", every: "Cada", months: "meses", weeks: "semanas", years: "años" },
+        yearly: "Anual", every: "Cada", months: "meses", weeks: "semanas", years: "años",
+        everyMin: "Cada", hourly: "Cada hora" },
 };
 
 /** Known preset schedules — 6-field Quartz cron (sec min hour dom month dow) */
 export const SCHEDULE_PRESETS = [
-  { id: "every25min", cron: "0 */25 * * * *", label_fr: "Toutes les 25 min", label_en: "Every 25 min", devOnly: true },
-  { id: "hourly",    cron: "0 0 * * * *",    label_fr: "Toutes les heures", label_en: "Hourly" },
-  { id: "daily",     cron: "0 0 9 * * *",   label_fr: "Quotidien",      label_en: "Daily" },
-  { id: "weekly",    cron: "0 0 9 * * 1",   label_fr: "Hebdomadaire",   label_en: "Weekly" },
-  { id: "monthly",   cron: "0 0 9 1 * *",   label_fr: "Mensuel",        label_en: "Monthly" },
-  { id: "quarterly", cron: "0 0 9 1 */3 *", label_fr: "Trimestriel",    label_en: "Quarterly" },
-  { id: "yearly",    cron: "0 0 9 1 1 *",   label_fr: "Annuel",         label_en: "Yearly" },
-  { id: "biennial",  cron: "0 0 9 1 1 *",   label_fr: "Tous les 2 ans", label_en: "Every 2 years", repeatEvery: 2 },
-  { id: "triennial", cron: "0 0 9 1 1 *",   label_fr: "Tous les 3 ans", label_en: "Every 3 years", repeatEvery: 3 },
-  { id: "custom",    cron: "",              label_fr: "Personnalisé",   label_en: "Custom" },
+  { id: "every25min", cron: "0 */25 * * * *", label_fr: "Toutes les 25 min", label_en: "Every 25 min", label_de: "Alle 25 Min.", label_es: "Cada 25 min", devOnly: true },
+  { id: "hourly",    cron: "0 0 * * * *",    label_fr: "Toutes les heures", label_en: "Hourly", label_de: "Stündlich", label_es: "Cada hora" },
+  { id: "daily",     cron: "0 0 9 * * *",   label_fr: "Quotidien",      label_en: "Daily", label_de: "Täglich", label_es: "Diario" },
+  { id: "weekly",    cron: "0 0 9 * * 1",   label_fr: "Hebdomadaire",   label_en: "Weekly", label_de: "Wöchentlich", label_es: "Semanal" },
+  { id: "monthly",   cron: "0 0 9 1 * *",   label_fr: "Mensuel",        label_en: "Monthly", label_de: "Monatlich", label_es: "Mensual" },
+  { id: "quarterly", cron: "0 0 9 1 */3 *", label_fr: "Trimestriel",    label_en: "Quarterly", label_de: "Vierteljährlich", label_es: "Trimestral" },
+  { id: "yearly",    cron: "0 0 9 1 1 *",   label_fr: "Annuel",         label_en: "Yearly", label_de: "Jährlich", label_es: "Anual" },
+  { id: "biennial",  cron: "0 0 9 1 1 *",   label_fr: "Tous les 2 ans", label_en: "Every 2 years", label_de: "Alle 2 Jahre", label_es: "Cada 2 años", repeatEvery: 2 },
+  { id: "triennial", cron: "0 0 9 1 1 *",   label_fr: "Tous les 3 ans", label_en: "Every 3 years", label_de: "Alle 3 Jahre", label_es: "Cada 3 años", repeatEvery: 3 },
+  { id: "custom",    cron: "",              label_fr: "Personnalisé",   label_en: "Custom", label_de: "Benutzerdefiniert", label_es: "Personalizado" },
 ];
 
 /** Known networks and their common tokens */

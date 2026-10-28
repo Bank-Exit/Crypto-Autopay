@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher, onMount } from "svelte";
-  import { t } from "./i18n.js";
+  import { t, fmt, currentLang } from "./i18n.js";
+  import { scheduleToHuman } from "./autopay-encode.js";
   import { currentNetwork } from "./network.js";
 
   const dispatch = createEventDispatcher();
@@ -41,8 +42,8 @@
   function countdownText(sub, now) {
     const ms = remainingMs(sub, now);
     if (ms === null) return null;
-    const inPfx = $t.inPrefix || "dans";
-    const dayPfx = $t.dayMinus || "J-";
+    const inPfx = $t.inPrefix;
+    const dayPfx = $t.dayMinus;
     if (ms <= 0) {
       // Overdue — show delay
       const late = Math.abs(new Date(sub.next_payment_at) - now);
@@ -53,7 +54,7 @@
       if (ld >= 1) return `J+${ld}`;
       if (lh >= 1) return `+${lh}h`;
       if (lm >= 1) return `+${lm}min`;
-      return $t.now || 'maintenant';
+      return $t.now;
     }
     const s = Math.floor(ms / 1000);
     if (s < 60) return `${inPfx} ${s}s`;
@@ -104,7 +105,7 @@
 
   function deleteSub(sub, event) {
     event.stopPropagation();
-    if (confirm(`Supprimer « ${sub.label} » ?`)) {
+    if (confirm(fmt($t.subDeleteConfirm, { label: sub.label }))) {
       dispatch("delete-sub", { id: sub.id });
     }
     openMenuId = null;
@@ -144,7 +145,7 @@
 
   function walletName(id) {
     const w = wallets.find(w => w.id === id);
-    return w ? w.name : null;
+    return w ? (w.name || $t.walletMainName) : null;
   }
   function walletColor(id) {
     const w = wallets.find(w => w.id === id);
@@ -187,9 +188,9 @@
     openMenuId = null;
   }
 
-  function formatDate(dateStr) {
+  function formatDate(dateStr, lang) {
     if (!dateStr) return null;
-    return new Date(dateStr).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+    return new Date(dateStr).toLocaleDateString(lang, { day: "2-digit", month: "short" });
   }
 </script>
 
@@ -222,7 +223,7 @@
           <div class="sub-meta">
             <span class="sub-amount"><strong>{sub.amount}</strong> {$currentNetwork.symbol}</span>
             <span class="sep">·</span>
-            <span class="sub-schedule text-muted">{sub.schedule}</span>
+            <span class="sub-schedule text-muted">{sub._raw_schedule ? scheduleToHuman(sub._raw_schedule, sub.repeat_every || 1, $currentLang) : sub.schedule}</span>
 
             {#if sub.canary_status === "Expired"}
               <span class="sep">·</span>
@@ -247,7 +248,7 @@
             {#if !isSuspended(sub) && sub.next_payment_at}
               <span class="next-date">
                 <span class="text-muted">{$t.next}</span>
-                <strong>{formatDate(sub.next_payment_at)}</strong>
+                <strong>{formatDate(sub.next_payment_at, $currentLang)}</strong>
               </span>
               <!-- Pie countdown timer -->
               <span class="pie-wrap" title={countdownText(sub, now)}>
@@ -267,7 +268,7 @@
         <div class="sub-actions">
           <!-- Play / Pause -->
           {#if !isSuspended(sub)}
-            <button class="btn-ghost btn-sm" title={sub.status === "Paused" ? "Reprendre" : "Mettre en pause"}
+            <button class="btn-ghost btn-sm" title={sub.status === "Paused" ? $t.subResume : $t.subPause}
               on:click={e => togglePause(sub, e)}>
               {sub.status === "Paused" ? "▶" : "⏸"}
             </button>
@@ -281,27 +282,27 @@
               <div class="kebab-menu" on:click|stopPropagation>
                 {#if !isSuspended(sub)}
                   <button class="kebab-item kebab-trigger" on:click={e => triggerNow(sub, e)}>
-                    ▶ Declencher maintenant
+                    ▶ {$t.subTriggerNow}
                   </button>
                   <button class="kebab-item" on:click={e => editSub(sub, e)}>
-                    ✏ Modifier
+                    ✏ {$t.subEdit}
                   </button>
                   <button class="kebab-item" on:click={e => togglePause(sub, e)}>
-                    {sub.status === "Paused" ? "▶ Reprendre" : "⏸ Pause"}
+                    {sub.status === "Paused" ? `▶ ${$t.subResume}` : `⏸ ${$t.subPauseShort}`}
                   </button>
                   <div class="kebab-divider"></div>
                   <button class="kebab-item kebab-warn" on:click={e => archiveSub(sub, e)}>
-                    Archiver
+                    {$t.subArchive}
                   </button>
                 {/if}
                 {#if ARCHIVED_STATUSES.includes(sub.status)}
                   <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
-                    Restaurer
+                    {$t.subRestore}
                   </button>
                 {/if}
                 <div class="kebab-divider"></div>
                 <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
-                  Supprimer
+                  {$t.subDelete}
                 </button>
               </div>
             {/if}
@@ -311,7 +312,7 @@
     {/each}
     {#if archivedSubs.length > 0}
       <div class="archived-divider">
-        <span class="archived-divider-label">{$t.navArchived || 'Archivés'}</span>
+        <span class="archived-divider-label">{$t.navArchived}</span>
       </div>
       {#each archivedSubs as sub (sub.id)}
         <div class="sub-card card sub-archived sub-suspended">
@@ -326,7 +327,7 @@
             <div class="sub-meta">
               <span class="sub-amount"><strong>{sub.amount}</strong> {$currentNetwork.symbol}</span>
               <span class="sep">·</span>
-              <span class="sub-schedule text-muted">{sub.schedule}</span>
+              <span class="sub-schedule text-muted">{sub._raw_schedule ? scheduleToHuman(sub._raw_schedule, sub.repeat_every || 1, $currentLang) : sub.schedule}</span>
             </div>
           </div>
           <div class="sub-actions">
@@ -336,11 +337,11 @@
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="kebab-menu" on:click|stopPropagation>
                   <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
-                    Restaurer
+                    {$t.subRestore}
                   </button>
                   <div class="kebab-divider"></div>
                   <button class="kebab-item kebab-danger" on:click={e => deleteSub(sub, e)}>
-                    Supprimer
+                    {$t.subDelete}
                   </button>
                 </div>
               {/if}

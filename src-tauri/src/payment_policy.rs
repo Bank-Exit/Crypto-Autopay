@@ -54,6 +54,7 @@ impl PaymentLimits {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyError {
     UnsupportedCurrency,
+    UnsupportedRepeat,
     InvalidAddress,
     InvalidAmount,
     AmountTooLow,
@@ -68,6 +69,7 @@ impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedCurrency => write!(f, "POLICY:UNSUPPORTED_CURRENCY"),
+            Self::UnsupportedRepeat => write!(f, "POLICY:UNSUPPORTED_REPEAT"),
             Self::InvalidAddress => write!(f, "POLICY:INVALID_ADDRESS"),
             Self::InvalidAmount => write!(f, "POLICY:INVALID_AMOUNT"),
             Self::AmountTooLow => write!(f, "POLICY:AMOUNT_TOO_LOW"),
