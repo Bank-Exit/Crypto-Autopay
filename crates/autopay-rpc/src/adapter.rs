@@ -62,5 +62,5 @@ pub trait PaymentAdapter: Send + Sync {
     fn to_atomic(&self, amount: &str) -> Result<u64, AdapterError>;
 
     /// Convert atomic units back to a human-readable string.
-    fn from_atomic(&self, amount_atomic: u64) -> String;
+    fn format_atomic(&self, amount_atomic: u64) -> String;
 }

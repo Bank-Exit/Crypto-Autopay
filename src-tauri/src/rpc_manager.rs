@@ -305,7 +305,7 @@ impl RpcManager {
         self.status = RpcStatus::Starting;
 
         let child = Command::new(&binary)
-            .args(&args)
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -355,7 +355,7 @@ impl RpcManager {
                         log::error!("[RPC] {}", msg);
                         return Err(msg);
                     }
-                    if attempts % 10 == 0 {
+                    if attempts.is_multiple_of(10) {
                         log::warn!("[RPC] Still waiting… attempt {}, error: {}", attempts, e);
                     }
                     std::thread::sleep(Duration::from_millis(200));

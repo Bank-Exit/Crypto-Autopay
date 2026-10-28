@@ -195,7 +195,7 @@ impl PaymentAdapter for MoneroAdapter {
         Ok((parsed * PICONERO_PER_XMR as f64).round() as u64)
     }
 
-    fn from_atomic(&self, amount_atomic: u64) -> String {
+    fn format_atomic(&self, amount_atomic: u64) -> String {
         format!("{:.12}", amount_atomic as f64 / PICONERO_PER_XMR as f64)
             .trim_end_matches('0')
             .trim_end_matches('.')

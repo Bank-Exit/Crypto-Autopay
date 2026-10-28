@@ -309,7 +309,7 @@ async fn unlock_wallet(
         // 720 blocks ≈ 24 hours. Avoids scan-from-genesis (millions of blocks).
         // Sufficient for recent deposits; users who had older funds will need a manual rescan.
         let daemon_height = rpc_manager::get_daemon_block_height(&mgr.daemon_address());
-        let restore_height: u64 = if daemon_height > 720 { daemon_height - 720 } else { 0 };
+        let restore_height: u64 = daemon_height.saturating_sub(720);
         log::info!("[Unlock/RPC] daemon_height={}, restore_height={}", daemon_height, restore_height);
 
         // Cache file (no extension) and height-marker file paths.
@@ -1305,7 +1305,7 @@ async fn set_history_config(
 ) -> Result<(), String> {
     let mut s = app_state.lock().map_err(|e| e.to_string())?;
     if let Some(v) = enabled { s.history_enabled = v; }
-    if let Some(d) = days { s.history_days = d.max(1).min(3650); }
+    if let Some(d) = days { s.history_days = d.clamp(1, 3650); }
     Ok(())
 }
 
@@ -1413,7 +1413,7 @@ async fn get_sync_info(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde
     let s = state.lock().map_err(|e| e.to_string())?;
     let wallet_h = s.last_wallet_height;
     let daemon_h = s.last_daemon_height;
-    let blocks_behind = if daemon_h > wallet_h { daemon_h - wallet_h } else { 0 };
+    let blocks_behind = daemon_h.saturating_sub(wallet_h);
     Ok(serde_json::json!({
         "wallet_height": wallet_h,
         "daemon_height": daemon_h,
