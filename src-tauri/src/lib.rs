@@ -543,6 +543,12 @@ async fn send_payment(
 }
 
 /// Update a subscription's next_payment_at after a successful payment.
+/// Next due date of a cron schedule (computed here so the frontend never re-implements cron).
+#[tauri::command]
+fn next_occurrence_of(schedule: String) -> String {
+    next_occurrence(&schedule, chrono::Utc::now()).to_rfc3339()
+}
+
 #[tauri::command]
 async fn update_subscription_next_payment(
     id: String,
@@ -1502,19 +1508,23 @@ async fn save_subscription(
     db_state: tauri::State<'_, Mutex<Database>>,
     app_state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    use chrono::Utc;
+    use chrono::{Datelike, Utc};
     use uuid::Uuid;
 
     let now = Utc::now();
-    // "Every N years" is not expressible in cron and the scheduler would pay every year.
-    if payload["repeat_every"].as_u64().unwrap_or(1) > 1 {
-        return Err(payment_policy::PolicyError::UnsupportedRepeat.to_string());
-    }
     let label = payment_policy::clean_text(payload["custom_label"].as_str().unwrap_or("—"), 80);
     let dest = payload["destination_address"].as_str().unwrap_or("").trim().to_string();
     let amount = payload["amount"].as_str().unwrap_or("0").to_string();
     let currency = payload["currency"].as_str().unwrap_or("XMR").to_string();
-    let schedule = payload["schedule"].as_str().unwrap_or("0 0 9 1 * *").to_string();
+    let start_date = payload["start_date"].as_str().filter(|s| !s.is_empty())
+        .and_then(|sd| chrono::DateTime::parse_from_rfc3339(sd).ok())
+        .map(|d| d.with_timezone(&Utc));
+    // Legacy payloads carry "every N years" in repeat_every: fold it into the schedule.
+    let schedule = payment_policy::with_year_step(
+        payload["schedule"].as_str().unwrap_or("0 0 9 1 * *"),
+        payload["repeat_every"].as_u64().unwrap_or(1).min(u32::MAX as u64) as u32,
+        start_date.unwrap_or(now).year(),
+    ).map_err(|e| e.to_string())?;
     let number_of_payments = payload["number_of_payments"].as_u64().unwrap_or(1);
     let start_immediately = payload["start_immediately"].as_bool().unwrap_or(true);
     let canary_url = payload["canary_url"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
@@ -1530,9 +1540,8 @@ async fn save_subscription(
     // next_payment_at: now if start_immediately, else use start_date or compute from schedule
     let next_payment_at = if start_immediately {
         Some(now)
-    } else if let Some(sd) = payload["start_date"].as_str().filter(|s| !s.is_empty()) {
-        chrono::DateTime::parse_from_rfc3339(sd).ok().map(|d| d.with_timezone(&Utc))
-            .or(Some(now + chrono::Duration::days(1)))
+    } else if payload["start_date"].as_str().is_some_and(|s| !s.is_empty()) {
+        start_date.or(Some(now + chrono::Duration::days(1)))
     } else {
         Some(next_occurrence(&schedule, now))
     };
@@ -2475,6 +2484,7 @@ pub fn run() {
             sweep_all,
             send_payment,
             update_subscription_next_payment,
+            next_occurrence_of,
             get_subscriptions,
             add_subscription,
             delete_subscription,

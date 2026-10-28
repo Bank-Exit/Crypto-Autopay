@@ -12,7 +12,6 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **Window restore**: Single-instance plugin now correctly calls `show() + unminimize() + set_focus()`. Verify on all 3 platforms (Linux, Windows, macOS) that clicking the tray icon always brings the window to front.
 - [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
 - [ ] **Review "AutoPay account" creation (UX + security)**: the notion of "account" makes no sense here (nothing is registered anywhere, it is a local encrypted vault + a Monero wallet). Find better wording ("coffre local", "profil sur cet appareil"...) and re-review the whole flow: seed generation, seed backup/verification, restoration from 25 words, reset when the seed is lost, master password change.
-- [ ] **Multi-year subscriptions**: `repeat_every > 1` is refused (`POLICY:UNSUPPORTED_REPEAT`) because cron cannot express "every N years" and the scheduler would pay every year. Needs a dedicated column + scheduler support before re-enabling the "Pluriannuel" preset.
 - [ ] **Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
 - [ ] **monero-wallet-rpc bundled**: Currently users must download and configure the binary separately. Bundle it inside the installer for one-click setup. Legal check: MIT license of monero-wallet-rpc allows bundling.
 
@@ -32,7 +31,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 ## Features (planned)
 
 - [ ] **Android build**: Port to Android using `monero-rs` crate (Rust-native, no subprocess). Replace `monero-wallet-rpc` with direct Monero cryptography. Estimated effort: 10–15 focused sessions. See `docs/ANDROID_BUILD.md`.
-- [ ] **Canary URL support**: Merchants can publish a signed canary file. If it expires or is unreachable, the subscription is suspended with a RED alert. Spec exists, integration partially done.
+- [ ] **Canary URL support**: Merchants can publish a signed canary file. If it expires or is unreachable, the subscription is suspended with a RED alert. The checker exists (`crates/autopay-rpc/src/canary.rs`) but is not wired into the Tauri scheduler, and `recompute_alerts` never emits `CANARY_EXPIRED`: the Settings toggle currently has no effect.
 - [ ] **Max payments per subscription**: Field exists in DB schema (`grace_period_hours` repurposed), proper `max_payments` field needed. UI: show "X / Y payments done" progress bar.
 - [ ] **Multi-wallet**: Currently only one wallet (principal). Architecture supports multiple wallets (wallets table in DB). UI: add/remove wallets, assign subs to wallets.
 - [ ] **FIAT display**: Show XMR amounts alongside approximate FIAT value (using a privacy-respecting price API with caching). Already drafted in `docs/fiat-comparison.md`.
@@ -45,6 +44,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 - [ ] **monero-wallet-rpc version pinning**: ship a pinned version with its SHA-256 (verified against binaryFate's signed `hashes.txt`), check `get_version` at startup and refuse/alert on an unknown major version. CI job watching Monero releases + hard-fork dates, run the RPC integration tests against the new binary, release before the fork height.
 - [ ] **App update channel**: Tauri updater with a minisign public key embedded in the binary. Signed manifest fetched from the hardcoded domain, with Tor onion and IPFS mirrors as fallbacks; the signature is mandatory whatever the source. Notification only (no silent install), link to the official repository. Aim for reproducible builds.
+- [ ] **Release workflow manual run**: `workflow_dispatch` ignores its `tag` input (`tagName` uses `github.ref_name`, i.e. the branch name). Use the input when present.
 - [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
 - [ ] **macOS code signing**: Set `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` secrets in GitHub repo settings. Without signing, macOS shows Gatekeeper warning.
 - [ ] **Windows code signing**: Set `TAURI_SIGNING_PRIVATE_KEY` in GitHub secrets. Without signing, Windows Defender flags the installer.

@@ -78,9 +78,10 @@ export async function decodeAutopay(code) {
  */
 export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
   const labels = SCHEDULE_LABELS[lang] || SCHEDULE_LABELS.en;
-  const n = parseInt(repeatEvery, 10) || 1;
   if (!schedule) return "";
-  const s = schedule.trim();
+  const split = splitYearStep(schedule);
+  const n = split.years > 1 ? split.years : (parseInt(repeatEvery, 10) || 1);
+  const s = split.base;
 
   // Normalise cron to structural fields only (dom, month, dow), ignoring sec/min/hour.
   // Supports both 6-field Quartz "sec min hour dom month dow"
@@ -112,6 +113,25 @@ export function scheduleToHuman(schedule, repeatEvery = 1, lang = "en") {
   // Biweekly / every-N-days
   if (dom === "*/14" || dom === "1,15") return n === 1 ? labels.biweekly || "Bimensuel" : `${labels.every} 2 ${labels.weeks}`;
   return schedule + (n > 1 ? ` (×${n})` : "");
+}
+
+/**
+ * "Every N years" is stored as a 7th Quartz year field: "0 0 9 1 1 * 2026/2".
+ * Returns the 6-field base schedule and the step in years (1 if absent).
+ */
+export function splitYearStep(schedule) {
+  const parts = String(schedule || "").trim().split(/\s+/);
+  if (parts.length !== 7) return { base: parts.join(" "), years: 1, firstYear: null };
+  const [first, step] = parts[6].split("/");
+  return { base: parts.slice(0, 6).join(" "), years: parseInt(step, 10) || 1, firstYear: parseInt(first, 10) || null };
+}
+
+/** Append the year field to a yearly schedule (5 or 6 fields). n <= 1 returns the schedule unchanged. */
+export function withYearStep(schedule, n, firstYear) {
+  const parts = String(schedule || "").trim().split(/\s+/);
+  if (!(n > 1)) return parts.join(" ");
+  const six = parts.length === 5 ? ["0", ...parts] : parts.slice(0, 6);
+  return `${six.join(" ")} ${firstYear}/${n}`;
 }
 
 const SCHEDULE_LABELS = {

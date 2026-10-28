@@ -15,7 +15,7 @@
 -->
 <script>
   import { createEventDispatcher, onMount } from "svelte";
-  import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED, scheduleToHuman } from "./autopay-encode.js";
+  import { encodeAutopay, decodeAutopay, SCHEDULE_PRESETS, NETWORKS_EXTENDED, scheduleToHuman, splitYearStep, withYearStep } from "./autopay-encode.js";
 
   const dispatch = createEventDispatcher();
 
@@ -91,7 +91,15 @@
   };
 
   let schedulePresetId = "monthly";
-  let multiYearN = 2;          // for biennial/triennial custom
+  let multiYearN = 2;
+  {
+    const split = splitYearStep(payload.schedule);
+    if (split.years > 1) {
+      payload.schedule = split.base;
+      payload.repeat_every = multiYearN = split.years;
+      schedulePresetId = "yearly";
+    }
+  }
   // Start mode: null = not chosen (blocks submit), 'now' = immediately, 'wait' = next occurrence
   let startMode = null; // must be chosen by user
   let showAdvanced = false;
@@ -145,7 +153,7 @@
   }
 
   function onMultiYearChange() {
-    payload.repeat_every = parseInt(multiYearN, 10) || 2;
+    payload.repeat_every = Math.min(10, Math.max(2, parseInt(multiYearN, 10) || 2));
   }
 
   $: scheduleLabel = (() => {
@@ -174,7 +182,10 @@
       schedule: payload.schedule,
     };
     if (payload.token) { clean.token = payload.token; clean.token_contract = payload.token_contract || undefined; }
-    if (payload.repeat_every > 1) clean.repeat_every = payload.repeat_every;
+    if (payload.repeat_every > 1) {
+      const firstYear = payload.start_date ? new Date(payload.start_date).getFullYear() : new Date().getFullYear();
+      clean.schedule = withYearStep(payload.schedule, Math.min(10, payload.repeat_every), firstYear);
+    }
     if (payload.description.trim()) clean.description = payload.description.trim();
     if (payload.number_of_payments > 0) clean.number_of_payments = payload.number_of_payments;
     if (payload.start_date) clean.start_date = payload.start_date;
@@ -387,6 +398,7 @@
     "Cancel": { de: "Abbrechen", es: "Cancelar" },
     "Frequency": { de: "Häufigkeit", es: "Frecuencia" },
     "Every": { de: "Alle", es: "Cada" },
+    "Multi-year": { de: "Mehrjährig", es: "Plurianual" },
     "years": { de: "Jahre", es: "años" },
     "Cron:": { de: "Cron:", es: "Cron:" },
     "Number of payments": { de: "Anzahl der Zahlungen", es: "Número de pagos" },
@@ -597,6 +609,14 @@
               {presetLabel(preset)}
             </button>
           {/each}
+          <button
+            class="preset-btn"
+            class:active={schedulePresetId === "yearly" && payload.repeat_every > 1}
+            on:click={() => { schedulePresetId = "yearly"; payload.schedule = "0 0 9 1 1 *"; payload.repeat_every = multiYearN; }}
+            type="button"
+          >
+            {l("Pluriannuel", "Multi-year")}
+          </button>
 
         </div>
 

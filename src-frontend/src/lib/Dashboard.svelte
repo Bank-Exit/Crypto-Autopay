@@ -621,21 +621,16 @@
   /** Import tab dispatches this after "Ajouter cet abonnement" */
   async function onSubImported({ detail }) {
     logInfo("Dashboard", "onSubImported fired");
-    // add_subscription drops repeat_every: the scheduler would pay every year instead.
-    if ((parseInt(detail.payload?.repeat_every, 10) || 1) > 1) {
-      showImportModal = false;
-      await new Promise(resolve => {
-        policyNotice = { raw: "POLICY:UNSUPPORTED_REPEAT", canConfirm: false, resolve, retry: null };
-      });
-      return;
-    }
+    // Legacy codes carry "every N years" in repeat_every, which add_subscription ignores:
+    // save the payload instead, the backend folds it into the schedule.
+    const legacyRepeat = (parseInt(detail.payload?.repeat_every, 10) || 1) > 1;
     const sub = payloadToSubscription({ ...detail.payload, _sourceCode: detail.code });
     addOrConfirmDuplicate(sub);
     showImportModal = false;
 
     // Try parsed code first (crypto-autopay: or monero-request: prefix)
     let result = null;
-    if (detail.code && (detail.code.startsWith("crypto-autopay:") || detail.code.startsWith("monero-request:"))) {
+    if (!legacyRepeat && detail.code && (detail.code.startsWith("crypto-autopay:") || detail.code.startsWith("monero-request:"))) {
       result = await persistNewSubscription("add_subscription", { code: detail.code });
       if (result === false) return;
       if (result) logInfo("Dashboard", `Sub persisted via code: ${result.id}`);
@@ -895,8 +890,8 @@
         tx_hash: result.tx_hash || null,
       }];
       const rawSched = sub._raw_schedule || sub.schedule;
-      const next = computeNextOccurrence(rawSched, sub.repeat_every || 1);
-      const nextIso = next instanceof Date ? next.toISOString() : new Date(next).toISOString();
+      const nextIso = await tauriInvoke("next_occurrence_of", { schedule: rawSched })
+        || new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
       const idx = subscriptions.findIndex(s => s.id === sub.id);
       if (idx !== -1) {
         subscriptions[idx] = { ...subscriptions[idx], next_payment_at: nextIso, status: "Active", payments_sent: (sub.payments_sent || 0) + 1 };
@@ -910,37 +905,6 @@
       setTimeout(async () => { await refreshBalance(); }, 5000);
     } else {
       logWarn("Scheduler", `[WARN] Pas de tx_hash dans la reponse pour sub #${sub.id} — paiement non confirme`);
-    }
-  }
-
-  function computeNextOccurrence(cronExpr, repeatEvery = 1) {
-    // Parse CRON: sec min hour dom month dow (6-field) or min hour dom month dow (5-field)
-    const now = new Date();
-    const parts = String(cronExpr).trim().split(/\s+/);
-    // Try to use croner if available, else fallback to +1 month
-    try {
-      // Simple built-in parser for common patterns
-      const next = new Date(now);
-      if (parts.length === 6) {
-        const [, minP, hourP, domP, monP] = parts;
-        if (minP.startsWith('*/')) {
-          const every = parseInt(minP.slice(2));
-          next.setMinutes(Math.ceil((now.getMinutes() + 1) / every) * every, 0, 0);
-        } else if (domP !== '*') {
-          next.setMonth(next.getMonth() + 1 * repeatEvery, parseInt(domP));
-          next.setHours(parseInt(hourP) || 9, parseInt(minP) || 0, 0, 0);
-        } else {
-          next.setDate(next.getDate() + 1);
-          next.setHours(parseInt(hourP) || 9, 0, 0, 0);
-        }
-      } else {
-        next.setMonth(next.getMonth() + 1);
-      }
-      return next;
-    } catch {
-      const n = new Date(now);
-      n.setMonth(n.getMonth() + 1);
-      return n;
     }
   }
 
@@ -2303,7 +2267,7 @@
           <label class="toggle"><input type="checkbox" bind:checked={notifSettings.lowBalance} on:change={applyAlertConfig}/><span class="slider"></span></label>
         </div>
         {#if notifSettings.lowBalance}
-        <div class="setting-row" style="padding-left:16px;gap:8px">
+        <div class="setting-row" style="padding-left:34px;gap:8px">
           <span class="setting-label" style="font-size:12px;color:var(--text-muted)">{$t.notifLowBalanceBefore}</span>
           <input type="number" bind:value={notifSettings.lowBalanceThresholdDays}
             on:change={applyAlertConfig}
@@ -3163,7 +3127,7 @@
 
   /* Logs panel */
   .log-security-note {
-    font-size: 11px; color: var(--text-muted); padding: 6px 0 10px;
+    font-size: 11px; color: var(--text-muted); padding: 0 0 10px;
     border-bottom: 1px solid var(--border); margin-bottom: 8px;
   }
   .log-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
@@ -3281,7 +3245,11 @@
   .demo-hint { font-size: 10px; font-style: italic; }
 
   /* ----- Settings ----- */
-  .settings-section { padding: 0; overflow: hidden; }
+  /* Every section has the same inner padding; rows bleed to the edges to keep full-width separators. */
+  .settings-section { padding: 14px 18px; overflow: hidden; }
+  .settings-section > .setting-row { margin: 0 -18px; }
+  .settings-section > .setting-row:first-child { margin-top: -14px; }
+  .settings-section > .setting-row:last-child { margin-bottom: -14px; }
   .setting-row {
     display: flex;
     align-items: center;
@@ -3332,7 +3300,7 @@
 
   .mode-desc {
     margin: 0;
-    padding: 0 1.5rem 1rem;
+    padding: 10px 0 0;
     font-size: 0.82rem;
     color: var(--text-muted);
     line-height: 1.4;

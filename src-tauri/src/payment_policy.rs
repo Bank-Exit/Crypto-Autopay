@@ -196,13 +196,23 @@ impl CronField {
     fn has(&self, v: u32) -> bool { self.allowed.get(v as usize).copied().unwrap_or(false) }
 }
 
-struct Cron { minute: CronField, hour: CronField, dom: CronField, month: CronField, dow: CronField }
+struct Cron { minute: CronField, hour: CronField, dom: CronField, month: CronField, dow: CronField, year: CronField }
+
+const YEAR_MIN: u32 = 1970;
+const YEAR_MAX: u32 = 2199;
+/// Longest supported gap between two payments ("every N years").
+pub const MAX_REPEAT_YEARS: u32 = 10;
 
 impl Cron {
     fn parse(expr: &str) -> Option<Self> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
-        // Accept 6 fields (with seconds, ignored) or classic 5 fields.
-        let f = match parts.len() { 6 => &parts[1..], 5 => &parts[..], _ => return None };
+        // 5 classic fields, 6 with seconds (ignored), or 7 with a Quartz year field ("2026/2").
+        let (f, year) = match parts.len() {
+            7 => (&parts[1..6], parts[6]),
+            6 => (&parts[1..], "*"),
+            5 => (&parts[..], "*"),
+            _ => return None,
+        };
         let mut dow = CronField::parse(f[4], 0, 7)?;
         if dow.has(7) { dow.allowed[0] = true; }
         Some(Self {
@@ -211,11 +221,12 @@ impl Cron {
             dom: CronField::parse(f[2], 1, 31)?,
             month: CronField::parse(f[3], 1, 12)?,
             dow,
+            year: CronField::parse(year, YEAR_MIN, YEAR_MAX)?,
         })
     }
 
     fn day_matches(&self, d: &DateTime<Local>) -> bool {
-        if !self.month.has(d.month()) { return false; }
+        if !self.year.has(d.year() as u32) || !self.month.has(d.month()) { return false; }
         let dom_ok = self.dom.has(d.day());
         let dow_ok = self.dow.has(d.weekday().num_days_from_sunday());
         // Vixie cron: when both day fields are restricted, either one matching is enough.
@@ -229,13 +240,18 @@ impl Cron {
 }
 
 /// First occurrence strictly after `after`. None if the expression is invalid
-/// or never matches within 5 years.
+/// or never matches within the supported horizon.
 pub fn next_after(schedule: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let cron = Cron::parse(schedule)?;
     let start = after.with_timezone(&Local) + Duration::minutes(1);
     let mut t = start.with_second(0)?.with_nanosecond(0)?;
-    let limit = start + Duration::days(5 * 366);
+    let limit = start + Duration::days((MAX_REPEAT_YEARS as i64 + 1) * 366);
     while t < limit {
+        if !cron.year.has(t.year() as u32) {
+            let next_year = chrono::NaiveDate::from_ymd_opt(t.year() + 1, 1, 1)?.and_hms_opt(0, 0, 0)?;
+            t = Local.from_local_datetime(&next_year).earliest()?;
+            continue;
+        }
         if !cron.day_matches(&t) {
             let next_day = t.date_naive().succ_opt()?.and_hms_opt(0, 0, 0)?;
             t = Local.from_local_datetime(&next_day).earliest()?;
@@ -247,6 +263,19 @@ pub fn next_after(schedule: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>>
         t += Duration::minutes(1);
     }
     None
+}
+
+/// Turn a yearly schedule into "every `n` years" starting at `first_year`,
+/// by appending a Quartz year field: "0 0 9 1 1 *" -> "0 0 9 1 1 * 2026/2".
+pub fn with_year_step(schedule: &str, n: u32, first_year: i32) -> Result<String, PolicyError> {
+    if n <= 1 { return Ok(schedule.to_string()); }
+    let parts: Vec<&str> = schedule.split_whitespace().collect();
+    let base = match parts.len() { 6 => parts.clone(), 5 => [&["0"][..], &parts[..]].concat(), _ => return Err(PolicyError::UnsupportedRepeat) };
+    let yearly = base[4].parse::<u32>().is_ok() && base[3].parse::<u32>().is_ok();
+    if !yearly || n > MAX_REPEAT_YEARS || first_year < YEAR_MIN as i32 {
+        return Err(PolicyError::UnsupportedRepeat);
+    }
+    Ok(format!("{} {}/{}", base.join(" "), first_year, n))
 }
 
 fn intervals(schedule: &str, count: usize) -> Option<Vec<i64>> {
@@ -286,6 +315,23 @@ mod tests {
         assert!(min_interval_minutes("0 0 9 1 1 *").unwrap() >= 365 * day);
         assert_eq!(min_interval_minutes("0 */25 * * * *"), Some(10)); // 0, 25, 50 then 0
         assert_eq!(min_interval_minutes("nonsense"), None);
+    }
+
+    #[test]
+    fn multi_year() {
+        let day = 24 * 60;
+        let s = with_year_step("0 0 9 1 1 *", 3, 2026).unwrap();
+        assert_eq!(s, "0 0 9 1 1 * 2026/3");
+        let gap = min_interval_minutes(&s).unwrap();
+        assert!(gap >= 3 * 365 * day && gap <= 3 * 366 * day);
+        let after = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        assert_eq!(next_after(&s, after).unwrap().with_timezone(&Local).year(), 2029);
+        assert!(min_interval_minutes("0 0 9 1 1 * 2026/10").unwrap() >= 3650 * day);
+        assert_eq!(with_year_step("0 0 9 1 * *", 2, 2026), Err(PolicyError::UnsupportedRepeat));
+        assert_eq!(with_year_step("0 0 9 1 1 *", 11, 2026), Err(PolicyError::UnsupportedRepeat));
+        assert_eq!(with_year_step("0 0 9 1 1 *", 1, 2026).unwrap(), "0 0 9 1 1 *");
+        let off = PaymentLimits::default();
+        assert!(validate_terms("0.5", "0 0 9 1 1 * 2026/2", &off).is_ok());
     }
 
     #[test]

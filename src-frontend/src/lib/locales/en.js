@@ -74,7 +74,7 @@ export default {
   findDemoDesc: "Inactive example · for illustration only",
   findCategories: [
     { name: "Independent media", desc: "Newspapers, podcasts, private newsletters", url: null, icon: "📰" },
-    { name: "Recurring services (VPN, hosting)", desc: "No-KYC VPN, hosting, free/open-source tools", url: "https://kycnot.me/vpn", icon: "🛡",
+    { name: "Recurring services (VPN, hosting)", desc: "No-KYC VPN, hosting, free/open-source tools", url: "https://kycnot.me/?categories=vpn", icon: "🛡",
       demos: [
         { name: "IVPN", period: "Quarterly / Yearly", amount: "~0.05 XMR", url: "https://ivpn.net" },
         { name: "Mullvad VPN", period: "Monthly", amount: "~0.012 XMR", url: "https://mullvad.net" },
@@ -285,7 +285,7 @@ export default {
 
   // Payment limits (backend policy)
   policyUnsupportedCurrency: "Only XMR subscriptions can be paid for now.",
-  policyUnsupportedRepeat: "Multi-year schedules (every 2 years or more) are not supported yet.",
+  policyUnsupportedRepeat: "A multi-year schedule must start from a yearly date (fixed day and month), every 2 to 10 years.",
   policyInvalidAddress: "The recipient address is not a valid Monero address.",
   policyInvalidAmount: "The amount is not valid.",
   policyAmountTooLow: "Amount too low: the minimum for a subscription is {min} XMR.",
