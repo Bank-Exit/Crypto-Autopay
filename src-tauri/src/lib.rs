@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use aes_gcm::{aead::{Aead, KeyInit, OsRng as AesOsRng}, Aes256Gcm, Key as AesKey, Nonce as AesNonce};
 use rand::RngCore;
+use zeroize::Zeroize;
 use tauri::{Manager, Emitter, Listener};
 
 // ============================================================
@@ -32,6 +33,7 @@ use autopay_core::db::Database;
 use autopay_core::models::{Subscription, SubscriptionStatus};
 
 mod rpc_manager;
+mod payment_policy;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -98,6 +100,8 @@ pub struct AppState {
     pub last_unlock_at: i64,
     /// Treasurer mode: allows importing and executing one-time PV (Procès-Verbal) payments.
     pub treasurer_mode: bool,
+    /// Unlocked exceptions to the payment safety limits (persisted).
+    pub payment_limits: payment_policy::PaymentLimits,
 }
 
 /// A payment pending user confirmation (semi-auto mode).
@@ -107,6 +111,9 @@ pub struct PendingApproval {
     pub sub_label: String,
     pub amount_xmr: String,
     pub queued_at: String, // ISO 8601
+    /// Why confirmation is required: "semi_auto", "first_payment", "terms_changed", "high_amount".
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 // ============================================================
@@ -128,8 +135,10 @@ async fn get_pending_deep_link(state: tauri::State<'_, Mutex<AppState>>) -> Resu
 async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = false;
-    s.session_password = None;
-    s.history_key = None;  // clear derived key from memory
+    // Overwrite secrets before dropping them (copies held by in-flight operations
+    // are dropped when those operations end).
+    if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
+    if let Some(mut key) = s.history_key.take() { key.zeroize(); }
     // Keep wallet_address cached (it's in the .address file anyway)
     log::info!("[Security] Wallet locked (auto-lock or manual)");
     Ok(())
@@ -259,7 +268,7 @@ async fn unlock_wallet(
             s.unlocked = true;
             s.last_unlock_at = chrono::Utc::now().timestamp();
             s.session_password = Some(password.clone());
-            s.history_key = Some(derive_history_key(&password));
+            s.history_key = Some(history_key_with_migration(&password, &s.history_path));
             s.wallet_address = Some(cached_addr.clone());
             s.wallet_file_path = wallet_file_path.clone();
             s.rpc_connected = false;
@@ -400,7 +409,7 @@ async fn unlock_wallet(
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
     s.last_unlock_at = chrono::Utc::now().timestamp();
-    s.history_key = Some(derive_history_key(&password));
+    s.history_key = Some(history_key_with_migration(&password, &s.history_path));
     s.session_password = Some(password);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
     s.balance_atomic = (balance_xmr * 1e12) as u64;
@@ -707,7 +716,7 @@ async fn refresh_balance(
         let wallet_height = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"h2","method":"get_height","params":{}
         })).ok().and_then(|r| r["result"]["height"].as_u64());
-        if refresh_resp.is_ok() {
+        if refresh_resp.as_ref().map(|r| r.get("error").is_none()).unwrap_or(false) {
             if let Some(h) = wallet_height {
                 let _ = std::fs::write(&synced_height_file, h.to_string());
             }
@@ -718,13 +727,13 @@ async fn refresh_balance(
         log::info!("[refresh_balance] Balance fetched");
         let node = mgr.daemon_address();
         mgr.stop();
-        Ok::<(f64, u64, Option<u64>, String), String>((total, atomic, wallet_height, node))
+        Ok::<(f64, u64, Option<u64>, String, u64), String>((total, atomic, wallet_height, node, daemon_height_before))
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
 
-    let (xmr, atomic, wallet_height, daemon_addr) = match rpc_result {
+    let (xmr, atomic, wallet_height, daemon_addr, daemon_height_before) = match rpc_result {
         Ok(v) => v,
         Err(e) => {
             if let Ok(mut s) = state.lock() {
@@ -737,9 +746,12 @@ async fn refresh_balance(
 
     // 0 means the remote node did not answer: keep it as-is, never substitute the wallet height,
     // otherwise offline detection and OFFLINE_WITH_PENDING can never trigger.
-    let daemon_height = tokio::task::spawn_blocking(move || rpc_manager::get_daemon_block_height(&daemon_addr))
-        .await
-        .unwrap_or(0);
+    // No node answered before the session: skip a second probe that would only time out again.
+    let daemon_height = if daemon_height_before == 0 { 0 } else {
+        tokio::task::spawn_blocking(move || rpc_manager::get_daemon_block_height(&daemon_addr))
+            .await
+            .unwrap_or(0)
+    };
     let daemon_reachable = daemon_height > 0;
 
     if let Ok(mut s) = state.lock() {
@@ -782,12 +794,37 @@ async fn get_alerts(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<AppA
 
 /// Recompute all alerts based on current state and subscriptions.
 /// Returns the worst AlertLevel, or None if clean.
+/// Alerts raised by an event (a failed or blocked payment) rather than derived from the
+/// current state: recompute_alerts keeps them for EVENT_ALERT_TTL_SECS unless the
+/// subscription has been paid since.
+const EVENT_ALERT_KINDS: &[&str] = &["PAYMENT_FAILED", "OUTPUTS_LOCKED", "PAYMENT_BLOCKED_LIMITS"];
+const EVENT_ALERT_TTL_SECS: i64 = 24 * 3600;
+
+/// Record an event alert for a subscription (replaces the previous one of the same kind).
+fn push_alert(app: &tauri::AppHandle, level: AlertLevel, kind: &str, sub_id: &str, message: String) {
+    if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+        if let Ok(mut s) = state_rc.lock() {
+            s.alerts.retain(|a| a.kind != kind || a.sub_id.as_deref() != Some(sub_id));
+            s.alerts.push(AppAlert {
+                level,
+                kind: kind.into(),
+                sub_id: Some(sub_id.to_string()),
+                message,
+                created_at: chrono::Utc::now().timestamp(),
+            });
+        }
+    }
+}
+
 fn recompute_alerts(
     state: &mut AppState,
     subs: &[Subscription],
     now_ts: i64,
 ) -> Option<AlertLevel> {
-    let mut alerts: Vec<AppAlert> = Vec::new();
+    let mut alerts: Vec<AppAlert> = state.alerts.iter()
+        .filter(|a| EVENT_ALERT_KINDS.contains(&a.kind.as_str()) && now_ts - a.created_at < EVENT_ALERT_TTL_SECS)
+        .cloned()
+        .collect();
 
     let balance_xmr = state.balance_atomic as f64 / 1e12;
 
@@ -804,16 +841,29 @@ fn recompute_alerts(
     }
 
     // Estimate monthly spending (XMR/month) from active subs
-    let monthly_xmr: f64 = subs.iter().filter(|s| s.status == SubscriptionStatus::Active).map(|s| {
-        let amt: f64 = s.amount.parse().unwrap_or(0.0);
-        let cron_parts: Vec<&str> = s.schedule.trim().split_whitespace().collect();
-        let min_field = if cron_parts.len() >= 6 { cron_parts[1] } else { cron_parts.get(0).copied().unwrap_or("*") };
-        let period_min = if min_field.starts_with("*/") {
-            min_field[2..].parse::<f64>().unwrap_or(1440.0)
-        } else if min_field == "0" { 60.0 } else { 1440.0 };
-        let sends_per_month = 43200.0 / period_min; // 43200 min/month
-        amt * sends_per_month
-    }).sum();
+    let monthly_xmr: f64 = subs.iter().filter(|s| s.status == SubscriptionStatus::Active)
+        .map(|s| payment_policy::monthly_projection(&s.amount, &s.schedule))
+        .sum();
+
+    // ORANGE: payments due within 48h that the current balance cannot cover.
+    // One grouped alert rather than one per subscription.
+    if has_synced && balance_xmr >= 0.000001 {
+        let short = subs.iter()
+            .filter(|s| s.status == SubscriptionStatus::Active)
+            .filter(|s| s.next_payment_at.map(|n| n.timestamp() - now_ts < 48 * 3600).unwrap_or(false))
+            .filter(|s| payment_policy::parse_amount(&s.amount)
+                .map(|a| a + payment_policy::FEE_MARGIN_XMR > balance_xmr).unwrap_or(false))
+            .count();
+        if short > 0 {
+            alerts.push(AppAlert {
+                level: AlertLevel::Orange,
+                kind: "BALANCE_SHORT_UPCOMING".into(),
+                sub_id: None,
+                message: format!("{} payment(s) due within 48h exceed the balance", short),
+                created_at: now_ts,
+            });
+        }
+    }
 
     // ORANGE: balance will run out before threshold (default 7 days)
     let threshold_days = state.balance_low_threshold_days.max(1.0);
@@ -924,15 +974,67 @@ pub struct HistoryEntry {
 
 /// Derive a 32-byte AES key from the master password for history encryption.
 /// Uses Argon2id with lighter params (32MB, 2 iterations) since derived once at unlock.
-fn derive_history_key(password: &str) -> [u8; 32] {
+fn derive_history_key(password: &str, salt: &[u8]) -> [u8; 32] {
     use argon2::{Argon2, Params, Algorithm, Version};
-    const HISTORY_SALT: &[u8] = b"autopay-history-v1-salt-2025"; // fixed purpose salt
     let params = Params::new(32_768, 2, 1, Some(32)).expect("valid params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
-    argon2.hash_password_into(password.as_bytes(), HISTORY_SALT, &mut key)
+    argon2.hash_password_into(password.as_bytes(), salt, &mut key)
         .expect("Argon2id history key derivation failed");
     key
+}
+
+/// Salt used by versions that predate the per-install random salt.
+const LEGACY_HISTORY_SALT: &[u8] = b"autopay-history-v1-salt-2025";
+
+/// History key derived with this install's random salt (`history.salt`).
+/// On first use, an existing history encrypted with the legacy fixed salt is
+/// re-encrypted; if that fails the legacy key is kept so no entry is lost.
+fn history_key_with_migration(password: &str, history_path: &std::path::Path) -> [u8; 32] {
+    let salt_path = history_path.with_extension("salt");
+    if let Some(salt) = std::fs::read_to_string(&salt_path).ok()
+        .and_then(|b| base64_decode(b.trim()).ok())
+        .filter(|s| s.len() == 16)
+    {
+        return derive_history_key(password, &salt);
+    }
+
+    let mut salt = [0u8; 16];
+    AesOsRng.fill_bytes(&mut salt);
+    let new_key = derive_history_key(password, &salt);
+
+    let existing = std::fs::read_to_string(history_path).ok().filter(|b| !b.trim().is_empty());
+    if let Some(blob) = existing {
+        let mut old_key = derive_history_key(password, LEGACY_HISTORY_SALT);
+        let migrated = aes_decrypt(&old_key, blob.trim())
+            .and_then(|plain| aes_encrypt(&new_key, &plain))
+            .and_then(|b64| {
+                // Write the salt first: if the history write then fails, the next unlock
+                // would derive the new key over an old blob, so roll the salt back.
+                std::fs::write(&salt_path, base64_encode(&salt)).map_err(|e| e.to_string())?;
+                std::fs::write(history_path, b64).map_err(|e| {
+                    let _ = std::fs::remove_file(&salt_path);
+                    e.to_string()
+                })
+            });
+        match migrated {
+            Ok(()) => {
+                old_key.zeroize();
+                log::info!("[History] Re-encrypted with a per-install salt");
+                new_key
+            }
+            Err(e) => {
+                log::warn!("[History] Salt migration skipped, keeping legacy key: {}", e);
+                old_key
+            }
+        }
+    } else {
+        if let Err(e) = std::fs::write(&salt_path, base64_encode(&salt)) {
+            log::warn!("[History] Could not save history salt, using legacy salt: {}", e);
+            return derive_history_key(password, LEGACY_HISTORY_SALT);
+        }
+        new_key
+    }
 }
 
 /// Encrypt a JSON payload with AES-256-GCM. Returns base64(NONCE | CIPHERTEXT).
@@ -1024,14 +1126,127 @@ async fn get_payment_mode(
 async fn approve_payment(
     sub_id: String,
     app_state: tauri::State<'_, Mutex<AppState>>,
+    db_state: tauri::State<'_, Mutex<Database>>,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let mut s = app_state.lock().map_err(|e| e.to_string())?;
-    // Remove from pending — scheduler will treat it as approved on next run
-    // by checking `approved_payments` set
-    s.pending_approvals.remove(&sub_id);
-    s.approved_payments.insert(sub_id.clone());
+    {
+        let mut s = app_state.lock().map_err(|e| e.to_string())?;
+        // Remove from pending — scheduler will treat it as approved on next run
+        // by checking `approved_payments` set
+        s.pending_approvals.remove(&sub_id);
+        s.approved_payments.insert(sub_id.clone());
+    }
+    // Remember the exact terms the user agreed to: any later change of amount,
+    // address or cadence will require a new confirmation.
+    let sub = db_state.lock().map_err(|e| e.to_string())?
+        .list_subscriptions().map_err(|e| e.to_string())?
+        .into_iter().find(|s| s.id == sub_id);
+    if let Some(sub) = sub {
+        let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let mut terms = payment_policy::load_approved_terms(&dir);
+        terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+        payment_policy::save_approved_terms(&dir, &terms);
+    }
     log::info!("[PaymentMode] Payment approved by user for sub {}", &sub_id[..8.min(sub_id.len())]);
     Ok(())
+}
+
+fn sub_fingerprint(sub: &Subscription) -> String {
+    payment_policy::terms_fingerprint(&sub.destination_address, &sub.amount, &sub.currency, &sub.schedule)
+}
+
+/// Enforce amount / cadence limits on a new subscription, and ask for an explicit
+/// confirmation when it brings the projected monthly total above the threshold.
+fn check_new_subscription(
+    address: &str,
+    currency: &str,
+    amount: &str,
+    schedule: &str,
+    limits: &payment_policy::PaymentLimits,
+    existing: &[Subscription],
+    confirm_monthly: bool,
+) -> Result<(), String> {
+    payment_policy::validate_currency(currency).map_err(|e| e.to_string())?;
+    payment_policy::validate_address(address).map_err(|e| e.to_string())?;
+    payment_policy::validate_terms(amount, schedule, limits).map_err(|e| e.to_string())?;
+    let projected: f64 = existing.iter()
+        .filter(|s| s.status == SubscriptionStatus::Active)
+        .map(|s| payment_policy::monthly_projection(&s.amount, &s.schedule))
+        .sum::<f64>()
+        + payment_policy::monthly_projection(amount, schedule);
+    if projected > payment_policy::MONTHLY_CONFIRM_XMR && !confirm_monthly {
+        return Err(payment_policy::PolicyError::MonthlyTotal(projected).to_string());
+    }
+    Ok(())
+}
+
+/// Current payment limits and the fixed thresholds (for the Settings page).
+#[tauri::command]
+async fn get_payment_limits(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "allow_large_amounts": s.payment_limits.allow_large_amounts,
+        "allow_short_cadence": s.payment_limits.allow_short_cadence,
+        "min_amount_xmr": payment_policy::MIN_AMOUNT_XMR,
+        "high_amount_xmr": payment_policy::HIGH_AMOUNT_XMR,
+        "max_amount_xmr": payment_policy::MAX_AMOUNT_XMR,
+        "min_cadence_days": payment_policy::MIN_CADENCE_MINUTES / (24 * 60),
+        "monthly_confirm_xmr": payment_policy::MONTHLY_CONFIRM_XMR,
+    }))
+}
+
+/// Unlock or re-lock the exceptions to the payment limits.
+/// Unlocking requires the master password; re-locking never does.
+#[tauri::command]
+async fn set_payment_limits(
+    allow_large_amounts: bool,
+    allow_short_cadence: bool,
+    password: Option<String>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    let unlocking = (allow_large_amounts && !s.payment_limits.allow_large_amounts)
+        || (allow_short_cadence && !s.payment_limits.allow_short_cadence);
+    if unlocking {
+        let session = s.session_password.as_deref().ok_or("Wallet is locked.")?;
+        let mut given = password.unwrap_or_default();
+        let same = given.len() == session.len()
+            && given.bytes().zip(session.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        given.zeroize();
+        if !same { return Err("Incorrect password.".into()); }
+    }
+    let limits = payment_policy::PaymentLimits { allow_large_amounts, allow_short_cadence };
+    let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    limits.save(&dir)?;
+    log::info!("[Policy] Limits updated: large_amounts={}, short_cadence={}", allow_large_amounts, allow_short_cadence);
+    s.payment_limits = limits;
+    Ok(())
+}
+
+/// Make the data dir 0700 and everything in it 0700 (dirs) / 0600 (files): files created
+/// by older versions were group/world readable. No-op outside Unix.
+fn restrict_permissions(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fn walk(p: &std::path::Path, depth: u8) {
+            let Ok(meta) = std::fs::symlink_metadata(p) else { return };
+            if meta.file_type().is_symlink() { return; }
+            let mode = if meta.is_dir() { 0o700 } else { 0o600 };
+            if meta.permissions().mode() & 0o777 != mode {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+            }
+            if meta.is_dir() && depth < 6 {
+                if let Ok(entries) = std::fs::read_dir(p) {
+                    for e in entries.flatten() { walk(&e.path(), depth + 1); }
+                }
+            }
+        }
+        walk(dir, 0);
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Delay applied by "Reporter" in the semi-auto popup.
@@ -1056,10 +1271,7 @@ async fn reject_payment(
         .ok_or("Subscription not found")?;
     let now = chrono::Utc::now();
     let new_next = if skip.unwrap_or(false) {
-        let period = chrono::Duration::minutes(cron_period_minutes(&sub.schedule).max(1));
-        let mut next = sub.next_payment_at.unwrap_or(now) + period;
-        while next <= now { next = next + period; }
-        next
+        next_occurrence(&sub.schedule, sub.next_payment_at.unwrap_or(now).max(now))
     } else {
         now + chrono::Duration::minutes(POSTPONE_MINUTES)
     };
@@ -1222,7 +1434,9 @@ async fn get_subscriptions(
 #[tauri::command]
 async fn add_subscription(
     code: String,
+    confirm_monthly: Option<bool>,
     db_state: tauri::State<'_, Mutex<Database>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
     use autopay_crypto::{parse_code, AutoPayCode};
     use chrono::Utc;
@@ -1230,6 +1444,13 @@ async fn add_subscription(
 
     let parsed = parse_code(&code).map_err(|e| format!("Invalid code: {e:?}"))?;
     let AutoPayCode::V1(v1) = parsed;
+
+    {
+        let limits = app_state.lock().map_err(|e| e.to_string())?.payment_limits.clone();
+        let existing = db_state.lock().map_err(|e| e.to_string())?.list_subscriptions().map_err(|e| e.to_string())?;
+        check_new_subscription(&v1.sellers_wallet, &v1.currency, &v1.amount, &v1.schedule,
+            &limits, &existing, confirm_monthly.unwrap_or(false))?;
+    }
 
     let now = Utc::now();
     // Parse start_date from code if present, otherwise use now
@@ -1240,9 +1461,9 @@ async fn add_subscription(
     let sub = Subscription {
         id: Uuid::new_v4().to_string(),
         wallet_id: "default".to_string(),
-        label: v1.custom_label.clone(),
-        description: v1.description.clone(),
-        destination_address: v1.sellers_wallet.clone(),
+        label: payment_policy::clean_text(&v1.custom_label, 80),
+        description: v1.description.as_deref().map(|d| payment_policy::clean_text(d, 500)),
+        destination_address: v1.sellers_wallet.trim().to_string(),
         payment_network: v1.payment_network.clone(),
         amount: v1.amount.clone(),
         currency: v1.currency.clone(),
@@ -1277,21 +1498,30 @@ async fn add_subscription(
 #[tauri::command]
 async fn save_subscription(
     payload: serde_json::Value,
+    confirm_monthly: Option<bool>,
     db_state: tauri::State<'_, Mutex<Database>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
     use chrono::Utc;
     use uuid::Uuid;
 
     let now = Utc::now();
-    let label = payload["custom_label"].as_str().unwrap_or("—").to_string();
-    let dest = payload["destination_address"].as_str().unwrap_or("").to_string();
+    let label = payment_policy::clean_text(payload["custom_label"].as_str().unwrap_or("—"), 80);
+    let dest = payload["destination_address"].as_str().unwrap_or("").trim().to_string();
     let amount = payload["amount"].as_str().unwrap_or("0").to_string();
     let currency = payload["currency"].as_str().unwrap_or("XMR").to_string();
     let schedule = payload["schedule"].as_str().unwrap_or("0 0 9 1 * *").to_string();
     let number_of_payments = payload["number_of_payments"].as_u64().unwrap_or(1);
     let start_immediately = payload["start_immediately"].as_bool().unwrap_or(true);
     let canary_url = payload["canary_url"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
-    let description = payload["description"].as_str().unwrap_or("").to_string();
+    let description = payment_policy::clean_text(payload["description"].as_str().unwrap_or(""), 500);
+
+    {
+        let limits = app_state.lock().map_err(|e| e.to_string())?.payment_limits.clone();
+        let existing = db_state.lock().map_err(|e| e.to_string())?.list_subscriptions().map_err(|e| e.to_string())?;
+        check_new_subscription(&dest, &currency, &amount, &schedule,
+            &limits, &existing, confirm_monthly.unwrap_or(false))?;
+    }
 
     // next_payment_at: now if start_immediately, else use start_date or compute from schedule
     let next_payment_at = if start_immediately {
@@ -1300,9 +1530,7 @@ async fn save_subscription(
         chrono::DateTime::parse_from_rfc3339(sd).ok().map(|d| d.with_timezone(&Utc))
             .or(Some(now + chrono::Duration::days(1)))
     } else {
-        // Parse cron period for next occurrence
-        let period_min = cron_period_minutes(&schedule);
-        Some(now + chrono::Duration::minutes(period_min))
+        Some(next_occurrence(&schedule, now))
     };
 
     let sub = Subscription {
@@ -1485,16 +1713,16 @@ struct UnlockResult {
 /// Parse a CRON expression to its period in minutes (best effort).
 /// Supports: "0 */N * * * *" (every N min), "0 0 * * * *" (hourly), "0 0 H * * *" (daily).
 fn cron_period_minutes(cron: &str) -> i64 {
-    let parts: Vec<&str> = cron.trim().split_whitespace().collect();
-    // 6-field: sec min hour dom month dow
-    let min_field = if parts.len() >= 6 { parts[1] } else if parts.len() >= 5 { parts[0] } else { "*" };
-    let hour_field = if parts.len() >= 6 { parts[2] } else if parts.len() >= 5 { parts[1] } else { "*" };
-    if min_field.starts_with("*/") {
-        if let Ok(n) = min_field[2..].parse::<i64>() { return n.max(25); }
-    }
-    if min_field == "0" && hour_field == "*" { return 60; }      // hourly
-    if min_field == "0" { return 24 * 60; }                      // daily
-    30 * 24 * 60 // monthly fallback
+    payment_policy::average_interval_minutes(cron).unwrap_or(30 * 24 * 60)
+}
+
+/// Next due date strictly after `after`, following the calendar (a monthly "1st at 9:00"
+/// stays on the 1st). Falls back to one month if the expression cannot be evaluated.
+fn next_occurrence(schedule: &str, after: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    payment_policy::next_after(schedule, after).unwrap_or_else(|| {
+        log::warn!("[Scheduler] Unsupported schedule expression, falling back to +30 days");
+        after + chrono::Duration::days(30)
+    })
 }
 
 /// Update the system tray icon based on current alert level.
@@ -1738,24 +1966,67 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
     log::info!("[Scheduler] {} subscription(s) due", due.len());
 
     // Read semi-auto state once before the loop
-    let (semi_auto, approved_ids) = {
+    let (semi_auto, approved_ids, limits, balance_known) = {
         if let Some(state) = app.try_state::<Mutex<AppState>>() {
             if let Ok(mut s) = state.lock() {
                 let semi = s.semi_auto_mode;
                 let approved: std::collections::HashSet<String> = s.approved_payments.drain().collect();
-                (semi, approved)
-            } else { (false, Default::default()) }
-        } else { (false, Default::default()) }
+                let balance = if s.rpc_connected { Some(s.balance_atomic) } else { None };
+                (semi, approved, s.payment_limits.clone(), balance)
+            } else { return; }
+        } else { return; }
     };
+    // Approvals not consumed by an actual send this cycle must survive to the next one.
+    let restore_approvals = |ids: &std::collections::HashSet<String>| {
+        if let Some(state) = app.try_state::<Mutex<AppState>>() {
+            if let Ok(mut s) = state.lock() { s.approved_payments.extend(ids.iter().cloned()); }
+        }
+    };
+
+    let data_dir = match app.path().app_data_dir() { Ok(d) => d, Err(_) => return };
+    let mut approved_terms = payment_policy::load_approved_terms(&data_dir);
 
     for sub in due {
         let dest = sub.destination_address.clone();
-        let amount_pico = (sub.amount.parse::<f64>().unwrap_or(0.0) * 1e12) as u64;
+        let amount_xmr = payment_policy::parse_amount(&sub.amount).unwrap_or(0.0);
+        let amount_pico = (amount_xmr * 1e12) as u64;
         let sub_id = sub.id.clone();
+        let short_id = sub_id[..8.min(sub_id.len())].to_string();
 
-        // Semi-auto mode: queue for user approval unless already approved this session
-        if semi_auto && !approved_ids.contains(&sub_id) {
-            log::info!("[Scheduler] Semi-auto: queuing payment for sub {} — awaiting user approval", &sub_id[..8.min(sub_id.len())]);
+        // Limits are re-checked at payment time: they may have been re-locked since the
+        // subscription was added, or the DB may have been modified outside the app.
+        if let Err(e) = payment_policy::validate_currency(&sub.currency)
+            .and_then(|_| payment_policy::validate_address(&sub.destination_address))
+            .and_then(|_| payment_policy::validate_terms(&sub.amount, &sub.schedule, &limits))
+        {
+            log::warn!("[Scheduler] Sub {} blocked by payment limits ({})", short_id, e);
+            push_alert(app, AlertLevel::Orange, "PAYMENT_BLOCKED_LIMITS", &sub_id, e.to_string());
+            continue;
+        }
+
+        // Not enough funds: no point spawning wallet-rpc for a transfer that will fail.
+        let needed = ((amount_xmr + payment_policy::FEE_MARGIN_XMR) * 1e12) as u64;
+        if let Some(balance) = balance_known {
+            if balance < needed {
+                log::info!("[Scheduler] Sub {} due but balance too low — waiting for funds", short_id);
+                continue;
+            }
+        }
+
+        // Subscriptions paid before this check existed are trusted as-is.
+        let fingerprint = sub_fingerprint(&sub);
+        if sub.payments_sent > 0 && !approved_terms.contains_key(&sub_id) {
+            approved_terms.insert(sub_id.clone(), fingerprint.clone());
+            payment_policy::save_approved_terms(&data_dir, &approved_terms);
+        }
+        let mut reasons: Vec<String> = payment_policy::confirmation_reasons(
+            &sub.amount, &fingerprint, approved_terms.get(&sub_id),
+        ).into_iter().map(String::from).collect();
+        if semi_auto { reasons.insert(0, "semi_auto".into()); }
+
+        // Queue for user approval unless already approved this session
+        if !reasons.is_empty() && !approved_ids.contains(&sub_id) {
+            log::info!("[Scheduler] Sub {} queued for user approval ({})", short_id, reasons.join(","));
             if let Some(state) = app.try_state::<Mutex<AppState>>() {
                 if let Ok(mut s) = state.lock() {
                     s.pending_approvals.insert(sub_id.clone(), PendingApproval {
@@ -1763,6 +2034,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                         sub_label: sub.label.clone(),
                         amount_xmr: sub.amount.clone(),
                         queued_at: Utc::now().to_rfc3339(),
+                        reasons: reasons.clone(),
                     });
                 }
             }
@@ -1780,6 +2052,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 "schedule": sub.schedule,
                 "payments_sent": sub.payments_sent,
                 "last_payment_at": last_payment_iso,
+                "reasons": reasons,
             })).ok();
             continue; // skip to next sub — scheduler will retry next cycle
         }
@@ -1792,7 +2065,8 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             None => return,
         };
         if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            log::info!("[Scheduler] RPC busy — payment for sub {} retried next cycle", &sub_id[..8.min(sub_id.len())]);
+            log::info!("[Scheduler] RPC busy — payment for sub {} retried next cycle", short_id);
+            restore_approvals(&approved_ids);
             return;
         }
 
@@ -1851,13 +2125,13 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 if let Some(state) = app.try_state::<Mutex<AppState>>() {
                     if let Ok(mut s) = state.lock() {
                         s.last_payment_sent_at = Some(Utc::now().timestamp());
+                        s.alerts.retain(|a| a.sub_id.as_deref() != Some(sub_id.as_str()));
                     }
                 }
-                // Update next_payment_at in DB — compute next occurrence
-                // For now, advance by the period using chrono; TODO: full CRON parsing
-                if let Some(next) = sub.next_payment_at {
-                    let period_min = cron_period_minutes(&sub.schedule);
-                    let new_next = next + chrono::Duration::minutes(period_min);
+                // Next occurrence after now: a long-overdue subscription must not
+                // trigger a burst of catch-up payments.
+                let new_next = next_occurrence(&sub.schedule, Utc::now());
+                {
                     if let Ok(db) = db_state.lock() {
                         if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {
                             log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
@@ -1867,10 +2141,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                     }
                 }
                 // Emit event so frontend can refresh balance and subscription list
-                let new_next_iso = if let Some(next) = sub.next_payment_at {
-                    let p = cron_period_minutes(&sub.schedule);
-                    (next + chrono::Duration::minutes(p)).to_rfc3339()
-                } else { String::new() };
+                let new_next_iso = new_next.to_rfc3339();
                 app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
                 // Append to encrypted payment history
                 if let Some(app_state) = app.try_state::<Mutex<AppState>>() {
@@ -1960,6 +2231,11 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Files created from now on (vault, DB and its WAL, logs, wallet cache, webview storage)
+    // are private to the current user.
+    #[cfg(unix)]
+    unsafe { libc::umask(0o077); }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -1992,6 +2268,7 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()
                 .expect("Failed to resolve app data dir");
             std::fs::create_dir_all(&data_dir).ok();
+            restrict_permissions(&data_dir);
 
             let vault_path      = data_dir.join("seed.vault");
             let wallet_file_path = data_dir.join("autopay_wallet");
@@ -2032,7 +2309,8 @@ pub fn run() {
                     let mut s = std::collections::HashSet::new();
                     for k in &["BALANCE_LOW","BALANCE_EMPTY","PAYMENT_FAILED","CANARY_EXPIRED",
                                "CANARY_UNREACHABLE","PAYMENT_OVERDUE_SOFT","PAYMENT_OVERDUE_HARD",
-                               "WALLET_NOT_SYNCED","OUTPUTS_LOCKED","OFFLINE_WITH_PENDING"] {
+                               "WALLET_NOT_SYNCED","OUTPUTS_LOCKED","OFFLINE_WITH_PENDING",
+                               "PAYMENT_BLOCKED_LIMITS","BALANCE_SHORT_UPCOMING"] {
                         s.insert(k.to_string());
                     }
                     s
@@ -2046,6 +2324,7 @@ pub fn run() {
                 approved_payments: std::collections::HashSet::new(),
                 last_unlock_at: 0,
                 active_node: None,
+                payment_limits: payment_policy::PaymentLimits::load(&data_dir),
                 treasurer_mode: false,
             }));
 
@@ -2179,6 +2458,8 @@ pub fn run() {
             approve_payment,
             reject_payment,
             get_pending_approvals,
+            get_payment_limits,
+            set_payment_limits,
             set_treasurer_mode,
             get_treasurer_mode,
             validate_pv,

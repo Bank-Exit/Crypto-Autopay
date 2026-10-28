@@ -2545,7 +2545,9 @@ dependencies = [
  "autopay-crypto",
  "autopay-rpc",
  "base64 0.22.1",
+ "blake3",
  "chrono",
+ "libc",
  "log",
  "rand 0.8.8",
  "reqwest 0.12.28",
@@ -2559,6 +2561,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

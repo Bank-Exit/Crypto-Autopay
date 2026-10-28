@@ -14,7 +14,7 @@
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
   // ===== Auto-lock after 2 min of inactivity =====
-  const AUTO_LOCK_MS = 2 * 60 * 1000; // 2 minutes
+  const AUTO_LOCK_MS = 3 * 60 * 1000; // 3 minutes
   let autoLockTimer = null;
 
   function resetAutoLock() {

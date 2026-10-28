@@ -126,11 +126,62 @@ pub struct RpcManager {
     pub config: RpcConfig,
     process: Option<Child>,
     pub status: RpcStatus,
+    /// PID file of the wallet-rpc spawned by this app (in the wallet dir).
+    pid_file: Option<PathBuf>,
+}
+
+const PID_FILE_NAME: &str = "wallet-rpc.pid";
+
+/// True if `pid` is a monero-wallet-rpc serving our wallet dir (guards against PID reuse).
+fn is_our_wallet_rpc(pid: u32, wallet_dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{}/cmdline", pid))
+            .map(|c| {
+                let cmd = String::from_utf8_lossy(&c);
+                cmd.contains("monero-wallet-rpc") && cmd.contains(&*wallet_dir.to_string_lossy())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, wallet_dir);
+        true
+    }
+}
+
+/// wallet-rpc left behind by a previous run of this app: from the PID file, or on Linux
+/// (runs older than the PID file) by scanning processes for our wallet dir.
+fn find_stale_wallet_rpc(wallet_dir: &std::path::Path) -> Option<u32> {
+    let from_file = std::fs::read_to_string(wallet_dir.join(PID_FILE_NAME)).ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|pid| is_our_wallet_rpc(*pid, wallet_dir));
+    if from_file.is_some() { return from_file; }
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id();
+        std::fs::read_dir("/proc").ok()?.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .find(|pid| *pid != me && is_our_wallet_rpc(*pid, wallet_dir))
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    }
 }
 
 impl RpcManager {
     pub fn new(config: RpcConfig) -> Self {
-        Self { config, process: None, status: RpcStatus::Stopped }
+        Self { config, process: None, status: RpcStatus::Stopped, pid_file: None }
     }
 
     /// Try to find the `monero-wallet-rpc` binary.
@@ -175,6 +226,7 @@ impl RpcManager {
             let _ = child.kill();
             let _ = child.wait();
             log::info!("wallet-rpc stopped");
+            if let Some(f) = self.pid_file.take() { let _ = std::fs::remove_file(f); }
         }
         self.status = RpcStatus::Stopped;
     }
@@ -208,10 +260,21 @@ impl RpcManager {
             &addr_str.parse().unwrap(),
             Duration::from_millis(100),
         ).is_ok() {
-            log::warn!("[RPC] Port {} already in use — killing stale process", port);
-            // Try to kill whatever is on that port
-            let _ = Command::new("fuser").args(["-k", &format!("{}/tcp", port)]).status();
-            std::thread::sleep(Duration::from_millis(500));
+            // Only a wallet-rpc left behind by this app (crash) may be killed;
+            // anything else on the port belongs to another program.
+            match find_stale_wallet_rpc(wallet_dir) {
+                Some(pid) => {
+                    log::warn!("[RPC] Port {} held by a stale wallet-rpc from this app (PID {}) — stopping it", port, pid);
+                    kill_pid(pid);
+                    let _ = std::fs::remove_file(wallet_dir.join(PID_FILE_NAME));
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+                None => {
+                    let msg = format!("Port {} is used by another program. Close it or change the RPC port in Settings.", port);
+                    log::error!("[RPC] {}", msg);
+                    return Err(msg);
+                }
+            }
         }
 
         // --- 3. Daemon address ---
@@ -253,6 +316,10 @@ impl RpcManager {
             })?;
 
         log::info!("[RPC] Process spawned, PID={:?}", child.id());
+        let pid_file = wallet_dir.join(PID_FILE_NAME);
+        if std::fs::write(&pid_file, child.id().to_string()).is_ok() {
+            self.pid_file = Some(pid_file);
+        }
         self.process = Some(child);
         self.status = RpcStatus::Running;
         Ok(())

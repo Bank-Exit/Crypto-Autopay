@@ -21,6 +21,119 @@
     }
   }
 
+  // Same call, but backend errors are thrown instead of swallowed.
+  async function invokeStrict(cmd, args = {}) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke(cmd, args);
+  }
+
+  // ---- Payment limits (enforced by the backend, shown here) ----
+  let paymentLimits = {
+    allow_large_amounts: false, allow_short_cadence: false,
+    min_amount_xmr: 0.00021, high_amount_xmr: 1, max_amount_xmr: 5,
+    min_cadence_days: 7, monthly_confirm_xmr: 1,
+  };
+  let limitPrompt = null;      // { key } while the password is asked to unlock a limit
+  let limitPassword = "";
+  let limitError = "";
+  let policyNotice = null;     // { message, canConfirm, resolve, retry }
+
+  async function loadPaymentLimits() {
+    const l = await tauriInvoke("get_payment_limits");
+    if (l) paymentLimits = { ...paymentLimits, ...l };
+  }
+
+  function onLimitToggle(key, event) {
+    const enable = event.target.checked;
+    if (enable) {
+      // Stays off until the password is confirmed.
+      event.target.checked = false;
+      limitPrompt = { key };
+      limitPassword = "";
+      limitError = "";
+      return;
+    }
+    applyLimits({ ...paymentLimits, [key]: false }, null);
+  }
+
+  async function applyLimits(next, password) {
+    try {
+      await invokeStrict("set_payment_limits", {
+        allowLargeAmounts: next.allow_large_amounts,
+        allowShortCadence: next.allow_short_cadence,
+        password,
+      });
+      limitPrompt = null;
+      limitPassword = "";
+      await loadPaymentLimits();
+      await refreshAlerts();
+    } catch (e) {
+      limitError = String(e).includes("Incorrect password") ? "Mot de passe incorrect." : String(e);
+      limitPassword = "";
+    }
+  }
+
+  /** Backend refusal "POLICY:<CODE>[:detail]" as a plain explanation, or null for other errors. */
+  function policyMessage(err) {
+    const m = String(err).match(/POLICY:([A-Z_]+)(?::([\d.]+))?/);
+    if (!m) return null;
+    const L = paymentLimits;
+    switch (m[1]) {
+      case "UNSUPPORTED_CURRENCY": return "Seuls les abonnements en XMR peuvent être payés pour l'instant.";
+      case "INVALID_ADDRESS": return "L'adresse du destinataire n'est pas une adresse Monero valide.";
+      case "INVALID_AMOUNT": return "Le montant n'est pas valide.";
+      case "AMOUNT_TOO_LOW": return `Montant trop faible : le minimum pour un abonnement est de ${L.min_amount_xmr} XMR.`;
+      case "AMOUNT_ABOVE_MAX": return `Montant supérieur à ${L.max_amount_xmr} XMR par envoi. Pour l'autoriser, activez « Montants élevés » dans Paramètres, Limites de sécurité.`;
+      case "INVALID_SCHEDULE": return "La cadence de l'abonnement n'est pas reconnue.";
+      case "CADENCE_BELOW_FLOOR": return "Cadence trop rapprochée : au plus un envoi toutes les 25 minutes.";
+      case "CADENCE_TOO_SHORT": return `Cadence de moins de ${L.min_cadence_days} jours. Pour l'autoriser, activez « Cadences très courtes » dans Paramètres, Limites de sécurité.`;
+      case "MONTHLY_TOTAL": return `Avec cet abonnement, l'ensemble de vos abonnements représentera environ ${m[2]} XMR par mois.`;
+      default: return "Abonnement refusé par les limites de sécurité.";
+    }
+  }
+
+  async function reloadSubscriptions() {
+    const fresh = await tauriInvoke("get_subscriptions");
+    if (fresh) subscriptions = fresh.map(dbSubToUi);
+    return fresh;
+  }
+
+  /**
+   * Persist a new subscription. Returns the backend result, null on a technical failure,
+   * or false when the payment limits refused it (the user has been told why).
+   */
+  async function persistNewSubscription(cmd, args) {
+    try {
+      return await invokeStrict(cmd, args);
+    } catch (e) {
+      const message = policyMessage(e);
+      if (!message) { logWarn("Dashboard", `${cmd} failed: ${e}`); return null; }
+      logInfo("Policy", `Subscription refused (${String(e).match(/POLICY:[A-Z_]+/)?.[0]})`);
+      await reloadSubscriptions();
+      const monthly = String(e).includes("POLICY:MONTHLY_TOTAL");
+      return await new Promise(resolve => {
+        policyNotice = {
+          message, canConfirm: monthly, resolve,
+          retry: monthly ? () => persistNewSubscription(cmd, { ...args, confirmMonthly: true }) : null,
+        };
+      });
+    }
+  }
+
+  async function closePolicyNotice(confirmed) {
+    const notice = policyNotice;
+    policyNotice = null;
+    if (!notice) return;
+    notice.resolve(confirmed && notice.retry ? await notice.retry() : false);
+  }
+
+  const PENDING_REASON_LABELS = {
+    first_payment: "Premier envoi vers ce destinataire",
+    terms_changed: "Les conditions ont changé depuis votre dernière validation",
+    high_amount: "Montant élevé (1 XMR ou plus)",
+    semi_auto: "Mode semi-auto : chaque envoi est confirmé",
+  };
+
   async function tauriListen(event, cb) {
     try {
       const { listen } = await import("@tauri-apps/api/event");
@@ -109,6 +222,13 @@
           ? `${tObj.alertPaymentFailed || 'Échec paiement'} — ${label}`
           : (tObj.alertPaymentFailed || 'Échec d\'un paiement');
       }
+      case 'PAYMENT_BLOCKED_LIMITS': {
+        const label = subLabelForAlert(alert);
+        const why = policyMessage(alert.message) || '';
+        return `${label ? label + ' — ' : ''}envoi suspendu. ${why}`.trim();
+      }
+      case 'BALANCE_SHORT_UPCOMING':
+        return `${num ?? 'Des'} paiement(s) prévu(s) dans les 48 h dépassent le solde disponible. Rechargez le portefeuille pour qu'ils partent à l'heure.`;
       case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced || 'Wallet non synchronisé avec la blockchain';
       case 'OFFLINE_WITH_PENDING': {
         const hoursMatch = alert.message.match(/(\d+)h/);
@@ -185,7 +305,7 @@
   async function validatePv() {
     pvError = ""; pvDoc = null; pvResults = {};
     try {
-      const doc = await tauriInvoke("validate_pv", { pvJson });
+      const doc = await invokeStrict("validate_pv", { pvJson });
       if (doc) { pvDoc = doc; }
       else { pvError = "Réponse vide du backend."; }
     } catch (e) { pvError = String(e); }
@@ -196,7 +316,7 @@
     pvExecuting = true;
     pvResults = { ...pvResults, [payment.id]: { status: 'pending' } };
     try {
-      const tx = await tauriInvoke("execute_pv_payment", { paymentJson: JSON.stringify(payment) });
+      const tx = await invokeStrict("execute_pv_payment", { paymentJson: JSON.stringify(payment) });
       pvResults = { ...pvResults, [payment.id]: { status: 'ok', tx } };
     } catch (e) {
       pvResults = { ...pvResults, [payment.id]: { status: 'error', msg: String(e) } };
@@ -220,7 +340,7 @@
     _pendingQueue = _pendingQueue.filter(q => q.sub_id !== subId);
     if (!subId) return;
     try {
-      const next = await tauriInvoke("reject_payment", { subId, skip });
+      const next = await invokeStrict("reject_payment", { subId, skip });
       if (next) subscriptions = subscriptions.map(s => s.id === subId ? { ...s, next_payment_at: next } : s);
     } catch (e) {
       logWarn("Scheduler", `reject_payment failed: ${e}`);
@@ -463,7 +583,8 @@
     showNewSubModal = false;
     editingSubData = null;
     // Persist to DB via save_subscription (no code string needed)
-    const result = await tauriInvoke("save_subscription", { payload });
+    const result = await persistNewSubscription("save_subscription", { payload });
+    if (result === false) return;
     if (result) {
       logInfo("Dashboard", `Sub saved to DB: ${result.id}`);
       // Reload all subs from DB — ensures next_payment_at is fresh for ALL subs
@@ -535,13 +656,15 @@
     // Try parsed code first (crypto-autopay: or monero-request: prefix)
     let result = null;
     if (detail.code && (detail.code.startsWith("crypto-autopay:") || detail.code.startsWith("monero-request:"))) {
-      result = await tauriInvoke("add_subscription", { code: detail.code });
+      result = await persistNewSubscription("add_subscription", { code: detail.code });
+      if (result === false) return;
       if (result) logInfo("Dashboard", `Sub persisted via code: ${result.id}`);
     }
     // Fallback: save via payload (works for manually decoded or converted codes)
     if (!result && detail.payload) {
       const payload = { ...detail.payload, start_immediately: detail.payload.start_immediately ?? true };
-      result = await tauriInvoke("save_subscription", { payload });
+      result = await persistNewSubscription("save_subscription", { payload });
+      if (result === false) return;
       if (result) logInfo("Dashboard", `Sub persisted via payload fallback: ${result.id}`);
     }
     if (result) {
@@ -1027,7 +1150,7 @@
     nowMs = Date.now();
     logInfo("Dashboard", "Refreshing balance via RPC…");
     try {
-      const b = await tauriInvoke("refresh_balance");
+      const b = await invokeStrict("refresh_balance");
       if (b) {
         balanceXmr = b.xmr;
         // Only a completed refresh says anything reliable about connectivity.
@@ -1091,6 +1214,7 @@
     await loadHistoryEntries();
     // Load treasurer mode
     await loadTreasurerMode();
+    await loadPaymentLimits();
 
     // Sync payment mode with Rust backend (source of truth for semi-auto enforcement)
     try {
@@ -1157,7 +1281,7 @@
 
     // Check every 3s if we should display a queued pending payment
     everyWhileMounted(() => {
-      if (_pendingQueue.length > 0 && !balanceLoading && balanceXmr !== null && !isOffline) {
+      if (!pendingPaymentModal && _pendingQueue.length > 0 && !balanceLoading && balanceXmr !== null && !isOffline) {
         pendingPaymentModal = _pendingQueue.shift();
       }
     }, 3000);
@@ -1383,7 +1507,7 @@
         <div style="font-size:36px;margin-bottom:12px">🔔</div>
         <h2 style="margin:0 0 6px;font-size:18px">Paiement en attente</h2>
         <p style="color:var(--text-muted);font-size:13px;margin-bottom:16px">
-          Mode semi-auto — confirmez avant envoi
+          Rien ne part sans votre accord.
         </p>
       {/if}
       <div class="card" style="padding:14px 18px;margin-bottom:18px;text-align:left">
@@ -1394,9 +1518,15 @@
             <div>Cadence : <strong style="color:var(--text)">{scheduleLabel(pendingPaymentModal.schedule)}</strong></div>
           {/if}
           {#if pendingPaymentModal.payments_sent > 0}
-            <div>Envois precedents : <strong style="color:var(--text)">{pendingPaymentModal.payments_sent}</strong></div>
-          {:else}
-            <div style="color:#f97316">Premier envoi</div>
+            <div>Envois précédents : <strong style="color:var(--text)">{pendingPaymentModal.payments_sent}</strong></div>
+          {/if}
+          {#if pendingPaymentModal.reasons?.length}
+            <div style="margin-top:6px;color:var(--text)">Pourquoi cette confirmation :</div>
+            <ul style="margin:2px 0 0 16px;padding:0">
+              {#each pendingPaymentModal.reasons as r}
+                <li>{PENDING_REASON_LABELS[r] || r}</li>
+              {/each}
+            </ul>
           {/if}
           {#if pendingPaymentModal.last_payment_at && pendingPaymentModal.payments_sent > 0}
             {@const rel = formatRelativeDate(pendingPaymentModal.last_payment_at)}
@@ -1435,8 +1565,10 @@
         </button>
         <button class="btn-primary" style="flex:1;padding:10px;font-size:15px"
           on:click={async () => {
-            await tauriInvoke("approve_payment", { subId: pendingPaymentModal.sub_id });
+            const subId = pendingPaymentModal.sub_id;
             pendingPaymentModal = null;
+            try { await invokeStrict("approve_payment", { subId }); }
+            catch (e) { logWarn("Scheduler", `approve_payment failed: ${e}`); }
             // Trigger immediate scheduler cycle
             setTimeout(() => refreshBalance(), 2000);
           }}>
@@ -1447,6 +1579,63 @@
         Passer cette échéance (pas d'envoi, prochaine selon la cadence)
       </button>
       {/if}
+    </div>
+  </div>
+{/if}
+
+<!-- Subscription refused or needing confirmation by the payment limits -->
+{#if policyNotice}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:420px;text-align:center">
+      <h2 style="margin:0 0 10px;font-size:17px">
+        {policyNotice.canConfirm ? "Confirmer le budget mensuel" : "Abonnement non ajouté"}
+      </h2>
+      <p style="font-size:13px;margin-bottom:8px">{policyNotice.message}</p>
+      {#if policyNotice.canConfirm}
+        <p class="text-muted" style="font-size:12px;margin-bottom:16px">
+          Une confirmation est demandée au-delà de {paymentLimits.monthly_confirm_xmr} XMR par mois. Rien n'a été envoyé.
+        </p>
+        <div style="display:flex;gap:10px;justify-content:center">
+          <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>Annuler</button>
+          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(true)}>Ajouter quand même</button>
+        </div>
+      {:else}
+        <p class="text-muted" style="font-size:12px;margin-bottom:16px">Rien n'a été enregistré ni envoyé.</p>
+        <div style="display:flex;gap:10px;justify-content:center">
+          {#if /Paramètres/.test(policyNotice.message)}
+            <button class="btn-ghost" style="flex:1;padding:10px"
+              on:click={() => { closePolicyNotice(false); page = "settings"; }}>Ouvrir les Paramètres</button>
+          {/if}
+          <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>Compris</button>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+<!-- Password check before unlocking a payment limit -->
+{#if limitPrompt}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px">
+      <h2 style="margin:0 0 8px;font-size:17px">
+        {limitPrompt.key === "allow_large_amounts" ? "Autoriser les montants élevés" : "Autoriser les cadences très courtes"}
+      </h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">
+        {limitPrompt.key === "allow_large_amounts"
+          ? `Les abonnements de plus de ${paymentLimits.max_amount_xmr} XMR par envoi deviennent possibles. Chaque envoi d'au moins ${paymentLimits.high_amount_xmr} XMR reste confirmé.`
+          : `Les cadences de moins de ${paymentLimits.min_cadence_days} jours (de tous les 6 jours à toutes les 25 min) deviennent possibles.`}
+        Saisissez votre mot de passe pour confirmer.
+      </p>
+      <form on:submit|preventDefault={() => applyLimits({ ...paymentLimits, [limitPrompt.key]: true }, limitPassword)}>
+        <input type="password" bind:value={limitPassword} autocomplete="current-password"
+          placeholder="Mot de passe" style="width:100%;margin-bottom:8px" />
+        {#if limitError}<p style="color:#ef4444;font-size:12px;margin:0 0 8px">{limitError}</p>{/if}
+        <div style="display:flex;gap:10px">
+          <button type="button" class="btn-ghost" style="flex:1;padding:10px"
+            on:click={() => { limitPrompt = null; limitPassword = ""; }}>Annuler</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px" disabled={!limitPassword}>Confirmer</button>
+        </div>
+      </form>
     </div>
   </div>
 {/if}
@@ -2230,6 +2419,34 @@
         {#if rpcSaveMsg}
           <p class="text-muted" style="font-size:11px;margin-top:6px">{rpcSaveMsg}</p>
         {/if}
+      </div>
+
+      <h2 class="section-title">Limites de sécurité</h2>
+      <div class="settings-section card">
+        <p class="text-muted" style="font-size:12px;margin:0 0 10px">
+          Toujours actives : minimum {paymentLimits.min_amount_xmr} XMR par envoi ; confirmation pour un premier envoi,
+          des conditions modifiées, un envoi d'au moins {paymentLimits.high_amount_xmr} XMR, ou un total
+          de plus de {paymentLimits.monthly_confirm_xmr} XMR par mois.
+        </p>
+        <div class="setting-row">
+          <span class="setting-label">Montants élevés (plus de {paymentLimits.max_amount_xmr} XMR par envoi)</span>
+          <label class="toggle">
+            <input type="checkbox" checked={paymentLimits.allow_large_amounts}
+              on:change={e => onLimitToggle("allow_large_amounts", e)} />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Cadences très courtes (moins de {paymentLimits.min_cadence_days} jours, jusqu'à toutes les 25 min)</span>
+          <label class="toggle">
+            <input type="checkbox" checked={paymentLimits.allow_short_cadence}
+              on:change={e => onLimitToggle("allow_short_cadence", e)} />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="text-muted" style="font-size:11px;margin-top:6px">
+          Désactivées par défaut. Les activer demande votre mot de passe ; les désactiver, non.
+        </p>
       </div>
 
       <!-- Logs section in Settings -->

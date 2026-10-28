@@ -6,6 +6,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 ## Critical / UX (grand public)
 
+- [ ] **PRIORITY — Vulnerability disclosure policy**: publish a `SECURITY.md` (scope, safe harbour, response delay) with a dedicated security contact email, a bug bounty (amounts in XMR per severity), and the link to the GitLab repository / confidential issues. Must be online before the alpha with real funds.
 - [ ] **RPC error UX**: All 10 error cases from `docs/RPC_states.md` must have friendly, actionable messages for non-technical users. Currently some show raw error strings. See Case A–J in RPC_states.md.
 - [ ] **Tray zombie on crash**: If the app is force-killed (`kill -9`), the tray icon may remain. Add a PID lockfile or use the single-instance plugin's cleanup hook to remove the tray on startup if a stale one exists.
 - [ ] **Window restore**: Single-instance plugin now correctly calls `show() + unminimize() + set_focus()`. Verify on all 3 platforms (Linux, Windows, macOS) that clicking the tray icon always brings the window to front.
@@ -17,7 +18,9 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 ## Security
 
 - [ ] **No amount/address in logs**: Already implemented — verify no regression with new code paths (scheduler, sweep, send_payment).
-- [ ] **History encryption key rotation**: Currently the history key is derived from the master password (fixed salt). If the user changes their password, the history key changes and old entries become unreadable. Plan: re-encrypt on password change.
+- [ ] **History encryption key rotation**: The history key is derived from the master password with a random per-install salt (`history.salt`). If the user changes their password, old entries become unreadable. Plan: re-encrypt on password change.
+- [ ] **Encrypt subscriptions.db**: addresses, amounts and schedules are stored in clear (file is 0600). Plan: SQLCipher keyed from the master password, which means opening the DB only after unlock (today `Database` is opened at startup and shared everywhere).
+- [ ] **Price lookup leaks the IP**: the code editor fetches `libremonero.com/api/price` directly. Route through Tor/proxy or make it opt-in.
 - [ ] **Post-quantum consideration**: Current encryption is AES-256-GCM + Argon2id. AES-256 is considered quantum-resistant. For the future: evaluate CRYSTALS-Kyber (ML-KEM) for key encapsulation if a threat model requires it.
 - [ ] **Audit**: Before any public release with real funds, a security audit of `autopay-crypto` crate is strongly recommended.
 
