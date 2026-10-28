@@ -89,6 +89,11 @@ jobs:
             libssl-dev \
             pkg-config
 
+      # ── Bundled monero-wallet-rpc (pinned + SHA-256 checked) ──
+      - name: Fetch monero-wallet-rpc
+        shell: bash
+        run: scripts/fetch-wallet-rpc.sh ${{ matrix.target }}
+
       # ── macOS signing (only when the secrets exist) ──
       # Tauri tries to import APPLE_CERTIFICATE as soon as the variable is defined, even empty,
       # so it is exported only when set. Without it the app is ad-hoc signed (tauri.conf.json).

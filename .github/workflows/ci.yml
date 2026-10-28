@@ -42,6 +42,10 @@ jobs:
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev patchelf libssl-dev pkg-config
 
+      - name: Fetch monero-wallet-rpc
+        shell: bash
+        run: scripts/fetch-wallet-rpc.sh x86_64-unknown-linux-gnu
+
       - name: cargo check
         run: cargo check --workspace
 

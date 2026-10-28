@@ -185,13 +185,19 @@ impl RpcManager {
     }
 
     /// Try to find the `monero-wallet-rpc` binary.
-    /// Priority: user-configured path → PATH detection.
+    /// Priority: user-configured path → bundled sidecar → PATH detection.
     pub fn detect_binary(&self) -> Option<PathBuf> {
         // 1. User-specified path
         if let Some(ref p) = self.config.binary_path {
             if p.exists() { return Some(p.clone()); }
         }
-        // 2. PATH lookup
+        // 2. Sidecar shipped with the installer (pinned, hash-checked version), placed
+        //    next to the app executable by Tauri on every platform and in `tauri dev`.
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            let sidecar = dir.join(if cfg!(windows) { "autopay-wallet-rpc.exe" } else { "autopay-wallet-rpc" });
+            if sidecar.is_file() { return Some(sidecar); }
+        }
+        // 3. PATH lookup
         for candidate in &["monero-wallet-rpc", "monero-wallet-rpc.exe"] {
             if let Ok(output) = Command::new("which").arg(candidate).output() {
                 if output.status.success() {

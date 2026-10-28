@@ -1,0 +1,10 @@
+# Pinned monero-wallet-rpc bundled with the installers.
+# Hashes copied from https://www.getmonero.org/downloads/hashes.txt after checking its
+# GPG signature (binaryFate, 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92).
+# Update with: scripts/update-monero-lock.sh <version>
+version=v0.18.5.4
+monero-linux-x64-v0.18.5.4.tar.bz2=ba2928962c101b609434bf8c1b43ad59ebe96c5525977284ca599d8bf0f02d10
+monero-linux-armv8-v0.18.5.4.tar.bz2=d20d71e6522b41eb8e549c3425f7f4622c9c9a448fc7147525393fd0a6b59703
+monero-mac-armv8-v0.18.5.4.tar.bz2=d457de7c8a1ad42e3232fdea6d9f9003be9652143fb8f719c1fc906aa6b4917b
+monero-mac-x64-v0.18.5.4.tar.bz2=9fefa7f5f7ae60fbd8d0ad18842b76c56ed161eca4ffb4f8b5f4800e5033b146
+monero-win-x64-v0.18.5.4.zip=1ccac3b476ba75bf6dfdfa848f6520a79b64cdf3457a160eaa0dad82d5a2a042

@@ -9,3 +9,5 @@ target/
 .DS_Store
 monero-wallet-rpc.log
 monero-wallet-rpc.log*
+# Downloaded by scripts/fetch-wallet-rpc.sh (pinned in scripts/monero-cli.lock)
+/src-tauri/binaries/

@@ -13,7 +13,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
 - [ ] **Review "AutoPay account" creation (UX + security)**: the notion of "account" makes no sense here (nothing is registered anywhere, it is a local encrypted vault + a Monero wallet). Find better wording ("coffre local", "profil sur cet appareil"...) and re-review the whole flow: seed generation, seed backup/verification, restoration from 25 words, reset when the seed is lost, master password change.
 - [ ] **Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
-- [ ] **monero-wallet-rpc bundled**: Currently users must download and configure the binary separately. Bundle it inside the installer for one-click setup. Legal check: MIT license of monero-wallet-rpc allows bundling.
+- [x] **monero-wallet-rpc bundled**: shipped as the `autopay-wallet-rpc` sidecar (renamed to avoid clashing with a distro `monero` package in /usr/bin). Pinned in `scripts/monero-cli.lock`, fetched and SHA-256 checked by `scripts/fetch-wallet-rpc.sh` (CI and local dev). Linux verified locally (.deb); Windows/macOS to verify on the next release run.
 
 ---
 
@@ -40,9 +40,20 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 ---
 
+## V2 — Merchant side
+
+- [ ] **Merchant tooling** (the adoption bottleneck of a two-sided market): one subaddress per subscriber, payment notifications (webhooks), plugins (BTCPay Server, WooCommerce, Ghost).
+- [ ] **LibreMonero integration**: non-custodial subaddress creation and payment detection in under 5 seconds, embeddable with a single tag. Natural partner for the merchant side.
+- [ ] **Mobile**: Android, then iOS.
+
+## Reputation / Operations
+
+- [ ] **Respond to security reports and alerts quickly**: one bug that sends funds wrongly is enough to ruin trust. Define a response time in `SECURITY.md` and stick to it.
+- [ ] **Regular audit**: one external audit before the first release with real funds, then yearly (and after any change to signing, key handling or the scheduler).
+
 ## Developer / Infrastructure
 
-- [ ] **monero-wallet-rpc version pinning**: ship a pinned version with its SHA-256 (verified against binaryFate's signed `hashes.txt`), check `get_version` at startup and refuse/alert on an unknown major version. CI job watching Monero releases + hard-fork dates, run the RPC integration tests against the new binary, release before the fork height.
+- [ ] **monero-wallet-rpc version pinning**: pinning done (`scripts/update-monero-lock.sh <version>` verifies the GPG-signed hashes.txt against binaryFate's fingerprint). Remaining: check `get_version` at startup and alert on an unknown major version; CI job watching Monero releases and hard-fork dates; RPC integration tests against the new binary before each bump.
 - [ ] **App update channel**: Tauri updater with a minisign public key embedded in the binary. Signed manifest fetched from the hardcoded domain, with Tor onion and IPFS mirrors as fallbacks; the signature is mandatory whatever the source. Notification only (no silent install), link to the official repository. Aim for reproducible builds.
 - [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
 - [ ] **macOS code signing**: set `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` in the repo secrets (Apple Developer account). Until then builds are ad-hoc signed: users must right-click > Open, or run `xattr -cr`.
