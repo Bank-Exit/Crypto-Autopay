@@ -1,5 +1,5 @@
 <script>
-  import { tick, onMount, createEventDispatcher } from "svelte";
+  import { tick, onMount, onDestroy, createEventDispatcher } from "svelte";
   const dispatch = createEventDispatcher();
   import { t, currentLang, LANGUAGES } from "./i18n.js";
   import { theme } from "./theme.js";
@@ -587,11 +587,31 @@
   // Sync progress (from get_sync_info after each refresh)
   let syncInfo = null; // { wallet_height, daemon_height, blocks_behind, synced }
   let syncPollTimer = null;
-  let isOffline = false;          // true when network is unreachable
-  let offlineConsecutive = 0;    // require N consecutive offline readings before showing banner
-  const OFFLINE_CONFIRM_COUNT = 3; // 3 × 5s = 15s before declaring offline
-  // Monero blockchain is ~3.8M blocks (2026). daemon_height=0 can also mean local RPC is restarting.
-  const OFFLINE_BLOCKS_THRESHOLD = 500_000; // >500k behind = almost certainly offline
+  let isOffline = false;          // true when the last completed refresh could not reach the Monero node
+  let busyRetryTimer = null;
+
+  // onMount's callback is async, so a returned cleanup function would be ignored by Svelte:
+  // every lock/unlock would leave the previous instance's timers and listeners alive,
+  // and those zombie instances keep grabbing the RPC lock.
+  let destroyed = false;
+  const cleanups = [];
+  onDestroy(() => {
+    destroyed = true;
+    cleanups.forEach(fn => { try { fn(); } catch (_) {} });
+    clearInterval(syncPollTimer);
+    clearTimeout(busyRetryTimer);
+    clearInterval(payLoaderTimer);
+    clearTimeout(payAnimTimer);
+    clearInterval(dupTimer);
+  });
+  async function listenWhileMounted(event, cb) {
+    const unlisten = await tauriListen(event, cb);
+    if (destroyed) unlisten(); else cleanups.push(unlisten);
+  }
+  function everyWhileMounted(fn, ms) {
+    const id = setInterval(fn, ms);
+    cleanups.push(() => clearInterval(id));
+  }
 
   // Receive / QR state
   let copiedAddr = false;
@@ -925,29 +945,13 @@
   async function pollSyncInfo() {
     try {
       const info = await tauriInvoke("get_sync_info");
-      if (info) {
-        syncInfo = info;
-        // Detect offline: daemon_height = 0 AND wallet is supposedly synced,
-        // OR blocks_behind > 500k (impossible unless daemon can't reach peers).
-        // Require OFFLINE_CONFIRM_COUNT consecutive readings to avoid false positives
-        // from the local RPC restarting (which briefly returns daemonH=0).
-        const behind = info.blocks_behind ?? 0;
-        const daemonH = info.daemon_height ?? 0;
-        const looksOffline = (daemonH === 0 && (info.wallet_height ?? 0) > 100_000) || behind > OFFLINE_BLOCKS_THRESHOLD;
-        if (looksOffline) {
-          offlineConsecutive++;
-          if (offlineConsecutive >= OFFLINE_CONFIRM_COUNT) isOffline = true;
-        } else {
-          offlineConsecutive = 0;
-          isOffline = false; // clear offline when sync info looks normal again
-        }
-      }
-    } catch(_) {
-      // get_sync_info failed = RPC restarting, not necessarily offline
-    }
+      if (info) syncInfo = info;
+    } catch(_) {}
   }
 
   async function refreshBalance() {
+    if (destroyed) return;
+    clearTimeout(busyRetryTimer);
     balanceLoading = true;
     logInfo("Dashboard", "Refreshing balance via RPC…");
     // Poll sync progress every 5s while balance is loading
@@ -957,6 +961,8 @@
       const b = await tauriInvoke("refresh_balance");
       if (b) {
         balanceXmr = b.xmr;
+        // Only a completed refresh says anything reliable about connectivity.
+        isOffline = b.daemon_reachable === false;
         // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
         if (wallets.length > 0) {
           wallets[0] = { ...wallets[0], balance: b.xmr.toFixed(4) };
@@ -972,7 +978,9 @@
     } catch (e) {
       const errStr = String(e);
       if (errStr.includes("RPC busy")) {
-        logInfo("Dashboard", "Balance refresh skipped (paiement en cours)");
+        // Another operation (scheduler payment, or a refresh started before a lock) holds the RPC.
+        logInfo("Dashboard", "Balance refresh deferred (RPC busy) — retry in 15s");
+        if (!destroyed) busyRetryTimer = setTimeout(refreshBalance, 15000);
       } else if (errStr.includes("Locked")) {
         logInfo("Dashboard", "Balance refresh skipped (wallet verrouillé)");
         balanceXmr = null;
@@ -1031,18 +1039,18 @@
     // (sync takes ~47s on first run — shows spinner in sidebar)
     refreshBalance(); // intentionally NOT awaited
 
-    const balanceTimer = setInterval(refreshBalance, 2 * 60 * 1000);
-    const agoTimer = setInterval(updateRefreshAgo, 30 * 1000);
+    everyWhileMounted(refreshBalance, 2 * 60 * 1000);
+    everyWhileMounted(updateRefreshAgo, 30 * 1000);
 
     // NOTE: auto payment scheduling is handled by the Rust background scheduler.
     // The frontend only handles manual triggers ("Déclencher maintenant").
     // No frontend payment timer — prevents double-firing with Rust scheduler.
 
     // Fast ticker every 10s — forces reactive nextPayment banner to update
-    const tickTimer = setInterval(() => { nowTick = Date.now(); }, 10 * 1000);
+    everyWhileMounted(() => { nowTick = Date.now(); }, 10 * 1000);
 
     // Listen for Rust background scheduler events
-    await tauriListen("payment-locked", async (ev) => {
+    await listenWhileMounted("payment-locked", async (ev) => {
       const { sub_id, retry_in_min, next_payment_at } = ev.payload || {};
       logWarn("Scheduler", `[ATTENTE] Fonds verrouilles pour sub #${sub_id} — retry automatique dans ${retry_in_min} min`);
       // Update in-memory subscription so frontend shows correct next time (not "Maintenant")
@@ -1061,20 +1069,20 @@
     // Semi-auto: show modal when payment needs user approval
     // Queue the payload and show only when sync is done (balance known)
     let _pendingQueue = [];
-    const unlistenPending = await tauriListen("payment-pending", (ev) => {
+    await listenWhileMounted("payment-pending", (ev) => {
       const p = ev.payload || {};
       logInfo("Scheduler", `[Semi-auto] Payment queued for approval: ${p.sub_label} — ${p.amount_xmr} XMR`);
       _pendingQueue.push(p);
     });
 
     // Check every 3s if we should display a queued pending payment
-    const pendingFlushTimer = setInterval(() => {
+    everyWhileMounted(() => {
       if (_pendingQueue.length > 0 && !balanceLoading && balanceXmr !== null && !isOffline) {
         pendingPaymentModal = _pendingQueue.shift();
       }
     }, 3000);
 
-    const unlistenPayment = await tauriListen("payment-sent", async (ev) => {
+    await listenWhileMounted("payment-sent", async (ev) => {
       logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
       const payload = ev.payload || {};
       if (payload.sub_id) {
@@ -1102,15 +1110,9 @@
     });
 
     // Refresh alerts immediately on balance update + periodically
-    await tauriListen("alerts-updated", () => refreshAlerts());
+    await listenWhileMounted("alerts-updated", () => refreshAlerts());
     await refreshAlerts();
-    const alertTimer = setInterval(refreshAlerts, 60 * 1000);
-
-    return () => {
-      clearInterval(balanceTimer); clearInterval(agoTimer);
-      clearInterval(tickTimer); clearInterval(alertTimer);
-      unlistenPayment();
-    };
+    everyWhileMounted(refreshAlerts, 60 * 1000);
   });
 
   /** Map a DB Subscription JSON to the UI subscription shape */

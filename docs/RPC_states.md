@@ -85,7 +85,7 @@ This document maps every possible state of the RPC subsystem, their causes, impl
                      │ │ 1. detect binary (PATH/cfg) │ │
                      │ │ 2. kill stale PID on :18083 │ │
                      │ │ 3. spawn monero-wallet-rpc  │ │
-                     │ │ 4. wait_for_ready (15s)     │ │
+                     │ │ 4. wait_for_ready (10-15s)  │ │
                      │ └─────────────────────────────┘ │
                      └────────────┬────────────────────┘
                                   │
@@ -97,29 +97,34 @@ This document maps every possible state of the RPC subsystem, their causes, impl
           │ (JSON-RPC call)  │         │ rpc_connected=false  │
           └────────┬─────────┘         │ rpc_last_error=msg   │
                    │                   └─────────────────────┘
-          ┌────────┴─────────┐
-          │ ok?              │ error
-          ▼                  ▼
-  ┌──────────────┐  ┌──────────────────┐
-  │ get_balance  │  │ RPC_ERROR state  │
-  │ + get_height │  │ (open_wallet     │
-  │ JSON-RPC     │  │  failed: wrong   │
-  │              │  │  pw, corrupted)  │
-  └──────┬───────┘  └──────────────────┘
-         │
-  ┌──────┴────────┐
-  │ ok?           │ HTTP/TCP error (daemon unreachable)
-  ▼               ▼
-  ┌──────────┐  ┌──────────────────────────────────────┐
-  │ SUCCESS  │  │ DAEMON_UNREACHABLE state             │
-  │ emit     │  │ balance=0 (unknown, not real zero)   │
-  │ alerts-  │  │ rpc_connected=false                  │
-  │ updated  │  │ → may trigger isOffline on frontend  │
-  └──────────┘  └──────────────────────────────────────┘
-         │
+                   │ (error only logged; a wrong password
+                   │  surfaces at unlock_wallet, Case E)
+                   ▼
+          ┌──────────────────┐
+          │ refresh()        │  long sync, 180s timeout, non-fatal
+          │ get_height()     │  optional (None if it fails)
+          │ get_balance()    │  failure → Err (never reported as 0)
+          └────────┬─────────┘
+                   │
   RpcManager::stop() called in all paths (RAII)
-  monero-wallet-rpc process killed
-  rpc_busy cleared
+  monero-wallet-rpc process killed, rpc_busy cleared
+                   │
+                   ▼  (outside the lock)
+          ┌───────────────────────────────┐
+          │ get_daemon_block_height()     │  direct get_info to the node
+          └────────┬──────────────────────┘
+          ┌────────┴──────────┐
+          │ height > 0        │ height = 0
+          ▼                   ▼
+  ┌────────────────┐  ┌──────────────────────────────────┐
+  │ SUCCESS        │  │ SUCCESS, DAEMON_UNREACHABLE      │
+  │ daemon_        │  │ balance = local (possibly stale) │
+  │ reachable=true │  │ daemon_reachable=false           │
+  │ last_daemon_*  │  │ last_daemon_* NOT updated        │
+  │ updated        │  │ → isOffline on frontend          │
+  └────────────────┘  └──────────────────────────────────┘
+  Both: rpc_connected=true, rpc_last_error=None,
+        recompute_alerts, emit "alerts-updated"
 ```
 
 ---
@@ -161,8 +166,8 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 | Value | Meaning for UI |
 |---|---|
-| `true` | Last balance refresh succeeded. Green dot in sidebar. |
-| `false` | Last refresh failed or never tried. Amber/grey dot. |
+| `true` | Last `refresh_balance` succeeded (set by Rust on success). Green dot in sidebar. |
+| `false` | Last `refresh_balance` failed (`rpc_last_error` holds the message) or never tried. Amber/grey dot. |
 | `null` (frontend) | Fresh app launch, never tried yet. Grey dot. |
 
 ---
@@ -199,9 +204,9 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 **Rust**: `compare_exchange(false, true)` fails → returns `Err("RPC busy (payment in progress) — skipping refresh")`.
 
-**Frontend**: Caught in `refreshBalance()` catch block, logged as Info ("Balance refresh skipped — paiement en cours"), no UI change.
+**Frontend**: Caught in `refreshBalance()` catch block, logged as Info, cached balance kept.
 
-**Recovery**: Automatic. The next `refreshBalance()` call (2-min timer) will succeed once the lock is released.
+**Recovery**: Automatic. `refreshBalance()` retries after 15s (single pending retry timer, cleared on destroy).
 
 ---
 
@@ -236,13 +241,13 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 **Trigger**: `monero-wallet-rpc` starts fine on :18083, opens the wallet, but the remote daemon (opennode.xmr-tw.org:18089) is unreachable.
 
-**Rust**: `get_balance` JSON-RPC succeeds but returns `balance: 0` because the wallet hasn't synced. `get_daemon_block_height` returns 0.
+**Rust**: `refresh()` times out or fails (non-fatal), `get_balance` returns the locally known balance (last synced state). After the process is stopped, `get_daemon_block_height` returns 0 → `daemon_reachable = false`. `last_daemon_height` / `last_daemon_contact_at` are not updated, so `OFFLINE_WITH_PENDING` can fire after 24h.
 
-**Frontend**: After 3 consecutive `pollSyncInfo` readings where `daemon_height = 0` and `wallet_height > 100_000`, `isOffline = true` → blue "Hors ligne" banner. Balance displayed as `-.----` if unknown, or greyed cached value if previously known.
+**Frontend**: `isOffline = (daemon_reachable === false)` from the completed `refresh_balance` → blue "Hors ligne" banner. `pollSyncInfo` only feeds the sync progress display, it never sets `isOffline`.
 
 **What NOT to confuse**: `Connexion refusée` from 127.0.0.1:18083 is Case G (local RPC restarting), not this.
 
-**Recovery**: Internet reconnects → `pollSyncInfo` gets `daemon_height > 0` → `offlineConsecutive` resets → `isOffline = false` → normal.
+**Recovery**: Internet reconnects → next refresh returns `daemon_reachable = true` → `isOffline = false`.
 
 ---
 
@@ -254,7 +259,7 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 **Frontend**: This is `rpcOk = false` with a `"Connexion refusée"` error message. **Not treated as offline** — this is a transient local state. The 2-min auto-refresh timer will pick it up once the process restarts.
 
-**Critical**: This was previously misidentified as offline. The fix: only `pollSyncInfo` daemon_height check sets `isOffline`, never error message strings.
+**Critical**: This was previously misidentified as offline. Only `daemon_reachable` from a completed refresh sets `isOffline`, never error message strings.
 
 ---
 
@@ -267,6 +272,16 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 **Frontend**: Caught in catch block, branch `errStr.includes("Locked")` → `balanceXmr = null` → displays `-.---- XMR`. No error overlay shown.
 
 **Recovery**: User unlocks → new `refresh_balance()` triggered by `onMount` after unlock.
+
+---
+
+### Case H2 — Zombie Dashboard instances (frontend lifecycle)
+
+**Context**: `App.svelte` destroys and recreates `Dashboard` on every lock/unlock (padlock button or 2-min auto-lock).
+
+**Pitfall**: in Svelte 4, the function returned by an `async` `onMount` is never called (the callback returns a Promise). Timers and event listeners registered there leaked on every cycle; destroyed instances kept calling `refresh_balance` every 2 min, grabbing `rpc_busy`, so the visible instance got "RPC busy" and never displayed the balance.
+
+**Rule**: register every interval/listener through `everyWhileMounted` / `listenWhileMounted`; they are released in `onDestroy`. Never rely on a cleanup returned from an async `onMount`.
 
 ---
 
@@ -318,27 +333,30 @@ refreshBalance() {
   │      detect_binary()               → /usr/local/bin/monero-wallet-rpc
   │      kill stale :18083 if any
   │      Command::spawn(args)          → PID 3488406
-  │      wait_for_ready(15s)           → ok after 9 attempts (~2s)
+  │      wait_for_ready(10s)           → ok after 9 attempts (~2s)
   │    open_wallet(name, password)     → ok
-  │    get_balance()                   → { balance: 820000000000, ... }
+  │    refresh()                       → sync with daemon (≤180s)
   │    get_height()                    → { height: 3793484 }
-  │    get_daemon_block_height()       → 3793484
-  │    RpcManager::stop()              → kill PID 3488406
+  │    get_balance()                   → { balance: 820000000000, ... }
+  │    RpcManager::stop()              → kill PID, rpc_busy = false
   │  }
+  │
+  ├─ get_daemon_block_height()         → 3793484 (direct to node)
   │
   ├─ AppState update:
   │    balance_atomic = 820000000000
+  │    rpc_connected = true, rpc_last_error = None
   │    last_wallet_height = 3793484
-  │    last_daemon_height = 3793484
-  │    last_daemon_contact_at = now()
-  │    rpc_busy = false
+  │    last_daemon_height = 3793484      (only if > 0)
+  │    last_daemon_contact_at = now()    (only if > 0)
   │
   ├─ recompute_alerts(...)
   ├─ emit "alerts-updated"
-  └─ return Ok { xmr: 0.82, ... }
+  └─ return Ok { xmr: 0.82, atomic, daemon_reachable: true }
 
   [Frontend]
   balanceXmr = 0.82
+  isOffline = false
   rpcOk = true
   wallets[0].balance = "0.8200"
   balanceLoading = false
@@ -356,6 +374,7 @@ Tokio timer fires (every 60s)
   ▼
 run_payment_scheduler() {
   check unlocked → true
+  skip if < 45s since unlock (initial balance sync first)
   check rpc_busy → false
   load due subscriptions from DB
   for each due sub:

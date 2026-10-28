@@ -49,7 +49,7 @@ The last daemon contact timestamp is updated every time `refresh_balance` receiv
 
 ## Offline mode (frontend)
 
-If `pollSyncInfo` returns `daemon_height = 0` (wallet connected but daemon unreachable) for **3 consecutive polls** (≈15s), the "Hors ligne" banner is shown instead of the sync progress.
+`refresh_balance` returns `daemon_reachable`, computed from a direct `get_info` call to the remote node after the wallet-rpc process has stopped. When it is `false`, the "Hors ligne" banner is shown instead of the sync progress. The next successful refresh with a reachable node clears it.
 
 The RPC status dot changes to **grey / slow pulse** when offline (instead of green or amber).
 

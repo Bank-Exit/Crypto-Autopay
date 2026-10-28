@@ -354,7 +354,7 @@ impl RpcManager {
         }
         let atomic   = response["result"]["balance"].as_u64().unwrap_or(0);
         let unlocked = response["result"]["unlocked_balance"].as_u64().unwrap_or(0);
-        log::info!("[RPC] Balance: total={} pico, unlocked={} pico", atomic, unlocked);
+        log::info!("[RPC] get_balance OK");
         Ok((atomic as f64 / 1e12, unlocked as f64 / 1e12))
     }
 

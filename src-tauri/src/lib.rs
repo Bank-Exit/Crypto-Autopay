@@ -429,7 +429,7 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
     let s = state.lock().map_err(|e| e.to_string())?;
     if !s.unlocked { return Err("Wallet is locked.".to_string()); }
     let atomic = s.balance_atomic;
-    Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic })
+    Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic, daemon_reachable: s.last_daemon_contact_at.is_some() })
 }
 
 /// Send all funds (sweep_all) to a destination address.
@@ -628,7 +628,7 @@ async fn refresh_balance(
         return Err("RPC busy".into());
     }
 
-    let (xmr, atomic, wallet_height) = tokio::task::spawn_blocking(move || {
+    let rpc_result = tokio::task::spawn_blocking(move || {
         struct RpcGuard(Arc<AtomicBool>);
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(rpc_busy);
@@ -636,11 +636,6 @@ async fn refresh_balance(
         let mut mgr = rpc_manager::RpcManager::new(rpc_manager::RpcConfig::default());
         mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
         mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
-
-        // Get wallet current height before sync (for progress reporting)
-        let wallet_height_before = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"h","method":"get_height","params":{}
-        })).ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(0);
 
         // Open wallet
         let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
@@ -657,42 +652,53 @@ async fn refresh_balance(
             "jsonrpc":"2.0","id":"refresh","method":"refresh",
             "params":{"start_height":0}
         }), 180);
-        let blocks_fetched = match &refresh_resp {
+        match &refresh_resp {
             Ok(r) => {
                 let fetched = r["result"]["blocks_fetched"].as_u64().unwrap_or(0);
                 let received = r["result"]["received_money"].as_bool().unwrap_or(false);
                 log::info!("[refresh_balance] Sync done: blocks_fetched={}, received_money={}", fetched, received);
-                fetched
             }
-            Err(e) => { log::warn!("[refresh_balance] refresh failed (non-fatal, will retry): {}", e); 0 }
-        };
+            Err(e) => log::warn!("[refresh_balance] refresh failed (non-fatal, will retry): {}", e),
+        }
 
-        // Get updated wallet height after sync
-        let wallet_height_after = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        let wallet_height = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"h2","method":"get_height","params":{}
-        })).ok().and_then(|r| r["result"]["height"].as_u64()).unwrap_or(wallet_height_before + blocks_fetched);
+        })).ok().and_then(|r| r["result"]["height"].as_u64());
 
-        let (total, _unlocked) = mgr.rpc_get_balance().unwrap_or((0.0, 0.0));
+        let (total, _unlocked) = mgr.rpc_get_balance()?;
         let atomic = (total * 1e12) as u64;
-        log::info!("[refresh_balance] Total balance: {} XMR ({} pico)", total, atomic);
+        log::info!("[refresh_balance] Balance fetched");
         mgr.stop();
-        Ok::<(f64, u64, u64), String>((total, atomic, wallet_height_after))
+        Ok::<(f64, u64, Option<u64>), String>((total, atomic, wallet_height))
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
 
-    // Get daemon height (non-blocking, direct REST call)
-    let daemon_addr = state.lock().map_err(|e| e.to_string())?.rpc.daemon_address();
-    let daemon_height = {
-        let h = rpc_manager::get_daemon_block_height(&daemon_addr);
-        if h > 0 { h } else { wallet_height }
+    let (xmr, atomic, wallet_height) = match rpc_result {
+        Ok(v) => v,
+        Err(e) => {
+            if let Ok(mut s) = state.lock() {
+                s.rpc_connected = false;
+                s.rpc_last_error = Some(e.clone());
+            }
+            return Err(e);
+        }
     };
+
+    // 0 means the remote node did not answer: keep it as-is, never substitute the wallet height,
+    // otherwise offline detection and OFFLINE_WITH_PENDING can never trigger.
+    let daemon_addr = state.lock().map_err(|e| e.to_string())?.rpc.daemon_address();
+    let daemon_height = rpc_manager::get_daemon_block_height(&daemon_addr);
+    let daemon_reachable = daemon_height > 0;
 
     if let Ok(mut s) = state.lock() {
         s.balance_atomic = atomic;
-        s.last_wallet_height = wallet_height;
-        s.last_daemon_height = daemon_height;
-        if daemon_height > 0 {
+        s.rpc_connected = true;
+        s.rpc_last_error = None;
+        if let Some(h) = wallet_height { s.last_wallet_height = h; }
+        if daemon_reachable {
+            s.last_daemon_height = daemon_height;
             s.last_daemon_contact_at = Some(chrono::Utc::now().timestamp());
         }
     }
@@ -714,7 +720,7 @@ async fn refresh_balance(
         app_handle.emit("alerts-updated", ()).ok();
     }
 
-    Ok(BalanceResponse { xmr, atomic })
+    Ok(BalanceResponse { xmr, atomic, daemon_reachable })
 }
 
 /// Return current active alerts (for frontend badge display).
@@ -1347,6 +1353,9 @@ async fn set_subscription_status(
 struct BalanceResponse {
     xmr: f64,
     atomic: u64,
+    /// false when the remote Monero node could not be reached during the last refresh
+    /// (balance is then the wallet's cached value, not a fresh one).
+    daemon_reachable: bool,
 }
 
 /// Result returned by unlock_wallet — never Err on RPC failure, always Ok.
