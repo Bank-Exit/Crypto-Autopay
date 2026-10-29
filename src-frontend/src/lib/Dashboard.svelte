@@ -154,24 +154,37 @@
   // Payment loader + success animation
   let showPayAnim = false;
   let showPayLoader = false;
-  let payLoaderCountdown = 15;
+  // A send may first wait for a running sync and then refresh the wallet: it can take
+  // minutes, so the loader shows elapsed time and can be dismissed (the send goes on).
+  let payLoaderElapsed = 0;
   let payLoaderTimer = null;
   let payAnimTimer = null;
+  const PAY_LOADER_SLOW_SECS = 15;
 
   function startPaymentLoader() {
     showPayLoader = true;
     showPayAnim = false;
-    payLoaderCountdown = 15;
+    payLoaderElapsed = 0;
     if (payLoaderTimer) clearInterval(payLoaderTimer);
-    payLoaderTimer = setInterval(() => {
-      payLoaderCountdown = Math.max(0, payLoaderCountdown - 1);
-    }, 1000);
+    payLoaderTimer = setInterval(() => { payLoaderElapsed += 1; }, 1000);
+  }
+
+  function hidePaymentLoader() {
+    if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
+    showPayLoader = false;
+  }
+
+  let infoNotice = "";
+  let infoNoticeTimer = null;
+  function showInfoNotice(msg) {
+    infoNotice = msg;
+    clearTimeout(infoNoticeTimer);
+    infoNoticeTimer = setTimeout(() => { infoNotice = ""; }, 8000);
   }
 
   function showPaymentAnimation() {
     // Stop loader, show success
-    if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
-    showPayLoader = false;
+    hidePaymentLoader();
     showPayAnim = true;
     if (payAnimTimer) clearTimeout(payAnimTimer);
     payAnimTimer = setTimeout(() => { showPayAnim = false; }, 4000);
@@ -895,8 +908,7 @@
     }
 
     if (invokeError) {
-      if (payLoaderTimer) { clearInterval(payLoaderTimer); payLoaderTimer = null; }
-      showPayLoader = false;
+      hidePaymentLoader();
       if (invokeError.includes("OUTPUTS_LOCKED")) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
       } else {
@@ -1525,12 +1537,14 @@
             _pendingQueue = _pendingQueue.filter(q => q.sub_id !== subId);
             const sub = subscriptions.find(s => s.id === subId);
             const coolingDown = lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS;
-            if (sub && !paymentInProgress && !coolingDown) {
+            if (sub && !paymentInProgress && !coolingDown && !balanceLoading) {
               await triggerNow(sub);
             } else {
-              // Another send is running or too recent: the scheduler sends it as soon as possible.
-              try { await invokeStrict("approve_payment", { subId }); }
-              catch (e) { logWarn("Scheduler", `approve_payment failed: ${e}`); }
+              // Sync running, another send running or too recent: the scheduler sends it as soon as possible.
+              try {
+                await invokeStrict("approve_payment", { subId });
+                showInfoNotice(balanceLoading ? $t.paySendAfterSync : $t.paySendScheduled);
+              } catch (e) { logWarn("Scheduler", `approve_payment failed: ${e}`); }
             }
           }}>
           {$t.pendingConfirm}
@@ -1667,9 +1681,18 @@
 {#if showPayLoader}
   <div class="pay-anim-overlay pay-loader-overlay" role="presentation">
     <div class="pay-loader-ring"></div>
-    <div class="pay-loader-countdown">{payLoaderCountdown}</div>
+    <div class="pay-loader-countdown">{formatDuration(payLoaderElapsed)}</div>
     <div class="pay-anim-label" style="font-size:15px;margin-top:8px">{$t.commonSending}</div>
+    {#if payLoaderElapsed >= PAY_LOADER_SLOW_SECS}
+      <p class="pay-loader-hint">{$t.paySlowHint}</p>
+      <button class="btn-ghost pay-loader-bg" on:click={hidePaymentLoader}>{$t.payContinueBackground}</button>
+    {/if}
   </div>
+{/if}
+
+{#if infoNotice}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="info-notice" role="status" on:click={() => infoNotice = ""}>{infoNotice}</div>
 {/if}
 
 <!-- Payment success animation overlay -->
@@ -3504,4 +3527,12 @@
     font-size:12px; line-height:1.5; white-space:normal;
   }
   .info-tip:hover .info-tip-body, .info-tip:focus .info-tip-body { display:block; }
+  .pay-loader-hint { max-width:340px; text-align:center; font-size:13px; line-height:1.5; color:var(--text-muted); margin:12px 0 0; }
+  .pay-loader-bg { margin-top:12px; }
+  .info-notice {
+    position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000;
+    max-width:460px; padding:10px 16px; border-radius:10px; cursor:pointer;
+    background:var(--bg-card, #fff); color:var(--text); border:1px solid var(--border);
+    box-shadow:0 6px 20px rgba(0,0,0,.18); font-size:13px; line-height:1.5;
+  }
 </style>

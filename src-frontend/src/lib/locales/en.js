@@ -225,6 +225,10 @@ export default {
   commonGotIt: "Got it",
   commonPassword: "Password",
   commonSending: "Sending…",
+  paySlowHint: "The wallet syncs before sending, this can take a few minutes. The payment goes on even if you hide this window.",
+  payContinueBackground: "Continue in the background",
+  paySendAfterSync: "Sync in progress: the payment will be sent automatically as soon as it is done.",
+  paySendScheduled: "Payment approved: it will be sent automatically within a few minutes.",
   mediaLabel: "Le Média Libre",
 
   // Unlock
