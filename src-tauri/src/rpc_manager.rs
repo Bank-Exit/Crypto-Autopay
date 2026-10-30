@@ -99,7 +99,7 @@ pub fn select_live_node(mut config: RpcConfig, last_working: Option<&str>) -> (R
     for node in &candidates {
         match probe_daemon_height(node, Duration::from_secs(6)) {
             Some(h) if h > 0 => {
-                log::info!("[RPC] Using node {} (height {})", node, h);
+                log::debug!("[RPC] Using node {} (height {})", node, h);
                 config.daemon_address = Some(node.clone());
                 return (config, node.clone(), h);
             }
@@ -274,13 +274,22 @@ impl RpcManager {
     /// Expose local RPC port for logging.
     pub fn config_port(&self) -> u16 { self.config.rpc_port }
 
-    /// Stop the wallet-rpc process gracefully.
+    /// Stop the wallet-rpc process.
+    /// The open wallet is saved first: killing it unsaved loses the sync progress, and the
+    /// next session has to fetch again every block since the last save.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.process.take() {
-            // Try to stop via RPC first (best practice), then kill
+            if matches!(child.try_wait(), Ok(None)) {
+                let store = serde_json::json!({ "jsonrpc":"2.0","id":"store","method":"store","params":{} });
+                match ureq_post_json_timeout(&self.rpc_url(), &store, 60) {
+                    Ok(r) if r.get("error").is_none() => log::debug!("[RPC] Wallet saved"),
+                    Ok(r) => log::debug!("[RPC] store skipped: {}", r["error"]["message"].as_str().unwrap_or("?")),
+                    Err(e) => log::warn!("[RPC] Could not save the wallet before stopping: {}", e),
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
-            log::info!("wallet-rpc stopped");
+            log::debug!("[RPC] wallet-rpc stopped");
             if let Some(f) = self.pid_file.take() { let _ = std::fs::remove_file(f); }
         }
         self.status = RpcStatus::Stopped;
@@ -290,14 +299,14 @@ impl RpcManager {
     /// Logs every step so failures are diagnosable.
     pub fn start_for_dir(&mut self, wallet_dir: &Path) -> Result<(), String> {
         if matches!(self.status, RpcStatus::Running) {
-            log::info!("[RPC] start_for_dir: already running, skipping");
+            log::debug!("[RPC] start_for_dir: already running, skipping");
             return Ok(());
         }
 
         // --- 1. Binary detection ---
         let binary = match self.detect_binary() {
             Some(b) => {
-                log::info!("[RPC] Binary found: {:?}", b);
+                log::debug!("[RPC] Binary found: {:?}", b);
                 b
             }
             None => {
@@ -337,10 +346,10 @@ impl RpcManager {
 
         // --- 3. Daemon address ---
         let daemon_addr = self.daemon_address();
-        log::info!("[RPC] Daemon node: {}", daemon_addr);
+        log::debug!("[RPC] Daemon node: {}", daemon_addr);
 
         // --- 4. Wallet dir ---
-        log::info!("[RPC] Wallet dir: {:?} (exists={})", wallet_dir, wallet_dir.exists());
+        log::debug!("[RPC] Wallet dir: {:?} (exists={})", wallet_dir, wallet_dir.exists());
         if !wallet_dir.exists() {
             if let Err(e) = std::fs::create_dir_all(wallet_dir) {
                 log::error!("[RPC] Could not create wallet dir: {}", e);
@@ -359,7 +368,7 @@ impl RpcManager {
             "--log-file", if cfg!(windows) { "NUL" } else { "/dev/null" }, // no 100MB+ log files
             "--non-interactive",
         ];
-        log::info!("[RPC] Spawning: {:?} {:?}", binary, args);
+        log::debug!("[RPC] Spawning: {:?} {:?}", binary, args);
         self.status = RpcStatus::Starting;
 
         let child = command(&binary)
@@ -373,7 +382,7 @@ impl RpcManager {
                 msg
             })?;
 
-        log::info!("[RPC] Process spawned, PID={:?}", child.id());
+        log::debug!("[RPC] Process spawned, PID={:?}", child.id());
         let pid_file = wallet_dir.join(PID_FILE_NAME);
         if std::fs::write(&pid_file, child.id().to_string()).is_ok() {
             self.pid_file = Some(pid_file);
@@ -389,7 +398,7 @@ impl RpcManager {
         let deadline = Instant::now() + timeout;
         let mut attempts = 0u32;
 
-        log::info!("[RPC] Waiting for local RPC on {} (timeout={}s)…", addr_str, timeout.as_secs());
+        log::debug!("[RPC] Waiting for local RPC on {} (timeout={}s)…", addr_str, timeout.as_secs());
 
         loop {
             attempts += 1;
@@ -400,7 +409,7 @@ impl RpcManager {
                 Ok(_) => {
                     // Extra wait for the RPC server to fully initialise
                     std::thread::sleep(Duration::from_millis(400));
-                    log::info!("[RPC] Ready after {} attempt(s)", attempts);
+                    log::debug!("[RPC] Ready after {} attempt(s)", attempts);
                     return Ok(());
                 }
                 Err(e) => {
@@ -414,7 +423,7 @@ impl RpcManager {
                         return Err(msg);
                     }
                     if attempts.is_multiple_of(10) {
-                        log::warn!("[RPC] Still waiting… attempt {}, error: {}", attempts, e);
+                        log::debug!("[RPC] Still waiting… attempt {}, error: {}", attempts, e);
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -485,7 +494,7 @@ impl RpcManager {
     /// Returns (total_balance_xmr, unlocked_balance_xmr).
     pub fn rpc_get_balance(&self) -> Result<(f64, f64), String> {
         let url = self.rpc_url();
-        log::info!("[RPC] Calling get_balance…");
+        log::debug!("[RPC] Calling get_balance…");
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": "balance",
             "method": "get_balance",
@@ -502,7 +511,7 @@ impl RpcManager {
         }
         let atomic   = response["result"]["balance"].as_u64().unwrap_or(0);
         let unlocked = response["result"]["unlocked_balance"].as_u64().unwrap_or(0);
-        log::info!("[RPC] get_balance OK");
+        log::debug!("[RPC] get_balance OK");
         Ok((atomic as f64 / 1e12, unlocked as f64 / 1e12))
     }
 
@@ -529,10 +538,10 @@ pub fn ureq_post_json_long(url: &str, body: &serde_json::Value, timeout_secs: u6
 /// Used to compute a sensible restore_height (recent) for new wallets.
 /// Falls back to 0 on error — caller should handle gracefully.
 pub fn get_daemon_block_height(daemon_addr: &str) -> u64 {
-    log::info!("[RPC] Querying daemon block count from {}", daemon_addr);
+    log::debug!("[RPC] Querying daemon block count from {}", daemon_addr);
     let count = probe_daemon_height(daemon_addr, Duration::from_secs(15)).unwrap_or(0);
     if count > 0 {
-        log::info!("[RPC] Daemon block count: {}", count);
+        log::debug!("[RPC] Daemon block count: {}", count);
     } else {
         log::warn!("[RPC] Could not get daemon height from {}", daemon_addr);
     }

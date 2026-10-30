@@ -7,7 +7,7 @@
  *   - Logs are kept in RAM only; send-logs persist to localStorage in encrypted form.
  *
  * Usage:
- *   import { logInfo, logWarn, logError, logSend } from "./AppLogger.js";
+ *   import { logDebug, logInfo, logWarn, logError, logSend } from "./AppLogger.js";
  *   logInfo("Dashboard", "Import modal opened");
  *   logWarn("DeepLink", "Same URL received twice — re-triggering");
  *   logSend("sub_42", "payment_attempted");
@@ -46,10 +46,12 @@ function _add(level, module, msg) {
   // Also mirror to browser console
   if (level === "error") console.error(`[${module}] ${safe}`);
   else if (level === "warn") console.warn(`[${module}] ${safe}`);
+  else if (level === "debug") console.debug(`[${module}] ${safe}`);
   else console.log(`[${module}] ${safe}`);
   _notify();
 }
 
+export const logDebug = (module, msg) => _add("debug", module, msg);
 export const logInfo  = (module, msg) => _add("info",  module, msg);
 export const logWarn  = (module, msg) => _add("warn",  module, msg);
 export const logError = (module, msg) => _add("error", module, msg);

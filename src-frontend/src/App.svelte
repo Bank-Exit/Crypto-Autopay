@@ -7,7 +7,7 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
-  import { subscribeToLogs, logInfo, logWarn, logError } from "./lib/AppLogger.js";
+  import { subscribeToLogs, logDebug, logInfo, logWarn, logError } from "./lib/AppLogger.js";
   import { t } from "./lib/i18n.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
@@ -15,17 +15,17 @@
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
 
   // ===== Auto-lock after 3 min of inactivity =====
+  // UI-only: the backend session keeps syncing and paying while the screen is locked.
   const AUTO_LOCK_MS = 3 * 60 * 1000; // 3 minutes
   let autoLockTimer = null;
 
   function resetAutoLock() {
     if (appState !== "dashboard") return;
     if (autoLockTimer) clearTimeout(autoLockTimer);
-    autoLockTimer = setTimeout(async () => {
+    autoLockTimer = setTimeout(() => {
       if (appState !== "dashboard") return;
-      try { await invoke("lock_wallet"); } catch(_) {}
       appState = "unlock";
-      logInfo("Security", "Auto-lock: wallet locked after 2 min of inactivity");
+      logInfo("Security", "Auto-lock: screen locked after 3 min of inactivity (background sync continues)");
     }, AUTO_LOCK_MS);
   }
 
@@ -35,8 +35,10 @@
   let showLogs = false;
   let liveLogs = [];
   let logFilter = "all"; // "all" | "warn" | "error"
+  let showDebugLogs = localStorage.getItem("_autopay_logs_debug") === "1";
+  $: localStorage.setItem("_autopay_logs_debug", showDebugLogs ? "1" : "0");
   // Newest first (reverse chronological order)
-  $: filteredLogs = (logFilter === "all" ? liveLogs
+  $: filteredLogs = (logFilter === "all" ? liveLogs.filter(l => showDebugLogs || l.level !== "debug")
     : liveLogs.filter(l => l.level === logFilter || (logFilter === "warn" && l.level === "error"))
   ).slice().reverse();
 
@@ -47,21 +49,29 @@
   let unlistenDeepLink = null;
   let devKeyHandler = null;
   onDestroy(() => {
-    unsubLogs?.(); unlistenRust?.(); unlistenDeepLink?.();
+    unsubLogs?.(); unlistenDeepLink?.();
+    if (unlistenRust) {
+      unlistenRust();
+      if (window.__autopayRustLogUnlisten === unlistenRust) window.__autopayRustLogUnlisten = null;
+    }
     if (devKeyHandler) document.removeEventListener("keydown", devKeyHandler);
   });
 
   onMount(async () => {
     unsubLogs = subscribeToLogs(entries => { liveLogs = [...entries]; });
 
-    // Forward Rust log events (tauri-plugin-log webview target) into AppLogger
+    // Forward Rust log events (tauri-plugin-log webview target) into AppLogger.
+    // The handle lives on window: a hot-reloaded module must replace the previous
+    // listener, not add a second one (each one would print every Rust line again).
     try {
       const { attachLogger } = await import("@tauri-apps/plugin-log");
-      unlistenRust = await attachLogger(({ level, message, location }) => {
+      window.__autopayRustLogUnlisten?.();
+      unlistenRust = window.__autopayRustLogUnlisten = await attachLogger(({ level, message, location }) => {
         const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
-        if (level >= 4) logError(mod, message);      // ERROR = 4
-        else if (level >= 3) logWarn(mod, message);  // WARN  = 3
-        else logInfo(mod, message);                  // INFO  = 2, DEBUG = 1
+        if (level >= 5) logError(mod, message);      // ERROR = 5
+        else if (level === 4) logWarn(mod, message); // WARN  = 4
+        else if (level === 3) logInfo(mod, message); // INFO  = 3
+        else logDebug(mod, message);                 // DEBUG = 2, TRACE = 1
       });
     } catch (e) {
       // In browser dev mode tauri-plugin-log is not available — ignore
@@ -216,6 +226,7 @@
         <span>📋 Logs <span style="font-size:10px;color:#aaa;font-weight:400">{$t.logsDrawerNewest}</span></span>
         <div class="logs-filters">
           <button class:active={logFilter==="all"} on:click={() => logFilter="all"}>{$t.logsDrawerAll}</button>
+          <button class:active={showDebugLogs} title={$t.logsDrawerDetailsTip} on:click={() => showDebugLogs = !showDebugLogs}>🔧 {$t.logsDrawerDetails}</button>
           <button class:active={logFilter==="warn"} on:click={() => logFilter="warn"}>⚠️ {$t.logsDrawerWarnings}</button>
           <button class:active={logFilter==="error"} on:click={() => logFilter="error"}>🔴 {$t.logsDrawerErrors}</button>
         </div>
@@ -323,6 +334,7 @@
   .log-time { color: var(--text-muted); flex-shrink: 0; font-size: 10px; padding-top: 1px; }
   .log-mod { color: var(--accent); flex-shrink: 0; }
   .log-msg { color: var(--text); word-break: break-all; }
+  .log-debug .log-msg { color: var(--text-muted); }
   .log-warn .log-msg { color: #d97706; }
   .log-error .log-msg { color: #ef4444; }
   .logs-footer {

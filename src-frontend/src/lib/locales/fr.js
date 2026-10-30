@@ -259,7 +259,9 @@ export default {
   // Logs drawer
   logsDrawerNewest: "↑ plus récent en haut",
   logsDrawerAll: "Tous",
-  logsDrawerWarnings: "Avertissements",
+  logsDrawerWarnings: "Avert.",
+  logsDrawerDetails: "Détails",
+  logsDrawerDetailsTip: "Afficher les logs techniques détaillés (RPC, nœud, synchro)",
   logsDrawerErrors: "Erreurs",
   logsDrawerClose: "Fermer les logs",
 

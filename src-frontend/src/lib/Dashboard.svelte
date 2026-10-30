@@ -356,7 +356,7 @@
     const alerts = await tauriInvoke("get_alerts");
     activeAlerts = alerts || [];
   }
-  import { logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
+  import { logDebug, logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
            setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
 
   // Tauri shell.open for external links (safe fallback for browser dev)
@@ -800,7 +800,6 @@
     else if (activeAlerts.length > 0) showAlertsOverlay = true;
     else page = "home";
   }
-  let busyRetryTimer = null;
 
   // onMount's callback is async, so a returned cleanup function would be ignored by Svelte:
   // every lock/unlock would leave the previous instance's timers and listeners alive,
@@ -810,7 +809,6 @@
   onDestroy(() => {
     destroyed = true;
     cleanups.forEach(fn => { try { fn(); } catch (_) {} });
-    clearTimeout(busyRetryTimer);
     clearInterval(payLoaderTimer);
     clearTimeout(payAnimTimer);
     clearInterval(dupTimer);
@@ -1104,38 +1102,50 @@
     : syncStep.phase === "reading" ? $t.syncReading
     : $t.syncGeneric;
 
+  // Applies a refresh result, whether requested by this UI or run by the backend loop.
+  function applyBalance(b) {
+    balanceXmr = b.xmr;
+    // Only a completed refresh says anything reliable about connectivity.
+    isOffline = b.daemon_reachable === false;
+    // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
+    if (wallets.length > 0) {
+      wallets[0] = { ...wallets[0], balance: b.xmr.toFixed(4) };
+      wallets = [...wallets];
+    }
+    rpcOk = true;
+    rpcError = null;
+    lastBalanceRefresh = Date.now();
+    updateRefreshAgo();
+  }
+
+  function endSyncDisplay() {
+    balanceLoading = false;
+    syncStep = null;
+    syncStartedAt = 0;
+  }
+
   async function refreshBalance() {
-    if (destroyed) return;
-    clearTimeout(busyRetryTimer);
+    if (destroyed || uiRefreshRunning) return;
+    uiRefreshRunning = true;
+    const shownBefore = { balanceLoading, syncStep, syncStartedAt, syncPhaseStartedAt };
     balanceLoading = true;
     syncStep = null;
     syncStartedAt = Date.now();
     syncPhaseStartedAt = 0;
     nowMs = Date.now();
-    logInfo("Dashboard", "Refreshing balance via RPC…");
+    logDebug("Dashboard", "Refreshing balance via RPC…");
+    let busy = false;
     try {
       const b = await invokeStrict("refresh_balance");
-      if (b) {
-        balanceXmr = b.xmr;
-        // Only a completed refresh says anything reliable about connectivity.
-        isOffline = b.daemon_reachable === false;
-        // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
-        if (wallets.length > 0) {
-          wallets[0] = { ...wallets[0], balance: b.xmr.toFixed(4) };
-          wallets = [...wallets];
-        }
-        rpcOk = true;
-        rpcError = null;
-        lastBalanceRefresh = Date.now();
-        updateRefreshAgo();
-        logInfo("Dashboard", `Balance refreshed: [REDACTED]`);
-      }
+      if (b) applyBalance(b);
     } catch (e) {
       const errStr = String(e);
       if (errStr.includes("RPC busy")) {
-        // Another operation (scheduler payment, or a refresh started before a lock) holds the RPC.
-        logInfo("Dashboard", "Balance refresh deferred (RPC busy) — retry in 15s");
-        if (!destroyed) busyRetryTimer = setTimeout(refreshBalance, 15000);
+        // A background sync or a payment holds the wallet: keep showing its progress, if any;
+        // its `wallet-refreshed` event updates the UI.
+        busy = true;
+        ({ balanceLoading, syncStep, syncStartedAt, syncPhaseStartedAt } = shownBefore);
+        logDebug("Dashboard", "Balance refresh skipped (wallet busy) — waiting for the running sync");
       } else if (errStr.includes("Locked")) {
         logInfo("Dashboard", "Balance refresh skipped (wallet verrouillé)");
         balanceXmr = null;
@@ -1148,11 +1158,11 @@
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
-    balanceLoading = false;
-    syncStep = null;
-    syncStartedAt = 0;
+    uiRefreshRunning = false;
+    if (!busy) endSyncDisplay();
     loadRpcState();
   }
+  let uiRefreshRunning = false;
 
   onMount(async () => {
     await loadRpcState();
@@ -1196,15 +1206,28 @@
 
     // Immediately trigger a background sync without blocking the UI
     // (sync takes ~47s on first run — shows spinner in sidebar)
+    // Progress of any sync, including the backend's periodic one.
     await listenWhileMounted("wallet-sync", (ev) => {
-      if (!balanceLoading) return;
+      if (!balanceLoading) {
+        balanceLoading = true;
+        syncStartedAt = Date.now();
+        syncPhaseStartedAt = 0;
+        nowMs = Date.now();
+      }
       const p = ev.payload || {};
       if (p.phase === "syncing" && syncStep?.phase !== "syncing") syncPhaseStartedAt = Date.now();
       syncStep = p;
     });
+    await listenWhileMounted("wallet-refreshed", (ev) => {
+      const p = ev.payload || {};
+      if (p.ok && p.balance) applyBalance(p.balance);
+      else if (p.error) { rpcOk = false; rpcError = String(p.error); }
+      if (!uiRefreshRunning) endSyncDisplay();
+      loadRpcState();
+    });
+    // The backend keeps syncing every 2 min (even with the window closed); this one is for fresh data on open.
     refreshBalance(); // intentionally NOT awaited
 
-    everyWhileMounted(refreshBalance, 2 * 60 * 1000);
     everyWhileMounted(updateRefreshAgo, 30 * 1000);
 
     // NOTE: auto payment scheduling is handled by the Rust background scheduler.
@@ -1252,7 +1275,7 @@
     }, 3000);
 
     await listenWhileMounted("payment-sent", async (ev) => {
-      logInfo("Scheduler", "[Rust] Paiement envoyé par le scheduler Rust — refresh dans 5s");
+      logDebug("Scheduler", "payment-sent event received — reloading history");
       const payload = ev.payload || {};
       if (payload.sub_id) {
         const sub = subscriptions.find(s => s.id === payload.sub_id);
@@ -1268,13 +1291,9 @@
             : s);
         }
       }
-      balanceLoading = true;
-      setTimeout(async () => {
-        await loadRpcState();
-        await refreshBalance();
-        await refreshAlerts();
-        await loadHistoryEntries(); // reload encrypted history after payment
-      }, 5000);
+      await loadHistoryEntries();
+      await refreshAlerts();
+      setTimeout(refreshBalance, 5000);
     });
 
     // Refresh alerts immediately on balance update + periodically
@@ -1798,7 +1817,7 @@
       <!-- Lock button — centered below settings -->
       <div style="display:flex;justify-content:center;padding:12px 0 4px">
         <button class="lock-nav-btn" title={$t.lockSession}
-          on:click={() => tauriInvoke('lock_wallet').then(() => dispatch('lock')).catch(() => dispatch('lock'))}>
+          on:click={() => dispatch('lock')}>
           <!-- Padlock SVG — use style= for CSS vars (WebKitGTK doesn't resolve vars in presentation attrs) -->
           <svg width="20" height="20" viewBox="0 0 24 24"
                style="fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;stroke-linejoin:round">
