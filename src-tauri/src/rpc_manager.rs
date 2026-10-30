@@ -216,14 +216,38 @@ fn find_stale_wallet_rpc(wallet_dir: &std::path::Path) -> Option<u32> {
     None
 }
 
-fn kill_pid(pid: u32) {
+/// Seconds wallet-rpc gets to save the wallet and exit after SIGTERM.
+const TERM_GRACE_SECS: u64 = 15;
+
+/// Stop a wallet-rpc process. On Unix, SIGTERM makes wallet-rpc abort a running refresh
+/// and save the wallet before exiting; SIGKILL is only the fallback.
+fn terminate_pid(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    {
+        let alive = || unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+        let deadline = Instant::now() + Duration::from_secs(TERM_GRACE_SECS);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if alive() {
+            log::warn!("[RPC] wallet-rpc (PID {}) ignored SIGTERM — killing it", pid);
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        }
     }
     #[cfg(windows)]
     {
         let _ = command("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    }
+}
+
+/// Stop any wallet-rpc this app left running on `wallet_dir` (called when the app exits:
+/// a session still syncing in a background thread would otherwise outlive the app).
+pub fn shutdown_leftover(wallet_dir: &Path) {
+    if let Some(pid) = find_stale_wallet_rpc(wallet_dir) {
+        log::info!("[RPC] Stopping wallet-rpc before exit (wallet is saved)");
+        terminate_pid(pid);
+        let _ = std::fs::remove_file(wallet_dir.join(PID_FILE_NAME));
     }
 }
 
@@ -280,11 +304,16 @@ impl RpcManager {
     pub fn stop(&mut self) {
         if let Some(mut child) = self.process.take() {
             if matches!(child.try_wait(), Ok(None)) {
+                // An idle wallet-rpc may ignore SIGTERM for seconds: save explicitly, then kill.
+                // SIGTERM (which also saves) is the fallback when the RPC does not answer.
                 let store = serde_json::json!({ "jsonrpc":"2.0","id":"store","method":"store","params":{} });
-                match ureq_post_json_timeout(&self.rpc_url(), &store, 60) {
+                match ureq_post_json_timeout(&self.rpc_url(), &store, 30) {
                     Ok(r) if r.get("error").is_none() => log::debug!("[RPC] Wallet saved"),
                     Ok(r) => log::debug!("[RPC] store skipped: {}", r["error"]["message"].as_str().unwrap_or("?")),
-                    Err(e) => log::warn!("[RPC] Could not save the wallet before stopping: {}", e),
+                    Err(e) => {
+                        log::warn!("[RPC] Could not save the wallet before stopping: {}", e);
+                        terminate_pid(child.id());
+                    }
                 }
             }
             let _ = child.kill();
@@ -324,7 +353,7 @@ impl RpcManager {
             if let Some(pid) = find_stale_wallet_rpc(wallet_dir) {
                 log::warn!("[RPC] Port {} held by a stale wallet-rpc from this app (PID {}) — stopping it",
                     self.config.rpc_port, pid);
-                kill_pid(pid);
+                terminate_pid(pid);
                 let _ = std::fs::remove_file(wallet_dir.join(PID_FILE_NAME));
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while port_in_use(self.config.rpc_port) && Instant::now() < deadline {
@@ -458,8 +487,6 @@ impl RpcManager {
             log::error!("[RPC] {}", msg);
             msg
         })?;
-
-        log::debug!("[RPC] restore response: {}", response);
 
         if let Some(err) = response.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -617,16 +644,17 @@ fn http_post_json(
     })?;
 
     let body_start = response.find("\r\n\r\n").ok_or_else(|| {
-        let msg = format!("Malformed HTTP response (no header/body separator). Raw: {}", &response[..response.len().min(200)]);
+        let msg = format!("Malformed HTTP response (no header/body separator, {}B)", response.len());
         log::error!("[RPC/HTTP] {}", msg);
         msg
     })?;
     let json_body = &response[body_start + 4..];
 
-    log::debug!("[RPC/HTTP] Response body ({}B): {}", json_body.len(), &json_body[..json_body.len().min(300)]);
+    // Bodies carry balances, addresses and tx hashes: only their size may be logged.
+    log::debug!("[RPC/HTTP] {} response ({}B)", method_hint, json_body.len());
 
     serde_json::from_str(json_body).map_err(|e| {
-        let msg = format!("JSON parse error: {} — body: {}", e, &json_body[..json_body.len().min(300)]);
+        let msg = format!("JSON parse error: {} ({}B body)", e, json_body.len());
         log::error!("[RPC/HTTP] {}", msg);
         msg
     })

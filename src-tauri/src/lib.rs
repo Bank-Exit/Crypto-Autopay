@@ -2686,6 +2686,13 @@ pub fn run() {
             save_rpc_config,
             stop_wallet_rpc,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while building tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Ok(dir) = app.path().app_data_dir() {
+                    rpc_manager::shutdown_leftover(&dir);
+                }
+            }
+        });
 }
