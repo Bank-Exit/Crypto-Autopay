@@ -889,11 +889,10 @@
     logInfo("Scheduler", `Processing payment for sub #${sub.id}`);
     if (retryOnBusy) startPaymentLoader(); // show loader immediately
 
-    let txHash = null;
     let invokeError = null;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      txHash = await invoke("pay_subscription_now", { subId: sub.id });
+      await invoke("pay_subscription_now", { subId: sub.id });
     } catch (e) {
       invokeError = String(e);
     }
@@ -909,6 +908,7 @@
       hidePaymentLoader();
       if (invokeError.includes("OUTPUTS_LOCKED")) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
+        showInfoNotice($t.payFundsConfirming);
       } else {
         logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
         const why = policyMessage(invokeError, $t);
@@ -918,7 +918,7 @@
       return;
     }
 
-    logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id} — tx: ${String(txHash).slice(0, 12)}...`);
+    logInfo("Scheduler", `[OK] Paiement envoye pour sub #${sub.id}`);
     lastPaymentSentAt = Date.now();
     // Optimistic balance subtraction — avoids showing stale balance while locked outputs settle
     const sentAmt = parseFloat(sub.amount) || 0;

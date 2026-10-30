@@ -229,6 +229,7 @@ export default {
   payContinueBackground: "Continuar en segundo plano",
   paySendAfterSync: "Sincronización en curso: el pago se enviará automáticamente en cuanto termine.",
   paySendScheduled: "Pago aprobado: se enviará automáticamente en unos minutos.",
+  payFundsConfirming: "No se envió nada: parte de los fondos aún se está confirmando (pago anterior). Nuevo intento automático en 25 min.",
   mediaLabel: "Le Média Libre",
 
   // Unlock

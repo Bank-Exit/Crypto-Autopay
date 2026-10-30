@@ -5,10 +5,14 @@
 //!
 //! ## Lifecycle
 //!  1. User unlocks vault → wallet file restored from seed if missing.
-//!  2. Refresh / payment → `start_for_dir()` then `open_wallet` over JSON-RPC
-//!     (the password is never passed on the command line).
-//!  3. Payment sent → `stop()` called (wallet-rpc shut down to minimise attack surface).
-//!  4. On app close → `stop()` always called.
+//!  2. First refresh / payment → `start_for_dir()` then `open_wallet` over JSON-RPC
+//!     (the password is never passed on the command line). The process then stays up for
+//!     the whole session: a fresh wallet-rpc has to download the whole mempool before its
+//!     first refresh completes, which costs from seconds to minutes on a remote node.
+//!  3. Every process gets random RPC credentials (HTTP digest auth), so other local
+//!     programs cannot drive the wallet. They go through a short-lived 0600 config file,
+//!     never the command line (visible in the process list).
+//!  4. Full lock, node change or app close → `stop()` (wallet saved first).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,11 +34,12 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 
 // ---- Public node list (mainnet, no local node needed) ----
 // Nodes are tried in order; first reachable one is used.
+// Order = preference; nodes found slow at runtime are skipped for a while (see lib.rs).
 pub const PUBLIC_NODES: &[&str] = &[
-    "opennode.xmr-tw.org:18089",       // long-running, trusted by community
-    "node.sethsimmons.me:18089",
     "xmr-node.cakewallet.com:18081",
     "nodes.hashvault.pro:18081",
+    "opennode.xmr-tw.org:18089",       // round-robin DNS: some backends are very slow
+    "node.sethsimmons.me:18089",
 ];
 
 /// User-facing RPC configuration (serialisable, stored in settings).
@@ -80,7 +85,11 @@ impl RpcConfig {
 /// A pinned node is always used. In automatic mode, the last working node is tried first,
 /// then the public list in order, so a node that starts refusing or rate-limiting us
 /// is skipped transparently.
-pub fn select_live_node(mut config: RpcConfig, last_working: Option<&str>) -> (RpcConfig, String, u64) {
+pub fn select_live_node(
+    mut config: RpcConfig,
+    last_working: Option<&str>,
+    avoid: &[String],
+) -> (RpcConfig, String, u64) {
     if let Some(node) = config.manual_node() {
         let height = probe_daemon_height(&node, Duration::from_secs(8)).unwrap_or(0);
         if height == 0 {
@@ -95,6 +104,8 @@ pub fn select_live_node(mut config: RpcConfig, last_working: Option<&str>) -> (R
     for n in PUBLIC_NODES {
         if !candidates.iter().any(|c| c == n) { candidates.push(n.to_string()); }
     }
+    // Nodes recently found slow go last (still used if nothing else answers).
+    candidates.sort_by_key(|c| avoid.contains(c));
 
     for node in &candidates {
         match probe_daemon_height(node, Duration::from_secs(6)) {
@@ -142,9 +153,46 @@ pub struct RpcManager {
     pub status: RpcStatus,
     /// PID file of the wallet-rpc spawned by this app (in the wallet dir).
     pid_file: Option<PathBuf>,
+    /// Config file carrying the RPC credentials, deleted once wallet-rpc has read it.
+    conf_file: Option<PathBuf>,
 }
 
 const PID_FILE_NAME: &str = "wallet-rpc.pid";
+const CONF_FILE_NAME: &str = "wallet-rpc.conf";
+
+/// RPC credentials of the wallet-rpc processes started by this app, by local port.
+static LOCAL_AUTH: std::sync::Mutex<Vec<(u16, String, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn local_auth(port: u16) -> Option<(String, String)> {
+    LOCAL_AUTH.lock().ok()?.iter().find(|(p, _, _)| *p == port).map(|(_, u, pw)| (u.clone(), pw.clone()))
+}
+
+fn set_local_auth(port: u16, creds: Option<(String, String)>) {
+    if let Ok(mut v) = LOCAL_AUTH.lock() {
+        v.retain(|(p, _, _)| *p != port);
+        if let Some((u, pw)) = creds { v.push((port, u, pw)); }
+    }
+}
+
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut b = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Write a file readable by the owner only.
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(content.as_bytes())
+}
 
 fn is_wallet_rpc_cmd(cmd: &str) -> bool {
     cmd.contains("autopay-wallet-rpc") || cmd.contains("monero-wallet-rpc")
@@ -253,7 +301,7 @@ pub fn shutdown_leftover(wallet_dir: &Path) {
 
 impl RpcManager {
     pub fn new(config: RpcConfig) -> Self {
-        Self { config, process: None, status: RpcStatus::Stopped, pid_file: None }
+        Self { config, process: None, status: RpcStatus::Stopped, pid_file: None, conf_file: None }
     }
 
     /// Try to find the `monero-wallet-rpc` binary.
@@ -321,7 +369,14 @@ impl RpcManager {
             log::debug!("[RPC] wallet-rpc stopped");
             if let Some(f) = self.pid_file.take() { let _ = std::fs::remove_file(f); }
         }
+        if let Some(f) = self.conf_file.take() { let _ = std::fs::remove_file(f); }
+        set_local_auth(self.config.rpc_port, None);
         self.status = RpcStatus::Stopped;
+    }
+
+    /// True while the spawned wallet-rpc process is alive.
+    pub fn is_alive(&mut self) -> bool {
+        self.process.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
     /// Start wallet-rpc in wallet-dir mode (no specific wallet pre-loaded).
@@ -386,13 +441,23 @@ impl RpcManager {
             }
         }
 
-        // --- 5. Spawn ---
+        // --- 5. Credentials ---
+        let creds = (random_hex(8), random_hex(24));
+        let conf_path = wallet_dir.join(CONF_FILE_NAME);
+        write_private(&conf_path, &format!("rpc-login={}:{}\n", creds.0, creds.1)).map_err(|e| {
+            let msg = format!("Cannot write wallet-rpc config: {e}");
+            log::error!("[RPC] {}", msg);
+            msg
+        })?;
+        self.conf_file = Some(conf_path.clone());
+
+        // --- 6. Spawn ---
         let args = [
             "--daemon-address", &daemon_addr,
             "--rpc-bind-ip", "127.0.0.1",
             "--rpc-bind-port", &port.to_string(),
             "--wallet-dir", wallet_dir.to_str().unwrap_or("."),
-            "--disable-rpc-login",
+            "--config-file", conf_path.to_str().unwrap_or(CONF_FILE_NAME),
             "--log-level", "0",        // suppress logs
             "--log-file", if cfg!(windows) { "NUL" } else { "/dev/null" }, // no 100MB+ log files
             "--non-interactive",
@@ -406,10 +471,12 @@ impl RpcManager {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
+                if let Some(f) = self.conf_file.take() { let _ = std::fs::remove_file(f); }
                 let msg = format!("Failed to spawn {:?}: {} — check binary permissions", binary, e);
                 log::error!("[RPC] {}", msg);
                 msg
             })?;
+        set_local_auth(port, Some(creds));
 
         log::debug!("[RPC] Process spawned, PID={:?}", child.id());
         let pid_file = wallet_dir.join(PID_FILE_NAME);
@@ -438,6 +505,7 @@ impl RpcManager {
                 Ok(_) => {
                     // Extra wait for the RPC server to fully initialise
                     std::thread::sleep(Duration::from_millis(400));
+                    if let Some(f) = &self.conf_file { let _ = std::fs::remove_file(f); }
                     log::debug!("[RPC] Ready after {} attempt(s)", attempts);
                     return Ok(());
                 }
@@ -587,75 +655,189 @@ fn ureq_post_json_timeout(url: &str, body: &serde_json::Value, timeout_secs: u64
 
 /// HTTP/1.0 JSON POST with bounded connect and read timeouts
 /// (a plain `TcpStream::connect` can hang for minutes on a node that drops packets).
+/// Answers a digest challenge from a wallet-rpc started by this app.
 fn http_post_json(
     url: &str,
     body: &serde_json::Value,
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    use std::io::{Read, Write};
-    use std::net::ToSocketAddrs;
-
     let method_hint = body.get("method").and_then(|m| m.as_str()).unwrap_or("?");
     log::debug!("[RPC/HTTP] POST {} method={}", url, method_hint);
 
-    // Parse host and path
     let without_scheme = url.trim_start_matches("http://");
     let slash_pos = without_scheme.find('/').unwrap_or(without_scheme.len());
     let host_port = &without_scheme[..slash_pos];
-    let path = &without_scheme[slash_pos..];
-
+    let path = if slash_pos < without_scheme.len() { &without_scheme[slash_pos..] } else { "/" };
     let body_str = body.to_string();
-    let request = format!(
-        "POST {path} HTTP/1.0\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
-        body_str.len()
-    );
 
-    let addrs: Vec<std::net::SocketAddr> = host_port.to_socket_addrs()
-        .map_err(|e| format!("Cannot resolve {}: {}", host_port, e))?
-        .collect();
-    let mut last_err = format!("No address for {}", host_port);
-    let mut stream = None;
-    for addr in &addrs {
-        match std::net::TcpStream::connect_timeout(addr, connect_timeout) {
-            Ok(s) => { stream = Some(s); break; }
-            Err(e) => last_err = e.to_string(),
+    let mut conn = HttpConn::open(host_port, connect_timeout, read_timeout)?;
+    let (mut status, headers, mut json_body) = conn.post(path, &body_str, None)?;
+    if status == 401 {
+        let creds = host_port.strip_prefix("127.0.0.1:")
+            .and_then(|p| p.parse::<u16>().ok())
+            .and_then(local_auth)
+            .ok_or_else(|| "wallet-rpc requires authentication (not started by this session)".to_string())?;
+        let challenge = digest_challenge(&headers)
+            .ok_or_else(|| "wallet-rpc sent no usable digest challenge".to_string())?;
+        let auth = digest_authorization(&challenge, &creds.0, &creds.1, path);
+        // The nonce is bound to this connection: answer on the same one.
+        (status, _, json_body) = conn.post(path, &body_str, Some(&auth))?;
+        if status == 401 {
+            log::error!("[RPC/HTTP] wallet-rpc rejected the session credentials");
+            return Err("wallet-rpc authentication failed".into());
         }
     }
-    let mut stream = stream.ok_or_else(|| {
-        let msg = format!("TCP connect to {} failed: {} (is wallet-rpc running?)", host_port, last_err);
-        log::error!("[RPC/HTTP] {}", msg);
-        msg
-    })?;
-    stream.set_read_timeout(Some(read_timeout)).ok();
-    stream.set_write_timeout(Some(connect_timeout)).ok();
-
-    stream.write_all(request.as_bytes()).map_err(|e| {
-        let msg = format!("Write to {} failed: {}", host_port, e);
-        log::error!("[RPC/HTTP] {}", msg);
-        msg
-    })?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).map_err(|e| {
-        let msg = format!("Read from {} failed: {}", host_port, e);
-        log::error!("[RPC/HTTP] {}", msg);
-        msg
-    })?;
-
-    let body_start = response.find("\r\n\r\n").ok_or_else(|| {
-        let msg = format!("Malformed HTTP response (no header/body separator, {}B)", response.len());
-        log::error!("[RPC/HTTP] {}", msg);
-        msg
-    })?;
-    let json_body = &response[body_start + 4..];
 
     // Bodies carry balances, addresses and tx hashes: only their size may be logged.
     log::debug!("[RPC/HTTP] {} response ({}B)", method_hint, json_body.len());
 
-    serde_json::from_str(json_body).map_err(|e| {
-        let msg = format!("JSON parse error: {} ({}B body)", e, json_body.len());
+    serde_json::from_str(&json_body).map_err(|e| {
+        let msg = format!("JSON parse error: {} ({}B body, HTTP {})", e, json_body.len(), status);
         log::error!("[RPC/HTTP] {}", msg);
         msg
     })
+}
+
+/// Keep-alive HTTP/1.1 connection (a digest challenge must be answered on the same one).
+struct HttpConn {
+    stream: std::net::TcpStream,
+    host_port: String,
+}
+
+impl HttpConn {
+    fn open(host_port: &str, connect_timeout: Duration, read_timeout: Duration) -> Result<Self, String> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = host_port.to_socket_addrs()
+            .map_err(|e| format!("Cannot resolve {}: {}", host_port, e))?
+            .collect();
+        let mut last_err = format!("No address for {}", host_port);
+        for addr in &addrs {
+            match std::net::TcpStream::connect_timeout(addr, connect_timeout) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(read_timeout)).ok();
+                    stream.set_write_timeout(Some(connect_timeout)).ok();
+                    return Ok(Self { stream, host_port: host_port.to_string() });
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        let msg = format!("TCP connect to {} failed: {} (is wallet-rpc running?)", host_port, last_err);
+        log::error!("[RPC/HTTP] {}", msg);
+        Err(msg)
+    }
+
+    /// One POST. Returns (status, raw headers, body).
+    fn post(&mut self, path: &str, body: &str, authorization: Option<&str>) -> Result<(u16, String, String), String> {
+        use std::io::{Read, Write};
+        let host_port = self.host_port.clone();
+        let fail = |what: &str, e: &dyn std::fmt::Display| {
+            let msg = format!("{} {} failed: {}", what, host_port, e);
+            log::error!("[RPC/HTTP] {}", msg);
+            msg
+        };
+
+        let auth_line = authorization.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+        // Keep-alive only towards the local wallet-rpc; remote nodes (often behind a proxy that
+        // may answer HTTP/1.1 with chunked bodies) get a plain HTTP/1.0 request.
+        let (version, connection) = if host_port.starts_with("127.0.0.1:") {
+            ("HTTP/1.1", "keep-alive")
+        } else {
+            ("HTTP/1.0", "close")
+        };
+        let request = format!(
+            "POST {path} {version}\r\nHost: {host_port}\r\nContent-Type: application/json\r\n{auth_line}Content-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
+            body.len()
+        );
+        self.stream.write_all(request.as_bytes()).map_err(|e| fail("Write to", &e))?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break pos; }
+            let n = self.stream.read(&mut chunk).map_err(|e| fail("Read from", &e))?;
+            if n == 0 {
+                let msg = format!("Malformed HTTP response (no header/body separator, {}B)", buf.len());
+                log::error!("[RPC/HTTP] {}", msg);
+                return Err(msg);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let status = headers.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let content_length = headers.lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+        let mut body_bytes = buf[header_end + 4..].to_vec();
+        loop {
+            if content_length.is_some_and(|len| body_bytes.len() >= len) { break; }
+            let n = self.stream.read(&mut chunk).map_err(|e| fail("Read from", &e))?;
+            if n == 0 { break; }
+            body_bytes.extend_from_slice(&chunk[..n]);
+        }
+        if let Some(len) = content_length { body_bytes.truncate(len); }
+        Ok((status, headers, String::from_utf8_lossy(&body_bytes).to_string()))
+    }
+}
+
+/// Parameters of the plain-MD5 digest challenge among the WWW-Authenticate headers.
+fn digest_challenge(headers: &str) -> Option<Vec<(String, String)>> {
+    headers.lines()
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            if !name.trim().eq_ignore_ascii_case("www-authenticate") { return None; }
+            let value = value.trim();
+            if !value.get(..7)?.eq_ignore_ascii_case("digest ") { return None; }
+            Some(parse_auth_params(&value[7..]))
+        })
+        .find(|params| params.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("algorithm"))
+            .is_none_or(|(_, v)| v.eq_ignore_ascii_case("MD5")))
+}
+
+fn parse_auth_params(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = s.trim();
+    while let Some((key, after)) = rest.split_once('=') {
+        let key = key.trim().trim_start_matches(',').trim().to_string();
+        let after = after.trim_start();
+        let (value, next) = if let Some(quoted) = after.strip_prefix('"') {
+            let end = quoted.find('"').unwrap_or(quoted.len());
+            (quoted[..end].to_string(), quoted.get(end + 1..).unwrap_or(""))
+        } else {
+            let end = after.find(',').unwrap_or(after.len());
+            (after[..end].trim().to_string(), &after[end..])
+        };
+        out.push((key, value));
+        rest = next.trim_start_matches([',', ' ']);
+    }
+    out
+}
+
+fn md5_hex(data: &str) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(data.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// RFC 2617 digest response for a POST (qop=auth when offered).
+fn digest_authorization(params: &[(String, String)], user: &str, pass: &str, uri: &str) -> String {
+    let get = |k: &str| params.iter().find(|(pk, _)| pk.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str());
+    let realm = get("realm").unwrap_or("");
+    let nonce = get("nonce").unwrap_or("");
+    let ha1 = md5_hex(&format!("{user}:{realm}:{pass}"));
+    let ha2 = md5_hex(&format!("POST:{uri}"));
+    let mut header = format!("Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", algorithm=MD5");
+    if get("qop").is_some_and(|q| q.split(',').any(|v| v.trim() == "auth")) {
+        let cnonce = random_hex(8);
+        let nc = "00000001";
+        let response = md5_hex(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"));
+        header.push_str(&format!(", response=\"{response}\", qop=auth, nc={nc}, cnonce=\"{cnonce}\""));
+    } else {
+        header.push_str(&format!(", response=\"{}\"", md5_hex(&format!("{ha1}:{nonce}:{ha2}"))));
+    }
+    if let Some(opaque) = get("opaque") {
+        header.push_str(&format!(", opaque=\"{opaque}\""));
+    }
+    header
 }

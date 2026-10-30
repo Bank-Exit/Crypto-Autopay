@@ -53,6 +53,8 @@ pub struct AppState {
     pub wallet_address: Option<String>,
     /// Cached XMR balance (piconero units, refreshed at unlock time).
     pub balance_atomic: u64,
+    /// Spendable part of the balance: change from a recent send stays locked for 10 blocks.
+    pub unlocked_balance_atomic: u64,
     /// Whether the last RPC session succeeded (used for UI status dot).
     pub rpc_connected: bool,
     /// Last RPC error message (None = no error or not yet tried).
@@ -105,6 +107,8 @@ pub struct AppState {
     pub payment_limits: payment_policy::PaymentLimits,
     /// Unix timestamp of the last wallet refresh attempt (UI or background).
     pub last_refresh_at: i64,
+    /// Nodes found too slow or failing, with the Unix time until which they are avoided.
+    pub slow_nodes: std::collections::HashMap<String, i64>,
     /// Last readiness verdict logged, so the log only records changes.
     pub ready_state: Option<&'static str>,
 }
@@ -145,7 +149,9 @@ async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Str
     if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
     if let Some(mut key) = s.history_key.take() { key.zeroize(); }
     // Keep wallet_address cached (it's in the .address file anyway)
-    log::info!("[Security] Wallet locked (auto-lock or manual)");
+    log::info!("[Security] Wallet locked — session ended");
+    drop(s);
+    end_wallet_session("wallet locked");
     Ok(())
 }
 
@@ -353,6 +359,8 @@ async fn unlock_wallet(
 
     let rpc_result: Result<(String, f64), (String, bool)> = tokio::task::spawn_blocking(move || {
         log::debug!("[Unlock/RPC] spawn_blocking started");
+        // The wallet files may be recreated below: no other process may hold them.
+        stop_wallet_session("unlock");
         let (mut mgr, _) = live_rpc_manager(&app_rpc);
         log::debug!("[Unlock/RPC] Using daemon: {}, port: {}", mgr.daemon_address(), mgr.config_port());
 
@@ -441,8 +449,8 @@ async fn unlock_wallet(
             });
             (addr, bal)
         };
-        log::debug!("[Unlock/RPC] Session complete — stopping wallet-rpc");
-        mgr.stop();
+        log::debug!("[Unlock/RPC] Session complete — wallet-rpc kept for the session");
+        return_wallet_session(mgr);
         Ok::<(String, f64), (String, bool)>((address, balance))
     })
     .await
@@ -540,32 +548,27 @@ async fn sweep_all(
         return Err("Invalid Monero address (expected 95-106 characters).".to_string());
     }
 
-    let (wallet_name, wallet_dir, password) = {
+    let (wallet_name, wallet_dir, password, rpc_busy) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Wallet is locked.".to_string()); }
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
         let pw = s.session_password.clone().ok_or("No session password")?;
-        (wn, wd, pw)
+        (wn, wd, pw, Arc::clone(&s.rpc_busy))
     };
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err(RPC_BUSY.into());
+    }
 
     log::info!("[Sweep] Initiating sweep_all");
 
     let app_rpc = app_handle.clone();
     let tx_hash = tokio::task::spawn_blocking(move || {
-        let (mut mgr, _) = live_rpc_manager(&app_rpc);
-        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
-
-        // Open wallet
-        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"open","method":"open_wallet",
-            "params":{"filename":wallet_name,"password":password}
-        })).map_err(|e| e.to_string())?;
-        if let Some(err) = open.get("error") {
-            return Err(format!("open_wallet error: {}", err));
-        }
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(rpc_busy);
+        let mgr = take_wallet_session(&app_rpc, &wallet_dir, &wallet_name, &password)?;
 
         // sweep_all
         let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
@@ -575,9 +578,8 @@ async fn sweep_all(
                 "account_index": 0,
                 "get_tx_hex": false
             }
-        })).map_err(|e| e.to_string())?;
-
-        mgr.stop();
+        }))?;
+        return_wallet_session(mgr);
 
         if let Some(err) = resp.get("error") {
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
@@ -641,23 +643,12 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
             app_rpc.emit("wallet-sync", payload).ok();
         };
 
-        progress("node", serde_json::json!({}));
-        let (mut mgr, daemon_height_before) = live_rpc_manager(&app_rpc);
-        progress("starting", serde_json::json!({ "node": mgr.daemon_address() }));
-        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
-
         progress("opening", serde_json::json!({}));
-        let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"open","method":"open_wallet",
-            "params":{"filename":wallet_name,"password":password}
-        })).map_err(|e| e.to_string())?;
-        if let Some(err) = open_resp.get("error") {
-            log::warn!("[refresh_balance] open_wallet error: {}", err);
-        }
+        let mgr = take_wallet_session(&app_rpc, &wallet_dir, &wallet_name, &password)?;
+        let daemon_height_before = rpc_manager::get_daemon_block_height(&mgr.daemon_address());
 
-        // wallet-rpc starts its own background refresh right after open_wallet and then
-        // answers nothing until it is done, so get_height often times out here.
+        // wallet-rpc refreshes on its own in the background and answers nothing meanwhile,
+        // so get_height often times out here.
         // Fall back to the height saved after the previous successful sync.
         let synced_height_file = wallet_dir.join(format!("{}.synced_height", wallet_name));
         let height_body = serde_json::json!({ "jsonrpc":"2.0","id":"h","method":"get_height","params":{} });
@@ -682,6 +673,7 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
         progress("syncing", serde_json::json!({ "blocks_behind": blocks_behind }));
 
         // A wallet that was closed for days can need several minutes on a remote node.
+        let refresh_started = std::time::Instant::now();
         let refresh_resp = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"refresh","method":"refresh",
             "params":{"start_height":0}
@@ -708,7 +700,8 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
             }
         }
 
-        let (total, _unlocked) = mgr.rpc_get_balance()?;
+        let (total, unlocked) = mgr.rpc_get_balance()?;
+        let unlocked_atomic = (unlocked * 1e12) as u64;
         let atomic = (total * 1e12) as u64;
         log::debug!("[Sync] Balance read");
 
@@ -729,14 +722,35 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
         };
 
         let node = mgr.daemon_address();
-        mgr.stop();
-        Ok::<_, String>((total, atomic, wallet_height, node, daemon_height_before, address))
+        // A slow or failed sync comes from the node most of the time: avoid it for a while and
+        // restart wallet-rpc on another one next time.
+        let fetched = refresh_resp.as_ref().ok()
+            .and_then(|r| r["result"]["blocks_fetched"].as_u64()).unwrap_or(0);
+        let secs = refresh_started.elapsed().as_secs();
+        let too_slow = secs > SLOW_SYNC_SECS && fetched < SLOW_SYNC_MAX_BLOCKS;
+        if refresh_resp.is_err() || too_slow {
+            if too_slow {
+                log::warn!("[Node] 🐢 {} too slow ({}s for {} block(s)) — switching node", node, secs, fetched);
+            } else {
+                log::warn!("[Node] {} failed to sync — switching node", node);
+            }
+            if let Some(st) = app_rpc.try_state::<Mutex<AppState>>() {
+                if let Ok(mut s) = st.lock() {
+                    s.slow_nodes.insert(node.clone(), chrono::Utc::now().timestamp() + SLOW_NODE_AVOID_SECS);
+                    if s.active_node.as_deref() == Some(node.as_str()) { s.active_node = None; }
+                }
+            }
+            drop(mgr);
+        } else {
+            return_wallet_session(mgr);
+        }
+        Ok::<_, String>((total, atomic, unlocked_atomic, wallet_height, node, daemon_height_before, address))
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
 
-    let (xmr, atomic, wallet_height, daemon_addr, daemon_height_before, address) = match rpc_result {
+    let (xmr, atomic, unlocked_atomic, wallet_height, daemon_addr, daemon_height_before, address) = match rpc_result {
         Ok(v) => v,
         Err(e) => {
             log::warn!("[Sync] Wallet refresh failed: {}", e);
@@ -763,6 +777,7 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
 
     if let Ok(mut s) = state.lock() {
         s.balance_atomic = atomic;
+        s.unlocked_balance_atomic = unlocked_atomic;
         s.rpc_connected = true;
         s.rpc_last_error = None;
         if address.is_some() { s.wallet_address = address; }
@@ -795,6 +810,12 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
     app_handle.emit("wallet-refreshed", serde_json::json!({ "ok": true, "balance": &resp })).ok();
     Ok(resp)
 }
+
+/// A sync slower than this with few blocks to fetch means the node is the bottleneck.
+const SLOW_SYNC_SECS: u64 = 60;
+const SLOW_SYNC_MAX_BLOCKS: u64 = 200;
+/// How long a slow or failing node is avoided.
+const SLOW_NODE_AVOID_SECS: i64 = 3600;
 
 /// Routine syncs (a few blocks every 2 min) are only logged at debug level.
 const SYNC_LOG_MIN_BLOCKS: u64 = 20;
@@ -1676,15 +1697,84 @@ fn get_public_nodes() -> Vec<String> {
 /// Build an RpcManager from the saved settings on a node that currently answers
 /// (automatic failover when no node is pinned). Blocking: probes nodes over the network.
 /// Also returns the selected node's height (0 if no node answered).
+/// The session's wallet-rpc, kept running between operations (see the rpc_manager module docs).
+static WALLET_SESSION: Mutex<Option<RpcManager>> = Mutex::new(None);
+/// Set when the session must end while an operation is using it: stopped when handed back.
+static WALLET_SESSION_INVALIDATED: AtomicBool = AtomicBool::new(false);
+
+/// The session wallet-rpc with the wallet open, started if needed. Callers hold `rpc_busy`.
+/// Hand it back with `return_wallet_session`; dropping it instead (error paths) stops it,
+/// and the next operation starts a fresh one.
+fn take_wallet_session(
+    app: &tauri::AppHandle,
+    wallet_dir: &std::path::Path,
+    wallet_name: &str,
+    password: &str,
+) -> Result<RpcManager, String> {
+    let existing = WALLET_SESSION.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut mgr) = existing {
+        if mgr.is_alive() { return Ok(mgr); }
+        log::warn!("[RPC] Wallet RPC exited unexpectedly — restarting it");
+        mgr.stop();
+    }
+    WALLET_SESSION_INVALIDATED.store(false, Ordering::SeqCst);
+    let (mut mgr, _) = live_rpc_manager(app);
+    mgr.start_for_dir(wallet_dir)?;
+    mgr.wait_for_ready(std::time::Duration::from_secs(15))?;
+    let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        "jsonrpc":"2.0","id":"open","method":"open_wallet",
+        "params":{"filename":wallet_name,"password":password}
+    }))?;
+    if let Some(err) = open.get("error") {
+        return Err(format!("open_wallet error: {}", err["message"].as_str().unwrap_or("?")));
+    }
+    log::info!("[RPC] Wallet RPC started, wallet open (node {})", mgr.daemon_address());
+    Ok(mgr)
+}
+
+fn return_wallet_session(mut mgr: RpcManager) {
+    if WALLET_SESSION_INVALIDATED.swap(false, Ordering::SeqCst) {
+        log::info!("[RPC] Stopping wallet RPC (session ended during the operation)");
+        mgr.stop();
+        return;
+    }
+    if let Ok(mut g) = WALLET_SESSION.lock() {
+        if let Some(mut old) = g.replace(mgr) { old.stop(); }
+    }
+}
+
+/// Save the wallet and stop the session wallet-rpc (full lock, node change, app exit).
+/// Blocks while the wallet is saved.
+fn stop_wallet_session(reason: &str) {
+    let existing = WALLET_SESSION.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut mgr) = existing {
+        log::info!("[RPC] Stopping wallet RPC ({})", reason);
+        mgr.stop();
+    }
+}
+
+/// End the session wallet-rpc without blocking the caller. One in use by an operation stops
+/// when handed back; otherwise the flag is cleared by the next fresh start.
+fn end_wallet_session(reason: &'static str) {
+    WALLET_SESSION_INVALIDATED.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || stop_wallet_session(reason));
+}
+
 fn live_rpc_manager(app: &tauri::AppHandle) -> (RpcManager, u64) {
-    let (config, last_working) = match app.try_state::<Mutex<AppState>>() {
+    let now = chrono::Utc::now().timestamp();
+    let (config, last_working, avoid) = match app.try_state::<Mutex<AppState>>() {
         Some(st) => match st.lock() {
-            Ok(s) => (s.rpc.config.clone(), s.active_node.clone()),
-            Err(_) => (RpcConfig::default(), None),
+            Ok(mut s) => {
+                s.slow_nodes.retain(|_, until| *until > now);
+                let avoid: Vec<String> = s.slow_nodes.keys().cloned().collect();
+                let last = s.active_node.clone().filter(|n| !avoid.contains(n));
+                (s.rpc.config.clone(), last, avoid)
+            }
+            Err(_) => (RpcConfig::default(), None, Vec::new()),
         },
-        None => (RpcConfig::default(), None),
+        None => (RpcConfig::default(), None, Vec::new()),
     };
-    let (config, node, height) = rpc_manager::select_live_node(config, last_working.as_deref());
+    let (config, node, height) = rpc_manager::select_live_node(config, last_working.as_deref(), &avoid);
     if height > 0 {
         if let Some(st) = app.try_state::<Mutex<AppState>>() {
             if let Ok(mut s) = st.lock() {
@@ -1751,6 +1841,8 @@ fn save_rpc_config(
     let mut s = state.lock().unwrap();
     if let Some(node) = config.manual_node() { s.active_node = Some(node); }
     s.rpc = RpcManager::new(config);
+    drop(s);
+    end_wallet_session("node settings changed");
     Ok(())
 }
 
@@ -1759,6 +1851,8 @@ fn save_rpc_config(
 fn stop_wallet_rpc(state: tauri::State<'_, Mutex<AppState>>) {
     let mut s = state.lock().unwrap();
     s.rpc.stop();
+    drop(s);
+    end_wallet_session("requested");
 }
 
 /// Delete a subscription by id.
@@ -1945,18 +2039,7 @@ async fn execute_pv_payment(
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(rpc_busy);
 
-        let (mut mgr, _) = live_rpc_manager(&app_rpc);
-        mgr.start_for_dir(&wallet_dir).map_err(|e| e.to_string())?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
-
-        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"open","method":"open_wallet",
-            "params":{"filename":wallet_name,"password":password}
-        })).map_err(|e| e.to_string())?;
-        if let Some(err) = open.get("error") {
-            mgr.stop();
-            return Err(format!("open_wallet: {}", err));
-        }
+        let mgr = take_wallet_session(&app_rpc, &wallet_dir, &wallet_name, &password)?;
 
         if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"refresh","method":"refresh","params":{}
@@ -1972,8 +2055,8 @@ async fn execute_pv_payment(
                 "priority": 1,
                 "get_tx_key": false
             }
-        })).map_err(|e| e.to_string());
-        mgr.stop();
+        }));
+        return_wallet_session(mgr);
         let resp = resp?;
 
         if let Some(err) = resp.get("error") {
@@ -2072,17 +2155,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
         impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _guard = RpcGuard(rpc_busy);
 
-        let (mut mgr, _) = live_rpc_manager(&app_rpc);
-        mgr.start_for_dir(&wallet_dir2).map_err(|e| e.to_string())?;
-        mgr.wait_for_ready(std::time::Duration::from_secs(15)).map_err(|e| e.to_string())?;
-
-        let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"o","method":"open_wallet",
-            "params":{"filename":wallet_name2,"password":pw2}
-        })).map_err(|e| e.to_string())?;
-        if let Some(err) = open.get("error") {
-            return Err(format!("open_wallet: {}", err));
-        }
+        let mgr = take_wallet_session(&app_rpc, &wallet_dir2, &wallet_name2, &pw2)?;
 
         // Spend from an up-to-date wallet, otherwise stale outputs make the transfer fail.
         if let Err(e) = rpc_manager::ureq_post_json_long(&mgr.rpc_url(), &serde_json::json!({
@@ -2097,8 +2170,8 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
                 "destinations":[{"amount": amount_pico, "address": dest}],
                 "account_index": 0, "priority": 1
             }
-        })).map_err(|e| e.to_string());
-        mgr.stop();
+        }));
+        return_wallet_session(mgr);
         let resp = resp?;
 
         if let Some(err) = resp.get("error") {
@@ -2274,13 +2347,14 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
     log::debug!("[Scheduler] {} subscription(s) due", due.len());
 
     // Read semi-auto state once before the loop
-    let (semi_auto, approved_ids, limits, balance_known) = {
+    let (semi_auto, approved_ids, limits, balance_known, unlocked_known) = {
         if let Some(state) = app.try_state::<Mutex<AppState>>() {
             if let Ok(mut s) = state.lock() {
                 let semi = s.semi_auto_mode;
                 let approved: std::collections::HashSet<String> = s.approved_payments.drain().collect();
                 let balance = if s.rpc_connected { Some(s.balance_atomic) } else { None };
-                (semi, approved, s.payment_limits.clone(), balance)
+                let unlocked = if s.rpc_connected { Some(s.unlocked_balance_atomic) } else { None };
+                (semi, approved, s.payment_limits.clone(), balance, unlocked)
             } else { return; }
         } else { return; }
     };
@@ -2323,6 +2397,14 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 log::debug!("[Scheduler] Sub {} due but balance too low — waiting for funds", short_id);
                 continue;
             }
+        }
+        // Enough funds but part of them still confirming (change of a recent send):
+        // neither prompt nor send until they are spendable. Survives app restarts, unlike
+        // the in-memory cooldown.
+        if unlocked_known.is_some_and(|u| u < needed) {
+            log::debug!("[Scheduler] Sub {} due but funds still confirming — waiting", short_id);
+            restore_approvals(&approved_ids);
+            continue;
         }
 
         // Subscriptions paid before this check existed are trusted as-is.
@@ -2511,6 +2593,8 @@ pub fn run() {
                 payment_limits: payment_policy::PaymentLimits::load(&data_dir),
                 treasurer_mode: false,
                 last_refresh_at: 0,
+                slow_nodes: std::collections::HashMap::new(),
+                unlocked_balance_atomic: 0,
                 ready_state: None,
             }));
 
@@ -2690,6 +2774,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                stop_wallet_session("app exit");
                 if let Ok(dir) = app.path().app_data_dir() {
                     rpc_manager::shutdown_leftover(&dir);
                 }

@@ -229,6 +229,7 @@ export default {
   payContinueBackground: "Continuer en arrière-plan",
   paySendAfterSync: "Synchronisation en cours : l'envoi partira automatiquement dès qu'elle sera terminée.",
   paySendScheduled: "Envoi approuvé : il partira automatiquement dans quelques minutes.",
+  payFundsConfirming: "Rien n'a été envoyé : une partie des fonds est encore en confirmation (envoi précédent). Nouvel essai automatique dans 25 min.",
   mediaLabel: "Le Média Libre",
 
   // Unlock

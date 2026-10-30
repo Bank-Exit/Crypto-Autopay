@@ -229,6 +229,7 @@ export default {
   payContinueBackground: "Im Hintergrund fortfahren",
   paySendAfterSync: "Synchronisierung läuft: Die Zahlung wird automatisch gesendet, sobald sie abgeschlossen ist.",
   paySendScheduled: "Zahlung bestätigt: Sie wird in wenigen Minuten automatisch gesendet.",
+  payFundsConfirming: "Nichts wurde gesendet: Ein Teil des Guthabens wird noch bestätigt (vorherige Zahlung). Automatischer neuer Versuch in 25 Min.",
   mediaLabel: "Le Média Libre",
 
   // Unlock
