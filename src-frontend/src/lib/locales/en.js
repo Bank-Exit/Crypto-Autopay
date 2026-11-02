@@ -457,7 +457,7 @@ export default {
   logsRetentionOff: "Off (no technical logs)",
   logsRetentionDays: "days",
   logsRetentionHint: "Sliding window: older lines are removed from the log file and from this list (checked every hour). Logs never contain amounts or addresses.",
-  logsNote: "⚠ These logs contain no amount, address or personal data. They are kept in RAM only and erased at every restart.",
+  logsNote: "⚠ These logs contain no amount, address or personal data. They are kept in a local file readable only by your account, for the period chosen below.",
   logsFilterAll: "All",
   logsFilterInfo: "Info",
   logsFilterWarn: "Warnings",

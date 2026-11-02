@@ -457,7 +457,7 @@ export default {
   logsRetentionOff: "Desactivado (sin logs técnicos)",
   logsRetentionDays: "días",
   logsRetentionHint: "Ventana deslizante: las líneas más antiguas se borran del archivo de logs y de esta lista (comprobado cada hora). Los logs nunca contienen importes ni direcciones.",
-  logsNote: "⚠ Estos registros no contienen importes, direcciones ni datos personales. Se guardan solo en RAM y se borran en cada reinicio.",
+  logsNote: "⚠ Estos registros no contienen importes, direcciones ni datos personales. Se guardan en un archivo local legible solo por su cuenta, durante el periodo elegido abajo.",
   logsFilterAll: "Todo",
   logsFilterInfo: "Info",
   logsFilterWarn: "Advertencias",

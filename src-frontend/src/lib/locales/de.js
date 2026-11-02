@@ -457,7 +457,7 @@ export default {
   logsRetentionOff: "Aus (keine technischen Logs)",
   logsRetentionDays: "Tage",
   logsRetentionHint: "Gleitendes Fenster: ältere Zeilen werden aus der Logdatei und dieser Liste gelöscht (stündlich geprüft). Logs enthalten weder Beträge noch Adressen.",
-  logsNote: "⚠ Diese Protokolle enthalten keine Beträge, Adressen oder persönlichen Daten. Sie werden nur im Arbeitsspeicher gehalten und bei jedem Neustart gelöscht.",
+  logsNote: "⚠ Diese Protokolle enthalten keine Beträge, Adressen oder persönlichen Daten. Sie werden in einer lokalen, nur für Ihr Konto lesbaren Datei für die unten gewählte Dauer aufbewahrt.",
   logsFilterAll: "Alle",
   logsFilterInfo: "Info",
   logsFilterWarn: "Warnungen",

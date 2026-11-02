@@ -457,7 +457,7 @@ export default {
   logsRetentionOff: "Désactivé (aucun log technique)",
   logsRetentionDays: "jours",
   logsRetentionHint: "Fenêtre glissante : les lignes plus anciennes sont effacées du fichier de logs et de cette liste (vérifié toutes les heures). Les logs ne contiennent ni montant ni adresse.",
-  logsNote: "⚠ Ces journaux ne contiennent aucun montant, adresse ou donnée personnelle. Ils sont stockés uniquement en RAM et effacés à chaque redémarrage.",
+  logsNote: "⚠ Ces journaux ne contiennent aucun montant, adresse ou donnée personnelle. Ils sont conservés dans un fichier local réservé à votre compte, pendant la durée choisie ci-dessous.",
   logsFilterAll: "Tout",
   logsFilterInfo: "Info",
   logsFilterWarn: "Avertissements",

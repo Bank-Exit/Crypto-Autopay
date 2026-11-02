@@ -17,6 +17,7 @@ Alerts are displayed in two places:
 | `CANARY_EXPIRED` | A subscription's canary URL returns `{"expired": true}` or HTTP 410 | "Canary expiré — {label}" |
 | `PAYMENT_OVERDUE_HARD` | `next_payment_at` + 24h has passed and no payment confirmed | "Retard critique : {label} — tolérance dépassée" |
 | `OFFLINE_WITH_PENDING` | No daemon contact for >24h AND at least one Active sub has `next_payment_at` within the next 7 days | "Hors ligne depuis {N}h — des paiements sont prévus dans les 7 prochains jours" |
+| `RPC_BINARY_MISSING` | The bundled `autopay-wallet-rpc` cannot be found or started | "Moteur Monero introuvable" |
 
 **Red = tray icon shows red dot. App stays in tray. User must act.**
 
@@ -31,8 +32,9 @@ Alerts are displayed in two places:
 | `PAYMENT_OVERDUE_SOFT` | `next_payment_at` + 1h has passed (within 24h tolerance) | "Paiement en retard : {label} (dans la tolérance)" |
 | `PAYMENT_FAILED` | `transfer` RPC call returned an error (e.g. "not enough money") | "Échec de paiement — {label}" |
 | `OUTPUTS_LOCKED` | Wallet outputs locked (unconfirmed outputs), retry in 25 min | "Fonds verrouillés — {label}" |
-| `WALLET_NOT_SYNCED` | `blocks_behind` > 1000 after a refresh | "Wallet non synchronisé avec la blockchain" |
-| `PAYMENT_BLOCKED_LIMITS` | A due subscription breaks the payment limits (see below), e.g. after a limit was re-locked | "{label} — envoi suspendu. {raison}" |
+| `WALLET_NOT_SYNCED` | Wallet more than 10 blocks behind the node for more than 30 min | "Wallet non synchronisé avec la blockchain" |
+| `NODE_STALLED` | The node answers but its height has not moved for 30 min (stale chain / eclipse); an automatic node is rotated away, a pinned one is only alerted | "Le nœud Monero ne reçoit plus de blocs — changement de nœud" |
+| `PAYMENT_BLOCKED_LIMITS` | A due subscription breaks the payment limits or a sending guard (see below), e.g. after a limit was re-locked | "{label} — envoi suspendu. {raison}" |
 | `BALANCE_SHORT_UPCOMING` | Payments due within 48 h exceed the known balance (one grouped alert) | "{N} paiement(s) prévu(s) dans les 48 h dépassent le solde disponible…" |
 
 `PAYMENT_FAILED`, `OUTPUTS_LOCKED` and `PAYMENT_BLOCKED_LIMITS` are event alerts: they survive
@@ -55,15 +57,30 @@ scheduler before every send. Errors are returned as `POLICY:<CODE>[:detail]` and
 | Absolute floor | 10 min between two cron occurrences (`*/25` has a 10 min gap); the 25 min send cooldown still applies | `CADENCE_BELOW_FLOOR` |
 | Monthly total | Adding a sub that brings the projection above 1 XMR / 30 days needs `confirm_monthly` | `MONTHLY_TOTAL:<xmr>` |
 
-Unlocks are stored in `payment_limits.json`; re-locking never needs the password.
+Unlocks are sealed in `policy.vault` (AES-256-GCM, key from the master password); re-locking never needs the password.
+A tampered or deleted vault falls back to the strict defaults.
+
+### Sending guards (checked right before every transfer, from the wallet's own outgoing transfers)
+
+| Guard | Default | Code |
+|---|---|---|
+| Wallet cap: % of balance or fixed XMR over 7/30/90 days | 33 % / 30 days | `WALLET_CAP:<remaining>` |
+| Balance floor | off | `BALANCE_FLOOR:<floor>` |
+| Max sends over 24 h | off | `DAILY_SENDS:<n>` |
+| Per-subscription cap over 30 days | none | `SUB_CAP:<remaining>` |
+| Delay before the first payment to a new address | off | `NEW_ADDRESS_DELAY:<hours>` |
+| Network fee cap (transaction prepared with `do_not_relay`, relayed only if the fee is below) | 0.001 XMR | `FEE_CAP:<cap>` |
+
+A held payment is retried after 1 h; nothing is sent. Loosening any guard asks for the master password.
 
 Confirmation before a send (even in auto mode), via `payment-pending` + `approve_payment`:
 - `first_payment`: no approved terms for this subscription yet;
-- `terms_changed`: blake3 fingerprint of (address, amount, currency, schedule) differs from the approved one (`approved_terms.json`);
+- `terms_changed`: blake3 fingerprint of (address, amount, currency, schedule) differs from the approved one (sealed in `policy.vault`);
 - `high_amount`: amount >= 1 XMR (every time);
 - `semi_auto`: semi-auto mode is on.
 
-Next due dates follow the cron calendar (`next_after`), not a fixed period.
+Next due dates follow the cron calendar (`next_after`), not a fixed period. After a send, slots that fall
+inside the 25-minute cooldown are skipped.
 
 ---
 
@@ -104,7 +121,12 @@ When enabled (default: **on**):
 When disabled ("auto" mode):
 - Payments are sent immediately when due, without any user confirmation.
 
-The mode is persisted in `localStorage` on the frontend and synchronised to the Rust `AppState.semi_auto_mode` on startup and every change.
+The mode is sealed in `policy.vault` with the other policy settings (`AppState.semi_auto_mode`).
+
+## Global pause
+
+Tray menu "Mettre en pause les paiements" or Settings > Payment mode. While paused the scheduler sends
+nothing (`PAUSED`), a banner offers Resume. Persisted in `policy.vault`.
 
 ---
 
@@ -117,4 +139,6 @@ Configurable in Settings > Alertes:
 Default enabled kinds:
 `BALANCE_LOW`, `BALANCE_EMPTY`, `PAYMENT_FAILED`, `CANARY_EXPIRED`, `CANARY_UNREACHABLE`,
 `PAYMENT_OVERDUE_SOFT`, `PAYMENT_OVERDUE_HARD`, `WALLET_NOT_SYNCED`, `OUTPUTS_LOCKED`, `OFFLINE_WITH_PENDING`,
-`PAYMENT_BLOCKED_LIMITS`, `BALANCE_SHORT_UPCOMING`
+`PAYMENT_BLOCKED_LIMITS`, `BALANCE_SHORT_UPCOMING`, `NODE_STALLED`
+
+`OUTPUTS_LOCKED`, `WALLET_NOT_SYNCED`, `NODE_STALLED` and `RPC_BINARY_MISSING` cannot be turned off.

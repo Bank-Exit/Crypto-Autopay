@@ -26,12 +26,14 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 │  └── calls: spawn_blocking → RpcManager::start_for_dir  │
 │                                                         │
 │  ─── HTTP 127.0.0.1:18083 ───────────────────────────► │
-│       monero-wallet-rpc (external process, short-lived) │
+│       monero-wallet-rpc (sidecar, one per session)      │
 │       └── TCP → daemon node (opennode.xmr-tw.org:18089) │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Key architectural choice**: `monero-wallet-rpc` is **started on demand and stopped immediately after** each operation (balance refresh, payment). It is never kept running between operations. This minimises the attack surface but means every refresh spawns + kills a process.
+**Key architectural choice**: one `monero-wallet-rpc` per unlocked session (`WALLET_SESSION`), bound to `127.0.0.1:18083` with random digest credentials, wallet kept open between operations (`take_wallet_session` / `return_wallet_session`, serialised by `rpc_busy`). It is stopped by `end_wallet_session` on lock, node switch (slow, unreachable or stalled node) or when an operation fails and drops it; the next operation starts a fresh one.
+
+> The state diagram below still shows the earlier start/stop-per-operation flow; the steps inside one operation are unchanged.
 
 ---
 
@@ -106,8 +108,8 @@ This document maps every possible state of the RPC subsystem, their causes, impl
           │ get_balance()    │  failure → Err (never reported as 0)
           └────────┬─────────┘
                    │
-  RpcManager::stop() called in all paths (RAII)
-  monero-wallet-rpc process killed, rpc_busy cleared
+  session handed back (kept running), rpc_busy cleared;
+  on error the session is dropped and stopped
                    │
                    ▼  (outside the lock)
           ┌───────────────────────────────┐

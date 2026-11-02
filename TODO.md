@@ -10,10 +10,10 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **RPC error UX**: All 10 error cases from `docs/RPC_states.md` must have friendly, actionable messages for non-technical users. Currently some show raw error strings. See Case A–J in RPC_states.md.
 - [ ] **Tray zombie on crash**: If the app is force-killed (`kill -9`), the tray icon may remain. Add a PID lockfile or use the single-instance plugin's cleanup hook to remove the tray on startup if a stale one exists.
 - [ ] **Window restore**: Single-instance plugin now correctly calls `show() + unminimize() + set_focus()`. Verify on all 3 platforms (Linux, Windows, macOS) that clicking the tray icon always brings the window to front.
-- [ ] **System notifications (semi-auto)**: When a payment is pending approval (semi-auto mode), show a native OS notification (Ubuntu: libnotify, Windows: WinRT Toast, macOS: NSUserNotification) using `tauri-plugin-notification`. Currently only an in-app modal is shown — useless if the window is minimized to tray.
+- [ ] **System notifications (semi-auto)**: `tauri-plugin-notification` is in place for sent payments (optional chime + notification, no amount). Remaining: notify when a payment is pending approval, useless otherwise if the window is minimized to tray.
 - [ ] **Review "AutoPay account" creation (UX + security)**: the notion of "account" makes no sense here (nothing is registered anywhere, it is a local encrypted vault + a Monero wallet). Find better wording ("coffre local", "profil sur cet appareil"...) and re-review the whole flow: seed generation, seed backup/verification, restoration from 25 words, reset when the seed is lost, master password change.
-- [ ] **Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
-- [ ] **Known bug — duplicated log lines**: each Rust log line showed up 3–4 times in the log panel with the same timestamp. Cause: every Vite hot reload (`tauri dev`) stacked one more Rust log listener. The listener handle now lives on `window` and is replaced on re-attach; confirm the duplicates are gone (dev and release) before closing.
+- [ ] **PRIORITY (before beta) — Persist subscription edits**: `onSubEdit` in `Dashboard.svelte` only updates the UI state; add an `update_subscription` command (going through `payment_policy`).
+- [x] **Duplicated log lines**: several Rust log listeners attached in the same page (async `onMount` race). One listener per page now, forwarding to the current sink.
 - [ ] **Replace wallet-rpc with an in-process Rust wallet**: removes the sidecar process, its port, its RPC credentials and the cold-start mempool download. Evaluate maturity (monero-rs / monero-serai / monero-wallet) for scanning, transfer and fee estimation on mainnet before switching.
 - [ ] **Node rotation with a pinned node**: a node pinned in Settings is never rotated, even when found slow; show a hint in Settings when the pinned node is slow.
 - [x] **Sweep (empty the wallet)**: tested OK on mainnet (0.2.1, Windows). Balance and the Wallets page now share the same live value.
@@ -62,6 +62,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **App update channel**: Tauri updater with a minisign public key embedded in the binary. Signed manifest fetched from the hardcoded domain, with Tor onion and IPFS mirrors as fallbacks; the signature is mandatory whatever the source. Notification only (no silent install), link to the official repository. Aim for reproducible builds.
 - [ ] **Windows build**: Use GitHub Actions release workflow (`git tag v0.x.y && git push origin v0.x.y`). See `docs/WINDOWS_BUILD.md`. Cannot cross-compile from Linux.
 - [ ] **macOS code signing**: set `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` in the repo secrets (Apple Developer account). Until then builds are ad-hoc signed: users must right-click > Open, or run `xattr -cr`.
+- [ ] **Release signature**: create the release OpenPGP key, publish `keys/releases.asc` and sign `SHA256SUMS` for each release (`docs/SIGNING_RELEASES.md`, user side `docs/VERIFY_DOWNLOAD.md`).
 - [ ] **Windows code signing**: needs an Authenticode certificate (OV/EV) and a signing step; without it SmartScreen warns on first launch. Note: `TAURI_SIGNING_PRIVATE_KEY` is the updater key, unrelated.
 - [ ] **Automated tests**: Add integration tests for the payment scheduler (mock monero-wallet-rpc HTTP server). Add unit tests for `recompute_alerts`.
 - [ ] **Clippy clean**: Run `cargo clippy -D warnings` in CI and fix any remaining lint warnings.
@@ -74,7 +75,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **DEV bypass mode**: After `Ctrl+Shift+D` (dev bypass), `refresh_balance` fails with "Locked" because `session_password` is not set in Rust. This is expected in dev mode but confusing. Consider adding a dev-only mock balance.
 - [ ] **Offline banner false positive**: Fixed in `5479a26` (now requires 3 consecutive `daemon_height=0` readings). Verify no regression after scheduler kills wallet-rpc.
 - [ ] **Balance 0.0000 after lock/re-unlock**: Fixed in `04e1ebf`. Verify displayed as `-.----` until first successful refresh.
-- [ ] **Tray icon color**: `tray-ok.png` / `tray-warn.png` / `tray-alert.png` use the old placeholder SVG colors. Replace with logo-derived icons once final logo is confirmed.
+- [ ] **New logo**: `public/logo.png` and `icons/icon.png` have an opaque white background; make a transparent logo (SVG or 1024 px PNG), regenerate the icons (`cargo tauri icon`) and the tray icons (`tray-ok/warn/alert.png`).
 
 ---
 

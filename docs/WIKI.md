@@ -1,0 +1,130 @@
+# Crypto AutoPay — Feature wiki
+
+Compact reference of everything the app does (v0.2.x). Details: `docs/ALERTS.md` (alerts, limits,
+modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
+
+**Contents:** [Wallet](#wallet) · [Subscriptions](#subscriptions) · [Payment engine](#payment-engine) ·
+[Sending guards](#sending-guards) · [Modes & pause](#modes--pause) · [Alerts](#alerts) ·
+[Node & sync](#node--sync) · [History & reports](#history--reports) · [Treasurer (PV)](#treasurer-pv) ·
+[Merchant side](#merchant-side) · [Settings](#settings) · [Privacy & security](#privacy--security) ·
+[Files](#files) · [Known limits](#known-limits)
+
+---
+
+## Wallet
+
+| Feature | Notes |
+|---|---|
+| Create / restore | 25-word Monero seed; restore re-syncs from the blockchain |
+| Master password | ≥ 12 chars; Argon2id → AES-256-GCM (`seed.vault`); unlock lockout after repeated failures |
+| Seed backup check | Reminder every 90 days; asks 3 random words, compared with the vault |
+| Lock | Manual (sidebar padlock) wipes the session password; UI auto-locks after 3 min idle (payments keep running) |
+| Balance | Live balance, sync progress, "top up in ~N days" from the monthly spend |
+| Sweep | Send all funds to an address (Wallets page), irreversible, confirmed |
+| Reset | "Seed lost" reset from the unlock screen |
+
+## Subscriptions
+
+| Feature | Notes |
+|---|---|
+| Add | Manual form, import of a `crypto-autopay:1:` / `monero-request:1:` code, QR, or `crypto-autopay://` deep link |
+| Schedules | Every 25 min (needs the "very short schedules" unlock) … hourly, daily, weekly, monthly, quarterly, yearly, every N years; cron calendar |
+| Options | Start date, number of payments, description, canary URL |
+| Duplicate check | Exact (same address + schedule) or soft (same name, amount, currency) before import |
+| Actions | Pause / resume, pay now, edit, archive, delete, per-subscription cap (⋯ menu) |
+| Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |
+
+## Payment engine
+
+- Scheduler every ~60 s while unlocked; one send per cycle, **25 min** minimum between two sends (Monero outputs lock ~10 blocks).
+- Before each send: wallet refresh → sending guards → transfer **prepared without relay** → fee check → relay.
+- Next due date: next cron slot after the cooldown (no catch-up burst after downtime).
+- Locked funds → retry in 25 min (`OUTPUTS_LOCKED`); failure → `PAYMENT_FAILED`; guard hit → held 1 h, nothing sent.
+- After a real send: discreet chime + system notification (subscription name only), both optional.
+
+## Sending guards
+
+All sealed in `policy.vault` (encrypted with the master password). **Tightening is free, loosening asks the password.** Altered/deleted vault → strict defaults.
+
+| Guard | Default | Where |
+|---|---|---|
+| Wallet cap | 33 % of balance / 30 days (or fixed XMR, 7/30/90 days) | Wallets > click the wallet card |
+| Balance floor | off | Wallets |
+| Max sends / 24 h | off | Wallets |
+| Max network fee | 0.001 XMR | Wallets |
+| Delay before 1st payment to a new address | off (24 h / 48 h) | Wallets |
+| Per-subscription cap | none (XMR / rolling 30 days) | Subscription ⋯ > Cap… |
+| Amount per payment | 0.00021 … 5 XMR ("high amounts" unlock) | Settings > Security limits |
+| Cadence | ≥ 7 days ("very short schedules" unlock, floor 25 min) | Settings > Security limits |
+| Monthly projection | confirmation above 1 XMR / 30 days when adding | add form |
+| Confirmation | first payment, changed terms (address/amount/currency/schedule fingerprint), ≥ 1 XMR | always, even in Auto |
+
+## Modes & pause
+
+- **Semi-auto** (default): every due payment waits for Confirm / Postpone 1 h / Skip.
+- **Auto**: due payments leave without asking (except the confirmations above).
+- **Global pause**: tray menu or Settings; banner with Resume; nothing leaves while paused.
+- Mode and pause persist across restarts (vault).
+
+## Alerts
+
+Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs/ALERTS.md`.
+
+- **Red:** `BALANCE_EMPTY`, `PAYMENT_OVERDUE_HARD`, `OFFLINE_WITH_PENDING`, `RPC_BINARY_MISSING`.
+- **Orange:** `BALANCE_LOW`, `BALANCE_SHORT_UPCOMING`, `PAYMENT_OVERDUE_SOFT`, `PAYMENT_FAILED`, `OUTPUTS_LOCKED`, `PAYMENT_BLOCKED_LIMITS`, `WALLET_NOT_SYNCED`, `NODE_STALLED`.
+
+## Node & sync
+
+- Bundled `autopay-wallet-rpc` (official Monero binary, pinned + SHA-256 checked), bound to `127.0.0.1`, random digest credentials per session.
+- Public node list with automatic failover (slow / unreachable / stalled > 30 min); a pinned custom node is only alerted, never rotated.
+- RPC status dot: connected / checking / offline / error.
+
+## History & reports
+
+- Encrypted payment history (`history.vault`), retention in days, can be turned off (privacy mode).
+- Grouped by period with relative dates, CSV export, clear.
+- Monthly report card (this month, last month, balance) + a one-time summary at each new month.
+
+## Treasurer (PV)
+
+Settings toggle. Import a meeting resolution JSON (Procès-Verbal), validate, execute each payment
+(immediate or deferred). Same sending guards as subscriptions.
+
+## Merchant side
+
+- **Create a code** page: amount, currency, schedule, canary → `crypto-autopay:1:` code, QR, HTML button snippet.
+- **Find subscriptions**: open directory (Tor / IPFS mirrors), demo entries.
+
+## Settings
+
+Language (FR/EN/DE/ES), theme, timezone, network (Monero; Bitcoin UI only), payment mode, pause,
+alerts on/off + low-balance threshold, send chime / notification, security limits, history,
+technical logs retention, RPC node / binary path / payment tolerance, start with the session (on by default).
+
+## Privacy & security
+
+- No telemetry, no account, nothing sent anywhere except to the Monero node (and the opt-in fiat rate).
+- Technical logs: **no amount, no address** (internal id + time only); file `0600`, sliding retention; drawer with copy / clear.
+- Secrets zeroized on lock; constant-time password comparison.
+- Threat model: RPC not reachable from the network; main risk is local malware (see `TODO.md` > Security).
+- Releases: `SHA256SUMS` signed with the project key — `docs/SIGNING_RELEASES.md`, `docs/VERIFY_DOWNLOAD.md`.
+
+## Files
+
+`~/.local/share/com.libre-market.autopay/` (Linux; OS equivalent elsewhere), all `0600`:
+
+| File | Content | Encrypted |
+|---|---|---|
+| `seed.vault` | wallet seed | yes (master password) |
+| `policy.vault` | guards, approvals, mode, pause, caps | yes |
+| `history.vault` | payment history | yes |
+| `subscriptions.db` | subscriptions (SQLite) | **no** — edits trigger a confirmation, not a payment |
+| `autopay_wallet*` | Monero wallet files | yes (wallet password) |
+| `logs/autopay.log` | technical logs | no (nothing sensitive by design) |
+
+## Known limits
+
+- Editing a subscription only updates the screen: the stored terms do not change yet (`TODO.md`).
+- Canary URLs are stored but not checked yet: `CANARY_*` alerts never fire.
+- `subscriptions.db` is not encrypted (planned: SQLCipher).
+- Bitcoin is display-only; one wallet only; no in-app updater.

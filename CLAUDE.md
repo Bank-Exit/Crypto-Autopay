@@ -282,8 +282,8 @@ Pour lancer : `cd web && npm run dev`
 
 ## AppLogger.js — Sécurité logs
 
-- **Logs techniques** : RAM seulement, max 500 entrées. Sanitisation automatique (adresses Monero/Bitcoin, montants redactés).
-- **Logs d'envoi** : opt-in, localStorage, max 1000 entrées. Contiennent UNIQUEMENT : timestamp + subscription_id interne + type d'événement. **Aucun montant, aucune adresse**.
+- **Logs techniques** : tiroir en RAM (max 500 entrées) + fichier `logs/autopay.log` (0600, rétention glissante configurable). Sanitisation automatique (adresses Monero/Bitcoin, montants redactés). Uniquement identifiant interne + date : **aucun montant, aucune adresse**.
+- Les "logs d'envoi" (opt-in localStorage) ont été supprimés.
 - Section "Journaux" dans Paramètres : filtrable info/warn/error, effaçable.
 
 ## Liens externes dans Tauri
