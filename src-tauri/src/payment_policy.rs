@@ -26,6 +26,7 @@ pub const MONTHLY_CONFIRM_XMR: f64 = 1.0;
 pub const FEE_MARGIN_XMR: f64 = 0.0001;
 
 const LIMITS_FILE: &str = "payment_limits.json";
+const WALLET_CAP_FILE: &str = "wallet_cap.json";
 const APPROVED_TERMS_FILE: &str = "approved_terms.json";
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -37,15 +38,85 @@ pub struct PaymentLimits {
 }
 
 impl PaymentLimits {
-    pub fn load(data_dir: &Path) -> Self {
+    /// Plain file of earlier versions, read once to migrate into the policy vault.
+    pub fn load_legacy(data_dir: &Path) -> Self {
         std::fs::read_to_string(data_dir.join(LIMITS_FILE)).ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
+}
 
-    pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(data_dir.join(LIMITS_FILE), json).map_err(|e| e.to_string())
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapMode {
+    /// Share of the funds available at the start of the period.
+    Percent,
+    /// Fixed amount in XMR.
+    Fixed,
+}
+
+/// Wallet-wide ceiling on what all automatic payments together may send over a rolling period,
+/// whatever the subscriptions say. Checked against the wallet's own outgoing transfers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WalletCap {
+    pub enabled: bool,
+    pub mode: CapMode,
+    pub percent: u32,
+    pub fixed_xmr: f64,
+    pub period_days: u32,
+}
+
+impl Default for WalletCap {
+    fn default() -> Self {
+        Self { enabled: true, mode: CapMode::Percent, percent: 33, fixed_xmr: 1.0, period_days: 30 }
+    }
+}
+
+impl WalletCap {
+    /// Plain file of earlier versions, read once to migrate into the policy vault.
+    pub fn load_legacy(data_dir: &Path) -> Self {
+        std::fs::read_to_string(data_dir.join(WALLET_CAP_FILE)).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.percent) { return Err("Percent must be between 1 and 100.".into()); }
+        if !(self.fixed_xmr.is_finite() && self.fixed_xmr > 0.0) { return Err("Amount must be positive.".into()); }
+        if !(1..=365).contains(&self.period_days) { return Err("Period must be between 1 and 365 days.".into()); }
+        Ok(())
+    }
+
+    /// Ceiling in piconero for the current period (None when disabled). In percent mode the base
+    /// is the balance at the start of the period: current balance + what was sent since.
+    pub fn cap_atomic(&self, balance_atomic: u64, sent_atomic: u64) -> Option<u64> {
+        if !self.enabled { return None; }
+        Some(match self.mode {
+            CapMode::Percent => ((balance_atomic as u128 + sent_atomic as u128) * self.percent as u128 / 100) as u64,
+            CapMode::Fixed => (self.fixed_xmr * 1e12) as u64,
+        })
+    }
+
+    pub fn check(&self, amount_atomic: u64, balance_atomic: u64, sent_atomic: u64) -> Result<(), PolicyError> {
+        match self.cap_atomic(balance_atomic, sent_atomic) {
+            Some(cap) if sent_atomic.saturating_add(amount_atomic) > cap => {
+                Err(PolicyError::WalletCap(cap.saturating_sub(sent_atomic) as f64 / 1e12))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// True when `self` allows more than `current` (needs the master password).
+    pub fn is_looser_than(&self, current: &WalletCap) -> bool {
+        if !current.enabled { return false; }
+        if !self.enabled || self.mode != current.mode || self.period_days < current.period_days {
+            return true;
+        }
+        match self.mode {
+            CapMode::Percent => self.percent > current.percent,
+            CapMode::Fixed => self.fixed_xmr > current.fixed_xmr,
+        }
     }
 }
 
@@ -63,6 +134,8 @@ pub enum PolicyError {
     CadenceBelowFloor,
     CadenceTooShort,
     MonthlyTotal(f64),
+    /// Remaining allowance (XMR) of the wallet cap for the current period.
+    WalletCap(f64),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -78,6 +151,7 @@ impl std::fmt::Display for PolicyError {
             Self::CadenceBelowFloor => write!(f, "POLICY:CADENCE_BELOW_FLOOR"),
             Self::CadenceTooShort => write!(f, "POLICY:CADENCE_TOO_SHORT"),
             Self::MonthlyTotal(x) => write!(f, "POLICY:MONTHLY_TOTAL:{:.4}", x),
+            Self::WalletCap(x) => write!(f, "POLICY:WALLET_CAP:{:.4}", x),
         }
     }
 }
@@ -138,17 +212,17 @@ pub fn terms_fingerprint(address: &str, amount: &str, currency: &str, schedule: 
     blake3::hash(data.as_bytes()).to_hex().to_string()
 }
 
-pub fn load_approved_terms(data_dir: &Path) -> HashMap<String, String> {
+/// Plain file of earlier versions, read once to migrate into the policy vault.
+pub fn load_legacy_approved_terms(data_dir: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(data_dir.join(APPROVED_TERMS_FILE)).ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-pub fn save_approved_terms(data_dir: &Path, terms: &HashMap<String, String>) {
-    if let Ok(json) = serde_json::to_string(terms) {
-        if let Err(e) = std::fs::write(data_dir.join(APPROVED_TERMS_FILE), json) {
-            log::error!("[Policy] Could not save approved terms: {}", e);
-        }
+/// Plain policy files of earlier versions, removed once migrated into the policy vault.
+pub fn remove_legacy_files(data_dir: &Path) {
+    for f in [LIMITS_FILE, WALLET_CAP_FILE, APPROVED_TERMS_FILE] {
+        let _ = std::fs::remove_file(data_dir.join(f));
     }
 }
 
@@ -303,6 +377,34 @@ pub fn average_interval_minutes(schedule: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_cap_percent_of_starting_balance() {
+        let xmr = |x: f64| (x * 1e12) as u64;
+        let cap = WalletCap::default(); // 33 % over 30 days
+        // 3 XMR at the start of the period, nothing sent yet: up to 0.99 XMR.
+        assert!(cap.check(xmr(0.99), xmr(3.0), 0).is_ok());
+        assert!(cap.check(xmr(1.0), xmr(3.0), 0).is_err());
+        // 0.5 already sent (balance now 2.5): the base stays 3 XMR, 0.49 left.
+        assert!(cap.check(xmr(0.49), xmr(2.5), xmr(0.5)).is_ok());
+        assert_eq!(cap.check(xmr(0.5), xmr(2.5), xmr(0.5)), Err(PolicyError::WalletCap(0.49)));
+        let off = WalletCap { enabled: false, ..WalletCap::default() };
+        assert!(off.check(xmr(100.0), xmr(1.0), 0).is_ok());
+        let fixed = WalletCap { mode: CapMode::Fixed, fixed_xmr: 0.2, ..WalletCap::default() };
+        assert!(fixed.check(xmr(0.1), xmr(50.0), xmr(0.1)).is_ok());
+        assert!(fixed.check(xmr(0.11), xmr(50.0), xmr(0.1)).is_err());
+    }
+
+    #[test]
+    fn wallet_cap_loosening() {
+        let cur = WalletCap::default();
+        assert!(WalletCap { percent: 50, ..cur.clone() }.is_looser_than(&cur));
+        assert!(WalletCap { enabled: false, ..cur.clone() }.is_looser_than(&cur));
+        assert!(WalletCap { period_days: 7, ..cur.clone() }.is_looser_than(&cur));
+        assert!(!WalletCap { percent: 20, ..cur.clone() }.is_looser_than(&cur));
+        assert!(!WalletCap { period_days: 60, ..cur.clone() }.is_looser_than(&cur));
+        assert!(!cur.is_looser_than(&WalletCap { enabled: false, ..cur.clone() }));
+    }
 
     #[test]
     fn cadences_of_app_presets() {

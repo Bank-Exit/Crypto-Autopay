@@ -106,6 +106,14 @@ pub struct AppState {
     pub treasurer_mode: bool,
     /// Unlocked exceptions to the payment safety limits (persisted).
     pub payment_limits: payment_policy::PaymentLimits,
+    /// Wallet-wide ceiling on automatic sends over a rolling period (persisted).
+    pub wallet_cap: payment_policy::WalletCap,
+    /// Sent (amounts + fees) over the cap period, as last read from the wallet.
+    pub sent_in_period_atomic: Option<u64>,
+    /// Subscriptions refused by the wallet cap, with the Unix time of the next attempt.
+    pub cap_blocked_until: std::collections::HashMap<String, i64>,
+    /// Fingerprints of the terms the user agreed to, per subscription (persisted in the policy vault).
+    pub approved_terms: std::collections::HashMap<String, String>,
     /// Unix timestamp of the last wallet refresh attempt (UI or background).
     pub last_refresh_at: i64,
     /// Nodes found too slow or failing, with the Unix time until which they are avoided.
@@ -339,6 +347,7 @@ async fn unlock_wallet(
             s.last_unlock_at = chrono::Utc::now().timestamp();
             s.session_password = Some(password.clone());
             s.history_key = Some(history_key_with_migration(&password, &s.history_path));
+            apply_policy_vault(&mut s);
             s.wallet_address = Some(cached_addr.clone());
             s.wallet_file_path = wallet_file_path.clone();
             s.rpc_connected = false;
@@ -481,6 +490,7 @@ async fn unlock_wallet(
     s.unlocked = true;
     s.last_unlock_at = chrono::Utc::now().timestamp();
     s.history_key = Some(history_key_with_migration(&password, &s.history_path));
+    apply_policy_vault(&mut s);
     s.session_password = Some(password);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
     s.balance_atomic = (balance_xmr * 1e12) as u64;
@@ -705,6 +715,7 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
         let unlocked_atomic = (unlocked * 1e12) as u64;
         let atomic = (total * 1e12) as u64;
         log::debug!("[Sync] Balance read");
+        record_sent_in_period(&app_rpc, &mgr.rpc_url());
 
         // The address is normally read at unlock; recover it if the RPC was unavailable then.
         let address = if need_address {
@@ -1272,10 +1283,114 @@ fn save_history(key: &[u8; 32], path: &PathBuf, entries: &[HistoryEntry]) -> Res
 }
 
 // ============================================================
+//  Sending policy vault
+// ============================================================
+
+const POLICY_VAULT_FILE: &str = "policy.vault";
+
+/// Everything that decides what may leave the wallet without asking. Sealed with the history
+/// key (AES-256-GCM): an edited, forged or deleted file never loosens anything, it falls back
+/// to the strict defaults.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct PolicyVault {
+    semi_auto: bool,
+    limits: payment_policy::PaymentLimits,
+    wallet_cap: payment_policy::WalletCap,
+    approved_terms: std::collections::HashMap<String, String>,
+}
+
+impl Default for PolicyVault {
+    fn default() -> Self {
+        Self {
+            semi_auto: true,
+            limits: Default::default(),
+            wallet_cap: Default::default(),
+            approved_terms: Default::default(),
+        }
+    }
+}
+
+fn write_sealed(key: &[u8; 32], path: &std::path::Path, plain: &[u8]) -> Result<(), String> {
+    let blob = aes_encrypt(key, plain)?;
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    std::io::Write::write_all(&mut opts.open(&tmp).map_err(|e| e.to_string())?, blob.as_bytes())
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Persist the policy currently in `s` (requires an unlocked session).
+fn save_policy_vault(s: &AppState) -> Result<(), String> {
+    let key = s.history_key.as_ref().ok_or("Wallet is locked.")?;
+    let vault = PolicyVault {
+        semi_auto: s.semi_auto_mode,
+        limits: s.payment_limits.clone(),
+        wallet_cap: s.wallet_cap.clone(),
+        approved_terms: s.approved_terms.clone(),
+    };
+    let plain = serde_json::to_vec(&vault).map_err(|e| e.to_string())?;
+    write_sealed(key, &s.history_path.with_file_name(POLICY_VAULT_FILE), &plain)
+}
+
+/// Load the sealed policy into `s` at unlock, migrating the plain files of earlier versions.
+fn apply_policy_vault(s: &mut AppState) {
+    let Some(key) = s.history_key.as_ref() else { return };
+    let path = s.history_path.with_file_name(POLICY_VAULT_FILE);
+    let vault = match std::fs::read_to_string(&path) {
+        Ok(b64) => aes_decrypt(key, b64.trim()).ok()
+            .and_then(|plain| serde_json::from_slice::<PolicyVault>(&plain).ok())
+            .unwrap_or_else(|| {
+                log::error!("[Policy] Policy vault altered or unreadable — strict defaults applied");
+                PolicyVault::default()
+            }),
+        Err(_) => {
+            let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+            PolicyVault {
+                semi_auto: load_legacy_semi_auto_mode(&dir),
+                limits: payment_policy::PaymentLimits::load_legacy(&dir),
+                wallet_cap: payment_policy::WalletCap::load_legacy(&dir),
+                approved_terms: payment_policy::load_legacy_approved_terms(&dir),
+            }
+        }
+    };
+    let migrating = !path.exists();
+    s.semi_auto_mode = vault.semi_auto;
+    s.payment_limits = vault.limits;
+    s.wallet_cap = vault.wallet_cap;
+    s.approved_terms = vault.approved_terms;
+    if migrating {
+        match save_policy_vault(s) {
+            Ok(()) => {
+                if let Some(dir) = path.parent() {
+                    payment_policy::remove_legacy_files(dir);
+                    let _ = std::fs::remove_file(dir.join(PAYMENT_MODE_FILE));
+                }
+                log::info!("[Policy] Sending policy moved to the encrypted vault");
+            }
+            Err(e) => log::error!("[Policy] Could not create the policy vault: {}", e),
+        }
+    }
+}
+
+// ============================================================
 //  Payment mode (semi-auto / auto)
 // ============================================================
 
-/// Set the payment mode. "semi-auto" = queue pending, "auto" = send directly.
+const PAYMENT_MODE_FILE: &str = "payment_mode.json";
+
+/// Payment mode saved in plain text by earlier versions (migration only).
+fn load_legacy_semi_auto_mode(data_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(data_dir.join(PAYMENT_MODE_FILE)).ok()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+        .and_then(|v| v["semi_auto"].as_bool())
+        .unwrap_or(true)
+}
+
+/// Set the payment mode. "semi-auto" = queue pending, "auto" = send directly. Persisted.
 #[tauri::command]
 async fn set_payment_mode(
     semi_auto: bool,
@@ -1283,6 +1398,7 @@ async fn set_payment_mode(
 ) -> Result<(), String> {
     let mut s = app_state.lock().map_err(|e| e.to_string())?;
     s.semi_auto_mode = semi_auto;
+    save_policy_vault(&s)?;
     log::info!("[PaymentMode] Mode set to {}", if semi_auto { "semi-auto" } else { "auto" });
     Ok(())
 }
@@ -1303,7 +1419,6 @@ async fn approve_payment(
     sub_id: String,
     app_state: tauri::State<'_, Mutex<AppState>>,
     db_state: tauri::State<'_, Mutex<Database>>,
-    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     {
         let mut s = app_state.lock().map_err(|e| e.to_string())?;
@@ -1318,10 +1433,9 @@ async fn approve_payment(
         .list_subscriptions().map_err(|e| e.to_string())?
         .into_iter().find(|s| s.id == sub_id);
     if let Some(sub) = sub {
-        let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-        let mut terms = payment_policy::load_approved_terms(&dir);
-        terms.insert(sub.id.clone(), sub_fingerprint(&sub));
-        payment_policy::save_approved_terms(&dir, &terms);
+        let mut s = app_state.lock().map_err(|e| e.to_string())?;
+        s.approved_terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+        save_policy_vault(&s)?;
     }
     log::info!("[PaymentMode] Payment approved by user for sub {}", &sub_id[..8.min(sub_id.len())]);
     Ok(())
@@ -1419,13 +1533,104 @@ async fn set_payment_limits(
         given.zeroize();
         if !same { return Err("Incorrect password.".into()); }
     }
-    let limits = payment_policy::PaymentLimits { allow_large_amounts, allow_short_cadence };
-    let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-    limits.save(&dir)?;
+    s.payment_limits = payment_policy::PaymentLimits { allow_large_amounts, allow_short_cadence };
+    save_policy_vault(&s)?;
     log::info!("[Policy] Limits updated: large_amounts={}, short_cadence={}", allow_large_amounts, allow_short_cadence);
-    s.payment_limits = limits;
     // Blocks raised under the previous limits are stale; the scheduler re-raises them if still relevant.
     s.alerts.retain(|a| a.kind != "PAYMENT_BLOCKED_LIMITS");
+    drop(s);
+    refresh_alerts_and_tray(&app_handle);
+    Ok(())
+}
+
+/// Seconds a subscription refused by the wallet cap waits before the next attempt.
+const CAP_RETRY_SECS: i64 = 3600;
+
+/// Sum of outgoing amounts + fees since `since_ts`, confirmed or pending, from the wallet itself
+/// (the app history can be disabled or cleared, the wallet's transfers cannot).
+fn wallet_sent_since(rpc_url: &str, since_ts: i64) -> Result<u64, String> {
+    let r = rpc_manager::ureq_post_json_pub(rpc_url, &serde_json::json!({
+        "jsonrpc":"2.0","id":"tr","method":"get_transfers","params":{"out":true,"pending":true}
+    }))?;
+    if let Some(err) = r.get("error") {
+        return Err(format!("get_transfers error: {}", err["message"].as_str().unwrap_or("?")));
+    }
+    let mut sent = 0u64;
+    for kind in ["out", "pending"] {
+        for t in r["result"][kind].as_array().into_iter().flatten() {
+            // A transfer without timestamp counts: unknown means possibly recent.
+            if t["timestamp"].as_i64().unwrap_or(i64::MAX) >= since_ts {
+                sent = sent
+                    .saturating_add(t["amount"].as_u64().unwrap_or(0))
+                    .saturating_add(t["fee"].as_u64().unwrap_or(0));
+            }
+        }
+    }
+    Ok(sent)
+}
+
+fn cap_period_start(cap: &payment_policy::WalletCap) -> i64 {
+    chrono::Utc::now().timestamp() - cap.period_days as i64 * 86400
+}
+
+/// Refresh the "sent over the period" figure shown on the Wallets page.
+fn record_sent_in_period(app: &tauri::AppHandle, rpc_url: &str) {
+    let Some(st) = app.try_state::<Mutex<AppState>>() else { return };
+    let Some(cap) = st.lock().ok().map(|s| s.wallet_cap.clone()) else { return };
+    let sent = wallet_sent_since(rpc_url, cap_period_start(&cap)).ok();
+    if let Ok(mut s) = st.lock() { s.sent_in_period_atomic = sent; };
+}
+
+/// Enforce the wallet cap right before a transfer. Fails closed: if the wallet cannot tell
+/// what was sent, nothing is sent.
+fn check_wallet_cap(app: &tauri::AppHandle, mgr: &RpcManager, amount_atomic: u64) -> Result<(), String> {
+    let st = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?;
+    let cap = st.lock().map_err(|e| e.to_string())?.wallet_cap.clone();
+    if !cap.enabled { return Ok(()); }
+    let sent = wallet_sent_since(&mgr.rpc_url(), cap_period_start(&cap))?;
+    let (total, _) = mgr.rpc_get_balance()?;
+    if let Ok(mut s) = st.lock() { s.sent_in_period_atomic = Some(sent); }
+    cap.check(amount_atomic, (total * 1e12) as u64, sent).map_err(|e| e.to_string())
+}
+
+/// Wallet cap settings and current usage for the Wallets page.
+#[tauri::command]
+async fn get_wallet_cap(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    let sent = s.sent_in_period_atomic;
+    let cap_atomic = sent.and_then(|sent| s.wallet_cap.cap_atomic(s.balance_atomic, sent));
+    Ok(serde_json::json!({
+        "cap": s.wallet_cap,
+        "sent_xmr": sent.map(|v| v as f64 / 1e12),
+        "cap_xmr": cap_atomic.map(|v| v as f64 / 1e12),
+        "remaining_xmr": cap_atomic.zip(sent).map(|(c, sent)| c.saturating_sub(sent) as f64 / 1e12),
+    }))
+}
+
+/// Change the wallet cap. Loosening it (higher, longer-reaching, disabled) needs the master password.
+#[tauri::command]
+async fn set_wallet_cap(
+    cap: payment_policy::WalletCap,
+    password: Option<String>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    cap.validate()?;
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    if cap.is_looser_than(&s.wallet_cap) {
+        let session = s.session_password.as_deref().ok_or("Wallet is locked.")?;
+        let mut given = password.unwrap_or_default();
+        let same = given.len() == session.len()
+            && given.bytes().zip(session.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        given.zeroize();
+        if !same { return Err("Incorrect password.".into()); }
+    }
+    log::info!("[Policy] Wallet cap updated: enabled={}, mode={:?}, period={} days",
+        cap.enabled, cap.mode, cap.period_days);
+    s.wallet_cap = cap;
+    save_policy_vault(&s)?;
+    s.cap_blocked_until.clear();
+    s.alerts.retain(|a| !(a.kind == "PAYMENT_BLOCKED_LIMITS" && a.message.contains("POLICY:WALLET_CAP")));
     drop(s);
     refresh_alerts_and_tray(&app_handle);
     Ok(())
@@ -1545,6 +1750,45 @@ async fn get_payment_history(
     };
     let entries = load_history(key, &s.history_path);
     Ok(serde_json::json!({ "enabled": true, "entries": entries }))
+}
+
+/// Write the payment history as CSV into the Downloads folder (owner-only file).
+/// Returns the file path. The export holds amounts by design: it is the user's own record.
+#[tauri::command]
+async fn export_payment_history(
+    app_state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let entries = {
+        let s = app_state.lock().map_err(|e| e.to_string())?;
+        let key = s.history_key.as_ref().ok_or("Locked")?;
+        load_history(key, &s.history_path)
+    };
+    let csv_field = |v: &str| {
+        // Leading =,+,-,@ would run as formulas in spreadsheet apps.
+        let v = if v.starts_with(['=', '+', '-', '@']) { format!("'{v}") } else { v.to_string() };
+        format!("\"{}\"", v.replace('"', "\"\""))
+    };
+    let mut csv = String::from("date,subscription,amount_xmr,tx_prefix\n");
+    for e in &entries {
+        csv.push_str(&format!("{},{},{:.12},{}\n",
+            csv_field(&e.sent_at), csv_field(&e.sub_label), e.amount_xmr, csv_field(&e.tx_prefix)));
+    }
+    let dir = app_handle.path().download_dir()
+        .or_else(|_| app_handle.path().home_dir())
+        .map_err(|e| e.to_string())?;
+    let path = dir.join(format!("crypto-autopay-history-{}.csv", chrono::Local::now().format("%Y-%m-%d_%H%M")));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    opts.open(&path).and_then(|mut f| f.write_all(csv.as_bytes())).map_err(|e| e.to_string())?;
+    log::info!("[History] Exported {} entr(y/ies) to the Downloads folder", entries.len());
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// Clear all payment history from disk.
@@ -1899,11 +2143,24 @@ fn detect_rpc_binary(state: tauri::State<'_, Mutex<AppState>>) -> Option<String>
     s.rpc.detect_binary().map(|p| p.to_string_lossy().to_string())
 }
 
-/// Get current RPC status.
+/// Status of the session wallet-rpc (the one actually syncing and paying), not of `s.rpc`,
+/// which is only kept for its config.
 #[tauri::command]
 fn get_rpc_status(state: tauri::State<'_, Mutex<AppState>>) -> RpcStatus {
     let s = state.lock().unwrap();
-    s.rpc.status.clone()
+    // While an operation holds the session it is out of WALLET_SESSION but running.
+    let in_use = s.rpc_busy.load(Ordering::SeqCst);
+    let idle_alive = WALLET_SESSION.lock().ok()
+        .is_some_and(|mut g| g.as_mut().is_some_and(|m| m.is_alive()));
+    if in_use || idle_alive {
+        RpcStatus::Running
+    } else if let Some(e) = &s.rpc_last_error {
+        RpcStatus::Error(e.clone())
+    } else if s.unlocked {
+        RpcStatus::Starting
+    } else {
+        RpcStatus::Stopped
+    }
 }
 
 /// Save RPC configuration (node, binary path, tolerance).
@@ -2140,6 +2397,11 @@ async fn execute_pv_payment(
         }), 600) {
             log::warn!("[Treasurer] refresh failed (continuing): {}", e);
         }
+        if let Err(e) = check_wallet_cap(&app_rpc, &mgr, amount_pico) {
+            return_wallet_session(mgr);
+            log::warn!("[Treasurer] PV id={} refused by the wallet cap", pv_id);
+            return Err(e);
+        }
 
         let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
             "jsonrpc":"2.0","id":"tx","method":"transfer",
@@ -2196,10 +2458,11 @@ async fn pay_subscription_now(sub_id: String, app_handle: tauri::AppHandle) -> R
         .and_then(|_| payment_policy::validate_terms(&sub.amount, &sub.schedule, &limits))
         .map_err(|e| e.to_string())?;
 
-    let dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-    let mut terms = payment_policy::load_approved_terms(&dir);
-    terms.insert(sub.id.clone(), sub_fingerprint(&sub));
-    payment_policy::save_approved_terms(&dir, &terms);
+    {
+        let mut s = app_handle.state::<Mutex<AppState>>().inner().lock().map_err(|e| e.to_string())?;
+        s.approved_terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+        save_policy_vault(&s)?;
+    }
 
     log::info!("[Payment] Manual payment requested for sub {}", &sub_id[..8.min(sub_id.len())]);
     let res = execute_subscription_payment(&app_handle, &sub).await;
@@ -2256,6 +2519,10 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
             "jsonrpc":"2.0","id":"r","method":"refresh","params":{}
         }), 600) {
             log::warn!("[Scheduler] refresh before transfer failed (continuing): {}", e);
+        }
+        if let Err(e) = check_wallet_cap(&app_rpc, &mgr, amount_pico) {
+            return_wallet_session(mgr);
+            return Err(e);
         }
 
         let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
@@ -2317,6 +2584,24 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
             let new_next_iso = new_next.to_rfc3339();
             app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
             Ok(tx_hash_out)
+        }
+        Ok(Err(e)) if e.starts_with("POLICY:WALLET_CAP") => {
+            let short = &sub_id[..8.min(sub_id.len())];
+            let retry_at = chrono::Utc::now().timestamp() + CAP_RETRY_SECS;
+            if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
+                if let Ok(mut s) = state_rc.lock() {
+                    s.cap_blocked_until.insert(sub_id.clone(), retry_at);
+                }
+            }
+            let already = app.try_state::<Mutex<AppState>>()
+                .and_then(|st| st.lock().ok().map(|s| s.alerts.iter()
+                    .any(|a| a.kind == "PAYMENT_BLOCKED_LIMITS" && a.sub_id.as_deref() == Some(sub_id.as_str()))))
+                .unwrap_or(false);
+            if !already {
+                log::warn!("[Payment] 🛑 Wallet cap reached — payment for sub {} held (nothing sent)", short);
+            }
+            push_alert(app, AlertLevel::Orange, "PAYMENT_BLOCKED_LIMITS", &sub_id, e.clone());
+            Err(e)
         }
         Ok(Err(e)) => {
             let is_locked = e.contains("not enough unlocked") || e.contains("locked") || e.contains("unlocked money");
@@ -2459,8 +2744,12 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
         }
     };
 
-    let data_dir = match app.path().app_data_dir() { Ok(d) => d, Err(_) => return };
-    let mut approved_terms = payment_policy::load_approved_terms(&data_dir);
+    let approved_terms = match app.try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| s.approved_terms.clone()))
+    {
+        Some(t) => t,
+        None => return,
+    };
 
     for sub in due {
         let amount_xmr = payment_policy::parse_amount(&sub.amount).unwrap_or(0.0);
@@ -2492,6 +2781,14 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 continue;
             }
         }
+        let cap_wait = app.try_state::<Mutex<AppState>>()
+            .and_then(|st| st.lock().ok().and_then(|s| s.cap_blocked_until.get(&sub_id).copied()))
+            .is_some_and(|until| until > Utc::now().timestamp());
+        if cap_wait {
+            log::debug!("[Scheduler] Sub {} held by the wallet cap — next check later", short_id);
+            continue;
+        }
+
         // Enough funds but part of them still confirming (change of a recent send):
         // neither prompt nor send until they are spendable. Survives app restarts, unlike
         // the in-memory cooldown.
@@ -2501,12 +2798,9 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             continue;
         }
 
-        // Subscriptions paid before this check existed are trusted as-is.
+        // No recorded approval (new, or vault reset) means confirmation, never implicit trust:
+        // the subscription DB is not authenticated, the vault is.
         let fingerprint = sub_fingerprint(&sub);
-        if sub.payments_sent > 0 && !approved_terms.contains_key(&sub_id) {
-            approved_terms.insert(sub_id.clone(), fingerprint.clone());
-            payment_policy::save_approved_terms(&data_dir, &approved_terms);
-        }
         let mut reasons: Vec<String> = payment_policy::confirmation_reasons(
             &sub.amount, &fingerprint, approved_terms.get(&sub_id),
         ).into_iter().map(String::from).collect();
@@ -2679,12 +2973,16 @@ pub fn run() {
                 history_path,
                 history_enabled: true,
                 history_days: 365,
-                semi_auto_mode: true, // safe default: require user confirmation
+                semi_auto_mode: true,
                 pending_approvals: std::collections::HashMap::new(),
                 approved_payments: std::collections::HashSet::new(),
                 last_unlock_at: 0,
                 active_node: None,
-                payment_limits: payment_policy::PaymentLimits::load(&data_dir),
+                payment_limits: payment_policy::PaymentLimits::default(),
+                wallet_cap: payment_policy::WalletCap::default(),
+                approved_terms: std::collections::HashMap::new(),
+                sent_in_period_atomic: None,
+                cap_blocked_until: std::collections::HashMap::new(),
                 treasurer_mode: false,
                 last_refresh_at: 0,
                 slow_nodes: std::collections::HashMap::new(),
@@ -2844,6 +3142,7 @@ pub fn run() {
             set_history_config,
             get_history_config,
             get_payment_history,
+            export_payment_history,
             clear_payment_history,
             set_payment_mode,
             get_payment_mode,
@@ -2852,6 +3151,8 @@ pub fn run() {
             get_pending_approvals,
             get_payment_limits,
             set_payment_limits,
+            get_wallet_cap,
+            set_wallet_cap,
             set_treasurer_mode,
             get_treasurer_mode,
             validate_pv,

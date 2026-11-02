@@ -76,6 +76,60 @@
     }
   }
 
+  // Wallet-wide ceiling on automatic sends (backend-enforced right before each transfer).
+  let walletCap = null;        // { cap, sent_xmr, cap_xmr, remaining_xmr }
+  let capDraft = null;         // editable copy of walletCap.cap
+  let capPrompt = false;       // password asked to loosen the cap
+  let capPassword = "";
+  let capError = "";
+  const CAP_PERIODS = [7, 30, 90];
+  let capOpen = false;
+
+  function onWalletCardClick(event) {
+    if (event.target.closest("button, input, select, label, a, .cap-body")) return;
+    capOpen = !capOpen;
+  }
+
+  function capSummary(c, tObj, sym) {
+    if (!c?.enabled) return tObj.capOffShort;
+    const value = c.mode === "percent" ? `${c.percent} %` : `${c.fixed_xmr} ${sym}`;
+    return `${value} ${fmt(tObj.capPerDays, { days: c.period_days })}`;
+  }
+
+  async function loadWalletCap() {
+    const c = await tauriInvoke("get_wallet_cap");
+    if (!c) return;
+    walletCap = c;
+    if (!capDraft || !capDirty) capDraft = { ...c.cap };
+  }
+
+  $: capDirty = !!(walletCap && capDraft) && JSON.stringify(capDraft) !== JSON.stringify(walletCap.cap);
+
+  async function saveWalletCap(password = null) {
+    capError = "";
+    try {
+      await invokeStrict("set_wallet_cap", {
+        cap: { ...capDraft, percent: Math.round(Number(capDraft.percent)), fixed_xmr: Number(capDraft.fixed_xmr) },
+        password,
+      });
+      capPrompt = false;
+      capPassword = "";
+      capDraft = null;
+      await loadWalletCap();
+      await refreshAlerts();
+    } catch (e) {
+      const wrong = String(e).includes("Incorrect password");
+      if (wrong && !capPrompt) { capPrompt = true; capPassword = ""; return; }
+      capError = wrong ? $t.unlockWrongPassword : String(e);
+      capPassword = "";
+    }
+  }
+
+  function toggleCap(event) {
+    capDraft = { ...capDraft, enabled: event.target.checked };
+    saveWalletCap();
+  }
+
   /** Backend refusal "POLICY:<CODE>[:detail]" as a plain explanation, or null for other errors. */
   function policyMessage(err, tObj) {
     const m = String(err).match(/POLICY:([A-Z_]+)(?::([\d.]+))?/);
@@ -92,6 +146,7 @@
       case "CADENCE_BELOW_FLOOR": return tObj.policyCadenceBelowFloor;
       case "CADENCE_TOO_SHORT": return fmt(tObj.policyCadenceTooShort, { days: L.min_cadence_days });
       case "MONTHLY_TOTAL": return fmt(tObj.policyMonthlyTotal, { total: m[2] });
+      case "WALLET_CAP": return fmt(tObj.policyWalletCap, { remaining: m[2], days: walletCap?.cap?.period_days ?? 30 });
       default: return tObj.policyDefault;
     }
   }
@@ -940,6 +995,9 @@
       if (invokeError.includes("OUTPUTS_LOCKED")) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
         showInfoNotice($t.payFundsConfirming);
+      } else if (invokeError.includes("POLICY:WALLET_CAP")) {
+        logWarn("Scheduler", `[RETENU] Plafond du wallet atteint pour sub #${sub.id} — rien envoye`);
+        showInfoNotice(policyMessage(invokeError, $t));
       } else {
         logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
         const why = policyMessage(invokeError, $t);
@@ -1078,6 +1136,59 @@
     await saveHistoryConfig();
   }
 
+  const DAY_MS = 86400000;
+
+  // Newest first, grouped: today, yesterday, last 7 / 30 days, last 6 months, then by year.
+  function groupHistory(entries, now, tObj) {
+    const startToday = new Date(now);
+    startToday.setHours(0, 0, 0, 0);
+    const t0 = startToday.getTime();
+    const groups = [];
+    for (const p of [...entries].sort((a, b) => new Date(b.sent_at) - new Date(a.sent_at))) {
+      const ts = new Date(p.sent_at).getTime();
+      const age = now - ts;
+      const [key, label] =
+        ts >= t0 ? ["today", tObj.historyGroupToday]
+        : ts >= t0 - DAY_MS ? ["yesterday", tObj.historyGroupYesterday]
+        : age <= 7 * DAY_MS ? ["week", tObj.historyGroupWeek]
+        : age <= 30 * DAY_MS ? ["month", tObj.historyGroupMonth]
+        : age <= 182 * DAY_MS ? ["six-months", tObj.historyGroupSixMonths]
+        : [`y${new Date(ts).getFullYear()}`, String(new Date(ts).getFullYear())];
+      const last = groups[groups.length - 1];
+      if (last?.key === key) last.items.push(p);
+      else groups.push({ key, label, items: [p] });
+    }
+    return groups;
+  }
+
+  function relativeTime(iso, now, lang) {
+    const secs = Math.round((new Date(iso).getTime() - now) / 1000);
+    const abs = Math.abs(secs);
+    const rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
+    if (abs < 60) return rtf.format(0, "minute");
+    if (abs < 3600) return rtf.format(Math.round(secs / 60), "minute");
+    if (abs < 86400) return rtf.format(Math.round(secs / 3600), "hour");
+    if (abs < 30 * 86400) {
+      // Calendar days, so entries of the same day get the same label.
+      const day = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); };
+      return rtf.format(Math.round((day(new Date(iso).getTime()) - day(now)) / DAY_MS), "day");
+    }
+    if (abs < 365 * 86400) return rtf.format(Math.round(secs / (30 * 86400)), "month");
+    return rtf.format(Math.round(secs / (365 * 86400)), "year");
+  }
+
+  $: historyGroups = groupHistory(historyEntries, nowTick, $t);
+
+  async function exportHistory() {
+    try {
+      const path = await invokeStrict("export_payment_history");
+      showInfoNotice(fmt($t.historyExported, { path }));
+    } catch (e) {
+      logWarn("History", `Export failed: ${e}`);
+      alert(String(e));
+    }
+  }
+
   async function clearHistory() {
     if (!confirm($t.historyClearConfirm)) return;
     await tauriInvoke("clear_payment_history");
@@ -1214,6 +1325,7 @@
 
     // Load basic wallet info (address, cached balance) — fast, no sync
     await loadWalletInfo();
+    loadWalletCap();
     // Load history config and entries from encrypted vault
     await loadHistoryConfig();
     await loadHistoryEntries();
@@ -1255,6 +1367,7 @@
       else if (p.error) { rpcOk = false; rpcError = String(p.error); }
       if (!uiRefreshRunning) endSyncDisplay();
       loadRpcState();
+      loadWalletCap();
     });
     // The backend keeps syncing every 2 min (even with the window closed); this one is for fresh data on open.
     refreshBalance(); // intentionally NOT awaited
@@ -1297,6 +1410,7 @@
     }, 3000);
 
     await listenWhileMounted("payment-sent", async (ev) => {
+      loadWalletCap();
       logDebug("Scheduler", "payment-sent event received — reloading history");
       const payload = ev.payload || {};
       if (payload.sub_id) {
@@ -1626,9 +1740,28 @@
 {/if}
 
 <!-- Password check before unlocking a payment limit -->
+{#if capPrompt}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
+      <h2 style="margin:0 0 8px;font-size:17px">{$t.capLoosenTitle}</h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">{$t.capLoosenDesc} {$t.limitEnterPassword}</p>
+      <form on:submit|preventDefault={() => saveWalletCap(capPassword)}>
+        <input type="password" bind:value={capPassword} autocomplete="current-password"
+          placeholder={$t.commonPassword} style="width:100%;margin-bottom:8px" />
+        {#if capError}<p style="color:#ef4444;font-size:12px;margin:0 0 8px">{capError}</p>{/if}
+        <div style="display:flex;gap:10px">
+          <button type="button" class="btn-ghost" style="flex:1;padding:10px"
+            on:click={() => { capPrompt = false; capPassword = ""; capError = ""; capDraft = { ...walletCap.cap }; }}>{$t.commonCancel}</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px" disabled={!capPassword}>{$t.commonConfirm}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 {#if limitPrompt}
   <div class="modal-backdrop" role="dialog" aria-modal="true">
-    <div class="modal-panel" role="document" style="max-width:400px">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
       <h2 style="margin:0 0 8px;font-size:17px">
         {limitPrompt.key === "allow_large_amounts" ? $t.limitLargeTitle : $t.limitShortTitle}
       </h2>
@@ -2109,7 +2242,8 @@
       {:else}
         <div class="wallet-list">
           {#each displayWallets as w}
-            <div class="wallet-card card">
+            <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+            <div class="wallet-card card" on:click={onWalletCardClick}>
               <div class="wallet-color-bar" style="background:{w.color}"></div>
               <div class="wallet-body">
                 <div class="wallet-top">
@@ -2148,6 +2282,61 @@
                   <p style="font-size:11px;color:var(--text-muted);margin:4px 0">{$t.walletSyncPending}</p>
                 {/if}
               </div><!-- /wallet-limit-warn -->
+              {#if capDraft}
+                <div class="cap-box">
+                  <button type="button" class="cap-summary" aria-expanded={capOpen} on:click={() => capOpen = !capOpen}>
+                    <span class="cap-title">{$t.capTitle}</span>
+                    <span class="text-muted">· {capSummary(walletCap?.cap, $t, $currentNetwork.symbol)}</span>
+                    {#if walletCap?.cap?.enabled && walletCap.remaining_xmr === 0}<span class="cap-full">●</span>{/if}
+                    <span class="cap-chevron" class:open={capOpen}>▸</span>
+                  </button>
+                  {#if capOpen}
+                  <div class="cap-body">
+                  <label class="cap-head">
+                    <input type="checkbox" checked={capDraft.enabled} on:change={toggleCap} />
+                    <span>{$t.capEnable}</span>
+                  </label>
+                  {#if capDraft.enabled}
+                    <div class="cap-form">
+                      <select bind:value={capDraft.mode}>
+                        <option value="percent">{$t.capModePercent}</option>
+                        <option value="fixed">{$t.capModeFixed}</option>
+                      </select>
+                      {#if capDraft.mode === "percent"}
+                        <span class="cap-input"><input type="number" min="1" max="100" step="1" bind:value={capDraft.percent} /> %</span>
+                      {:else}
+                        <span class="cap-input"><input type="number" min="0.0001" step="0.01" bind:value={capDraft.fixed_xmr} /> {$currentNetwork.symbol}</span>
+                      {/if}
+                      <select bind:value={capDraft.period_days}>
+                        {#each CAP_PERIODS as d}
+                          <option value={d}>{fmt($t.capPerDays, { days: d })}</option>
+                        {/each}
+                      </select>
+                      {#if capDirty}
+                        <button class="btn-primary btn-sm" on:click={() => saveWalletCap()}>{$t.commonSave}</button>
+                      {/if}
+                    </div>
+                    {#if walletCap?.cap?.enabled && walletCap.cap_xmr != null}
+                      <div class="limit-bar">
+                        <div class="limit-fill" style="width:{walletCap.cap_xmr > 0 ? Math.min(walletCap.sent_xmr / walletCap.cap_xmr * 100, 100) : 100}%; background:{walletCap.remaining_xmr > 0 ? w.color : '#ef4444'}"></div>
+                      </div>
+                      <span class="text-muted cap-usage">
+                        {fmt($t.capUsage, {
+                          sent: walletCap.sent_xmr.toFixed(4),
+                          cap: walletCap.cap_xmr.toFixed(4),
+                          days: walletCap.cap.period_days,
+                          remaining: walletCap.remaining_xmr.toFixed(4),
+                          sym: $currentNetwork.symbol,
+                        })}
+                      </span>
+                    {/if}
+                  {/if}
+                  <span class="text-muted cap-hint">{capDraft.enabled ? $t.capHint : $t.capOffHint}</span>
+                  {#if capError && !capPrompt}<span style="color:#ef4444;font-size:11px">{capError}</span>{/if}
+                  </div>
+                  {/if}
+                </div>
+              {/if}
             </div><!-- /wallet-body -->
             </div><!-- /wallet-card -->
           {/each}
@@ -2239,24 +2428,31 @@
             {$t.historyEmpty}
           </div>
         {:else}
-          <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
+          <div class="history-actions">
+            <button class="btn-ghost btn-sm" style="font-size:11px" on:click={exportHistory}>⬇ {$t.historyExportBtn}</button>
             <button class="btn-ghost btn-sm" style="color:#ef4444;font-size:11px"
               on:click={clearHistory}>{$t.historyClearBtn}</button>
           </div>
           <div class="history-list">
-            {#each [...historyEntries].reverse() as p}
-              <div class="history-card card">
-                <div class="history-row">
-                  <span class="history-label">{p.sub_label}</span>
-                  <span class="history-amount">{p.amount_xmr.toFixed(4)} XMR</span>
+            {#each historyGroups as g (g.key)}
+              <div class="history-sep"><span>{g.label}</span></div>
+              {#each g.items as p}
+                <div class="history-card card">
+                  <div class="history-row">
+                    <span class="history-label">{p.sub_label}</span>
+                    <span class="history-amount">{p.amount_xmr.toFixed(4)} XMR</span>
+                  </div>
+                  <div class="history-row history-meta">
+                    <span class="history-when">
+                      <span class="text-muted">{new Date(p.sent_at).toLocaleString($currentLang)}</span>
+                      <span class="history-ago">{relativeTime(p.sent_at, nowTick, $currentLang)}</span>
+                    </span>
+                    {#if p.tx_prefix}
+                      <span class="history-tx">tx: {p.tx_prefix}…</span>
+                    {/if}
+                  </div>
                 </div>
-                <div class="history-row history-meta">
-                  <span class="text-muted">{new Date(p.sent_at).toLocaleString($currentLang)}</span>
-                  {#if p.tx_prefix}
-                    <span class="history-tx">tx: {p.tx_prefix}…</span>
-                  {/if}
-                </div>
-              </div>
+              {/each}
             {/each}
           </div>
           <!-- Totals by sub -->
@@ -3207,7 +3403,16 @@
   .ios-toggle-btn.ios-on .ios-thumb-btn { left: 23px; }
   .history-list { display: flex; flex-direction: column; gap: 8px; }
   .history-card { padding: 12px 16px; }
-  .history-row { display: flex; justify-content: space-between; align-items: center; }
+  .history-row { display: flex; justify-content: space-between; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+  .history-actions { display: flex; justify-content: flex-end; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .history-sep {
+    display: flex; align-items: center; gap: 10px; margin: 10px 0 2px;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);
+  }
+  .history-sep:first-child { margin-top: 0; }
+  .history-sep::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  .history-when { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; font-size: 12px; }
+  .history-ago { font-size: 11px; color: var(--accent); font-weight: 600; white-space: nowrap; }
   .history-label { font-weight: 600; font-size: 14px; }
   .history-amount { font-weight: 700; color: var(--accent); font-size: 14px; }
   .history-meta { margin-top: 4px; }
@@ -3364,7 +3569,22 @@
     overflow: hidden;
   }
   .wallet-color-bar { width: 5px; flex-shrink: 0; }
-  .wallet-body { flex: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .wallet-body { flex: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .wallet-card { cursor: pointer; }
+  .cap-box { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; border-top: 1px solid var(--border, rgba(255,255,255,0.08)); }
+  .cap-summary { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; padding: 2px 0; font-size: 12px; text-align: left; cursor: pointer; color: inherit; }
+  .cap-summary .cap-chevron { margin-left: auto; transition: transform 0.15s; color: var(--text-muted); }
+  .cap-summary .cap-chevron.open { transform: rotate(90deg); }
+  .cap-full { color: #ef4444; font-size: 9px; }
+  .cap-body { display: flex; flex-direction: column; gap: 6px; cursor: default; font-size: 12px; }
+  .cap-head { display: flex; flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px; cursor: pointer; margin: 0; text-align: left; }
+  .cap-head input[type="checkbox"] { width: auto; margin: 0; flex: none; }
+  .cap-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+  .cap-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .cap-form select { width: auto; flex: 0 1 auto; font-size: 12px; padding: 4px 26px 4px 8px; min-width: 0; }
+  .cap-input { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+  .cap-input input { width: 80px; font-size: 12px; padding: 4px 6px; }
+  .cap-usage, .cap-hint { font-size: 10.5px; line-height: 1.4; }
   .wallet-top { display: flex; justify-content: space-between; align-items: flex-start; }
   .wallet-name { font-weight: 700; font-size: 14px; }
   .wallet-desc { font-size: 12px; margin-top: 2px; }
