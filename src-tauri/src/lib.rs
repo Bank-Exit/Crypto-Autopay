@@ -35,6 +35,7 @@ use autopay_core::models::{Subscription, SubscriptionStatus};
 mod rpc_manager;
 mod payment_policy;
 mod unlock_guard;
+mod log_retention;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -866,6 +867,72 @@ fn log_readiness(app_handle: &tauri::AppHandle, daemon_reachable: bool, balance_
     }
 }
 
+/// Seconds between two plain-language status lines (day and night follow-up).
+const STATUS_HEARTBEAT_SECS: i64 = 30 * 60;
+/// Seconds between two passes of the age-based log cleanup.
+const LOG_PRUNE_SECS: i64 = 3600;
+static LAST_STATUS_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static LAST_LOG_PRUNE_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Every 30 min, one non-technical line telling whether AutoPay can pay.
+/// Also runs the hourly log cleanup. No amounts, no addresses.
+fn status_heartbeat(app: &tauri::AppHandle) {
+    let now = chrono::Utc::now().timestamp();
+    if now - LAST_LOG_PRUNE_AT.load(Ordering::Relaxed) >= LOG_PRUNE_SECS {
+        LAST_LOG_PRUNE_AT.store(now, Ordering::Relaxed);
+        if let Ok(log_dir) = app.path().app_log_dir() {
+            log_retention::prune(&log_dir);
+        }
+    }
+    if now - LAST_STATUS_AT.load(Ordering::Relaxed) < STATUS_HEARTBEAT_SECS {
+        return;
+    }
+    LAST_STATUS_AT.store(now, Ordering::Relaxed);
+
+    let Some((unlocked, ready, last_refresh)) = app.try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| (s.unlocked, s.ready_state, s.last_refresh_at)))
+    else { return };
+    if !unlocked {
+        log::info!("[Status] 🔒 AutoPay locked — no payment until the wallet is unlocked");
+        return;
+    }
+    let (active, next_at) = app.try_state::<Mutex<Database>>()
+        .and_then(|db| db.lock().ok().and_then(|db| db.list_subscriptions().ok()))
+        .map(|subs| {
+            let active: Vec<_> = subs.iter().filter(|s| s.status == SubscriptionStatus::Active).collect();
+            (active.len(), active.iter().filter_map(|s| s.next_payment_at).min())
+        })
+        .unwrap_or((0, None));
+    let next = match next_at {
+        Some(t) => {
+            let mins = (t.timestamp() - now) / 60;
+            if mins <= 0 { "next payment due now".to_string() } else { format!("next payment in {}", human_minutes(mins)) }
+        }
+        None => "no payment scheduled".to_string(),
+    };
+    let sync_age_min = (now - last_refresh) / 60;
+    let stale = if last_refresh > 0 && sync_age_min >= 10 {
+        format!(" (last sync {} ago)", human_minutes(sync_age_min))
+    } else {
+        String::new()
+    };
+    match ready {
+        Some("ready") => log::info!("[Status] 🟢 AutoPay active — {} active subscription(s), {}{}", active, next, stale),
+        Some("idle") => log::info!("[Status] 🟢 AutoPay active — no active subscription{}", stale),
+        Some("low") => log::warn!("[Status] 🟠 AutoPay active but funds do not cover the next payment — {}{}", next, stale),
+        Some(_) => log::warn!("[Status] 🔴 AutoPay cannot reach a remote node — {}{}", next, stale),
+        None => log::info!("[Status] ⏳ AutoPay unlocked, wallet not synced yet — {}", next),
+    }
+}
+
+fn human_minutes(mins: i64) -> String {
+    match mins {
+        m if m < 60 => format!("{m} min"),
+        m if m < 48 * 60 => format!("{} h {:02} min", m / 60, m % 60),
+        m => format!("{} days", m / (24 * 60)),
+    }
+}
+
 /// Return current active alerts (for frontend badge display).
 #[tauri::command]
 async fn get_alerts(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<AppAlert>, String> {
@@ -1287,6 +1354,33 @@ fn check_new_subscription(
         return Err(payment_policy::PolicyError::MonthlyTotal(projected).to_string());
     }
     Ok(())
+}
+
+/// How long technical logs are kept on disk, in hours (0 = not written).
+#[tauri::command]
+async fn get_log_retention() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "hours": log_retention::hours(),
+        "max_hours": log_retention::MAX_HOURS,
+    }))
+}
+
+#[tauri::command]
+async fn set_log_retention(hours: u32, app_handle: tauri::AppHandle) -> Result<(), String> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    log_retention::save(&data_dir, hours)?;
+    log::info!("[Logs] Retention set to {} h", hours);
+    if let Ok(log_dir) = app_handle.path().app_log_dir() {
+        log_retention::prune(&log_dir);
+    }
+    Ok(())
+}
+
+/// Log lines still inside the retention window, for the logs drawer.
+#[tauri::command]
+async fn get_log_history(app_handle: tauri::AppHandle) -> Result<Vec<log_retention::HistoryLine>, String> {
+    let log_dir = app_handle.path().app_log_dir().map_err(|e| e.to_string())?;
+    Ok(log_retention::history(&log_dir))
 }
 
 /// Current payment limits and the fixed thresholds (for the Settings page).
@@ -2601,9 +2695,13 @@ pub fn run() {
             // Logs go to stdout, to the webview (logs drawer, via @tauri-apps/plugin-log) and to a
             // rotating file in the app log dir that keeps recording while the window is closed.
             // Log lines must never contain amounts or addresses; the dir is owner-only.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                log_retention::load(&data_dir);
+            }
             if let Ok(log_dir) = app.path().app_log_dir() {
                 let _ = std::fs::create_dir_all(&log_dir);
                 restrict_permissions(&log_dir);
+                log_retention::prune(&log_dir);
             }
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
@@ -2614,10 +2712,12 @@ pub fn run() {
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
                             file_name: Some("autopay".into()),
-                        }),
+                        })
+                        .filter(|_| log_retention::file_enabled()),
                     ])
                     .max_file_size(2_000_000)
-                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                    // Old files are removed by age (log_retention::prune), not by count.
+                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                     .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
                     .build(),
             )?;
@@ -2636,6 +2736,7 @@ pub fn run() {
                         interval.tick().await;
                         background_refresh(&sched_handle).await;
                         run_payment_scheduler(&sched_handle).await;
+                        status_heartbeat(&sched_handle);
                     }
                 });
             }
@@ -2723,6 +2824,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_log_retention,
+            set_log_retention,
+            get_log_history,
             get_pending_deep_link,
             lock_wallet,
             generate_seed,

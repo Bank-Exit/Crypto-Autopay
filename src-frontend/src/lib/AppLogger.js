@@ -4,7 +4,8 @@
  * SECURITY RULES (MANDATORY):
  *   - Never log amounts, wallet addresses, seeds, private keys or any PII.
  *   - "send logs" (opt-in) store only a subscription id + event type — no amounts, no recipients.
- *   - Logs are kept in RAM only; send-logs persist to localStorage in encrypted form.
+ *   - Logs are kept in RAM only (the Rust side keeps its own file, trimmed to the retention
+ *     window); send-logs persist to localStorage in encrypted form.
  *
  * Usage:
  *   import { logDebug, logInfo, logWarn, logError, logSend } from "./AppLogger.js";
@@ -13,7 +14,9 @@
  *   logSend("sub_42", "payment_attempted");
  */
 
-const MAX_TECH = 500;   // maximum technical log entries kept in RAM
+// Separate caps so that chatty debug lines never evict status, warning and error lines.
+const MAX_DEBUG = 3000;
+const MAX_OTHER = 3000;
 const MAX_SEND = 1000;  // maximum send-log entries (persisted)
 
 // Regex patterns of data that MUST never appear in logs
@@ -30,8 +33,51 @@ function sanitize(msg) {
 }
 
 // ----- Technical logs (always on, RAM only) -----
-let _entries = [];
+let _entries = [];   // newest first
+let _seq = 0;
+let _retentionHours = 12;
 const _listeners = new Set();
+
+const _isDebug = e => e.level === "debug";
+
+/** Age window (hours) shared with the Rust log file. 0: debug lines are not kept. */
+export function setLogRetentionHours(h) {
+  _retentionHours = Math.max(0, Number(h) || 0);
+  _trim();
+  _notify();
+}
+
+function _trim() {
+  const cutoff = Date.now() - _retentionHours * 3600_000;
+  // Without retention, status/warning/error lines still stay for the current session.
+  _entries = _entries.filter(e => _isDebug(e) ? _retentionHours > 0 && Date.parse(e.t) >= cutoff
+                                              : _retentionHours === 0 || Date.parse(e.t) >= cutoff);
+  let debug = 0, other = 0;
+  _entries = _entries.filter(e => _isDebug(e) ? ++debug <= MAX_DEBUG : ++other <= MAX_OTHER);
+}
+
+/** Prepend lines read back from the Rust log file (oldest first), older than anything in RAM. */
+export function seedHistory(lines) {
+  const known = _entries.length ? Date.parse(_entries[_entries.length - 1].t) : Infinity;
+  const old = [];
+  for (const l of lines || []) {
+    if (Date.parse(l.t) >= known) continue;
+    const level = l.level === "trace" ? "debug" : l.level;
+    old.unshift({ id: ++_seq, t: new Date(l.t).toISOString(), level, module: l.module, msg: sanitize(l.msg) });
+  }
+  _entries = [..._entries, ...old];
+  _trim();
+  _notify();
+}
+
+/** Local time of an entry, with the day when it is not today. */
+export function formatLogTime(t) {
+  if (!t) return "??:??:??";
+  const d = new Date(t);
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  if (d.toDateString() === new Date().toDateString()) return time;
+  return `${d.toLocaleDateString([], { day: "2-digit", month: "2-digit" })} ${time}`;
+}
 
 function _notify() {
   const snap = [..._entries];
@@ -40,9 +86,10 @@ function _notify() {
 
 function _add(level, module, msg) {
   const safe = sanitize(msg);
-  const entry = { t: new Date().toISOString(), level, module, msg: safe };
+  const entry = { id: ++_seq, t: new Date().toISOString(), level, module, msg: safe };
   _entries.unshift(entry);
-  if (_entries.length > MAX_TECH) _entries.length = MAX_TECH;
+  if (_retentionHours === 0 && level === "debug") _entries.shift();
+  if (_entries.length > MAX_DEBUG + MAX_OTHER || _seq % 200 === 0) _trim();
   // Also mirror to browser console
   if (level === "error") console.error(`[${module}] ${safe}`);
   else if (level === "warn") console.warn(`[${module}] ${safe}`);

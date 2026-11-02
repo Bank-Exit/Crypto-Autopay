@@ -133,6 +133,8 @@
   export let wallets = [];
   // All subscriptions passed from parent (Dashboard manages the list)
   export let subscriptions = [];
+  // Sub ids whose last attempt failed or hit locked funds: the countdown is a retry, not a sent payment.
+  export let retrySubIds = new Set();
 
   const SUSPENDED_STATUSES = ["Suspended", "Cancelled", "Expired"];
   const ARCHIVED_STATUSES = ["Cancelled", "Expired"];
@@ -246,15 +248,15 @@
 
             <!-- NEXT date only if not suspended -->
             {#if !isSuspended(sub) && sub.next_payment_at}
-              <span class="next-date">
-                <span class="text-muted">{$t.next}</span>
+              <span class="next-date" class:retry-date={retrySubIds.has(sub.id)}>
+                <span class="text-muted">{retrySubIds.has(sub.id) ? $t.retryNext : $t.next}</span>
                 <strong>{formatDate(sub.next_payment_at, $currentLang)}</strong>
               </span>
               <!-- Pie countdown timer -->
               <span class="pie-wrap" title={countdownText(sub, now)}>
                 <svg width="24" height="24" viewBox="0 0 24 24">
                   <circle cx="12" cy="12" r="10" fill="var(--bg-sidebar)" stroke="var(--border)" stroke-width="1.5"/>
-                  <path d={piePath(pieFraction(sub, now))} fill="var(--accent)" opacity="0.8"/>
+                  <path d={piePath(pieFraction(sub, now))} fill={retrySubIds.has(sub.id) ? "var(--orange)" : "var(--accent)"} opacity="0.8"/>
                   <circle cx="12" cy="12" r="10" fill="none" stroke="var(--border)" stroke-width="1.5"/>
                 </svg>
                 <span class="countdown-label">{countdownText(sub, now)}</span>
@@ -448,4 +450,5 @@
   }
   .archived-divider-label { padding: 0 8px; white-space: nowrap; }
   .btn-sm { padding: 5px 10px; font-size: 13px; }
+  .retry-date strong { color: var(--orange); }
 </style>

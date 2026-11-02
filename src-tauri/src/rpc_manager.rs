@@ -663,7 +663,7 @@ fn http_post_json(
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     let method_hint = body.get("method").and_then(|m| m.as_str()).unwrap_or("?");
-    log::debug!("[RPC/HTTP] POST {} method={}", url, method_hint);
+    log::trace!("[RPC/HTTP] POST {} method={}", url, method_hint);
 
     let without_scheme = url.trim_start_matches("http://");
     let slash_pos = without_scheme.find('/').unwrap_or(without_scheme.len());
@@ -690,7 +690,7 @@ fn http_post_json(
     }
 
     // Bodies carry balances, addresses and tx hashes: only their size may be logged.
-    log::debug!("[RPC/HTTP] {} response ({}B)", method_hint, json_body.len());
+    log::trace!("[RPC/HTTP] {} response ({}B)", method_hint, json_body.len());
 
     serde_json::from_str(&json_body).map_err(|e| {
         let msg = format!("JSON parse error: {} ({}B body, HTTP {})", e, json_body.len(), status);

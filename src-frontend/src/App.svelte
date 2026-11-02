@@ -7,7 +7,7 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
-  import { subscribeToLogs, logDebug, logInfo, logWarn, logError } from "./lib/AppLogger.js";
+  import { subscribeToLogs, logDebug, logInfo, logWarn, logError, setLogRetentionHours, seedHistory, formatLogTime } from "./lib/AppLogger.js";
   import { t } from "./lib/i18n.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
@@ -63,6 +63,14 @@
     // Forward Rust log events (tauri-plugin-log webview target) into AppLogger.
     // The handle lives on window: a hot-reloaded module must replace the previous
     // listener, not add a second one (each one would print every Rust line again).
+    // Earlier lines (previous sessions, night runs) come back from the Rust log file.
+    try {
+      const r = await invoke("get_log_retention");
+      setLogRetentionHours(r?.hours ?? 12);
+      seedHistory(await invoke("get_log_history"));
+    } catch (e) {
+      // Browser dev mode: no backend
+    }
     try {
       const { attachLogger } = await import("@tauri-apps/plugin-log");
       window.__autopayRustLogUnlisten?.();
@@ -236,9 +244,9 @@
         {#if filteredLogs.length === 0}
           <div class="logs-empty">Aucun log{logFilter !== "all" ? " de ce type" : ""}.</div>
         {:else}
-          {#each filteredLogs as log}
+          {#each filteredLogs as log (log.id)}
             <div class="log-line log-{log.level}">
-              <span class="log-time">{log.t ? log.t.slice(11,19) : "??:??:??"}</span>
+              <span class="log-time">{formatLogTime(log.t)}</span>
               <span class="log-mod">[{log.module}]</span>
               <span class="log-msg">{log.msg}</span>
             </div>
@@ -247,7 +255,7 @@
       </div>
       <div class="logs-footer">
         <button on:click={() => {
-          const txt = filteredLogs.map(l => `${l.t ? l.t.slice(11,19) : "??"} [${l.level}] [${l.module}] ${l.msg}`).join('\n');
+          const txt = filteredLogs.map(l => `${formatLogTime(l.t)} [${l.level}] [${l.module}] ${l.msg}`).join('\n');
           navigator.clipboard.writeText(txt).catch(() => {});
         }}>📋 Copier</button>
         <span class="logs-hint">Ces logs ne contiennent ni montant ni adresse.</span>

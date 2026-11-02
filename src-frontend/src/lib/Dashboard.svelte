@@ -68,6 +68,7 @@
       limitPrompt = null;
       limitPassword = "";
       await loadPaymentLimits();
+    await loadLogRetention();
       await refreshAlerts();
     } catch (e) {
       limitError = String(e).includes("Incorrect password") ? $t.unlockWrongPassword : String(e);
@@ -98,6 +99,32 @@
   /** Refusals that a setting in "Security limits" can lift. */
   function policyNeedsSettings(err) {
     return /POLICY:(AMOUNT_ABOVE_MAX|CADENCE_TOO_SHORT)/.test(String(err));
+  }
+
+  const LOG_RETENTION_CHOICES = [0, 1, 6, 12, 24, 72, 168, 336, 720, 1440];
+  let logRetentionHours = 12;
+
+  function retentionLabel(h, tr) {
+    if (h === 0) return tr.logsRetentionOff;
+    if (h < 24) return `${h} h`;
+    return `${h / 24} ${tr.logsRetentionDays}`;
+  }
+
+  async function loadLogRetention() {
+    const r = await tauriInvoke("get_log_retention");
+    if (r) logRetentionHours = r.hours;
+  }
+
+  async function saveLogRetention(h) {
+    const previous = logRetentionHours;
+    logRetentionHours = h;
+    try {
+      await invokeStrict("set_log_retention", { hours: h });
+      setLogRetentionHours(h);
+    } catch (e) {
+      logRetentionHours = previous;
+      logError("Settings", `Log retention not saved: ${e}`);
+    }
   }
 
   async function reloadSubscriptions() {
@@ -357,7 +384,8 @@
     activeAlerts = alerts || [];
   }
   import { logDebug, logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
-           setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs } from "./AppLogger.js";
+           setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs,
+           setLogRetentionHours, formatLogTime } from "./AppLogger.js";
 
   // Tauri shell.open for external links (safe fallback for browser dev)
   // Moves the due date in the DB (postpone 1 h, or skip to the next occurrence);
@@ -789,6 +817,9 @@
   let rpcBinaryPopupShown = false;
   $: rpcDiag = rpcError ? rpcDiagnosis(rpcError, $t) : null;
   $: if (rpcDiag?.binaryMissing && !rpcBinaryPopupShown) { rpcBinaryPopupShown = true; showRpcBinaryPopup = true; }
+  $: retrySubIds = new Set(activeAlerts
+    .filter(a => a.sub_id && (a.kind === 'PAYMENT_FAILED' || a.kind === 'OUTPUTS_LOCKED'))
+    .map(a => a.sub_id));
   $: hasRedAlert = activeAlerts.some(a => a.level === 'Red');
   $: hasOrangeAlert = activeAlerts.some(a => a.level === 'Orange');
   $: healthLevel = (hasRedAlert || rpcDiag?.level === 'error') ? 'red'
@@ -1240,18 +1271,9 @@
 
     // Listen for Rust background scheduler events
     await listenWhileMounted("payment-locked", async (ev) => {
-      const { sub_id, retry_in_min, next_payment_at } = ev.payload || {};
-      logWarn("Scheduler", `[ATTENTE] Fonds verrouilles pour sub #${sub_id} — retry automatique dans ${retry_in_min} min`);
-      // Update in-memory subscription so frontend shows correct next time (not "Maintenant")
-      if (sub_id && next_payment_at) {
-        subscriptions = subscriptions.map(s =>
-          s.id === sub_id ? { ...s, next_payment_at } : s
-        );
-      } else if (sub_id) {
-        // Reload from DB to get the deferred time
-        const fresh = await tauriInvoke("get_subscriptions");
-        if (fresh) subscriptions = fresh.map(dbSubToUi);
-      }
+      const { sub_id, retry_in_min } = ev.payload || {};
+      logWarn("Scheduler", `Funds locked for sub ${sub_id} — automatic retry in ${retry_in_min} min`);
+      await reloadSubscriptions();
       await refreshAlerts();
     });
 
@@ -1284,13 +1306,9 @@
             label: sub.label, amount: sub.amount, currency: sub.currency || 'XMR',
             sent_at: new Date().toISOString(), tx_hash: payload.tx_hash || null,
           }];
-          // Update in-memory next_payment_at so frontend shows correct countdown
-          subscriptions = subscriptions.map(s => s.id === payload.sub_id
-            ? { ...s, status: "Active", payments_sent: (s.payments_sent || 0) + 1,
-                next_payment_at: payload.next_payment_at || s.next_payment_at }
-            : s);
         }
       }
+      await reloadSubscriptions();
       await loadHistoryEntries();
       await refreshAlerts();
       setTimeout(refreshBalance, 5000);
@@ -1991,6 +2009,7 @@
       <SubscriptionList
         {wallets}
         {subscriptions}
+        {retrySubIds}
         on:delete-sub={async e => {
           const sub = subscriptions.find(s => s.id === e.detail.id);
           subscriptions = subscriptions.filter(s => s.id !== e.detail.id);
@@ -2528,6 +2547,16 @@
         <p class="log-security-note">
           {$t.logsNote}
         </p>
+        <div class="setting-row">
+          <span class="setting-label">{$t.logsRetention}</span>
+          <select class="setting-select" value={logRetentionHours}
+                  on:change={e => saveLogRetention(Number(e.currentTarget.value))}>
+            {#each LOG_RETENTION_CHOICES as h}
+              <option value={h}>{retentionLabel(h, $t)}</option>
+            {/each}
+          </select>
+        </div>
+        <p class="text-muted" style="font-size:11.5px;margin:-4px 0 10px">{$t.logsRetentionHint}</p>
         <div class="log-toolbar">
           <select bind:value={logFilter} class="setting-select log-filter-select">
             <option value="">{$t.logsFilterAll}</option>
@@ -2542,9 +2571,9 @@
         </div>
         {#if showLogs}
           <div class="log-list">
-            {#each $liveLogs.filter(e => !logFilter || e.level === logFilter) as entry (entry.t + entry.msg)}
+            {#each $liveLogs.filter(e => !logFilter || e.level === logFilter) as entry (entry.id)}
               <div class="log-row log-{entry.level}">
-                <span class="log-time">{entry.t.slice(11,19)}</span>
+                <span class="log-time">{formatLogTime(entry.t)}</span>
                 <span class="log-module">[{entry.module}]</span>
                 <span class="log-msg">{entry.msg}</span>
               </div>
