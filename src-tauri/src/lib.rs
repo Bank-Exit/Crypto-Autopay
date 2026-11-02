@@ -1759,6 +1759,39 @@ fn check_send_guards(
     }).map_err(|e| e.to_string())
 }
 
+/// Prepare the transfer without relaying it, check its fee against the cap, then relay.
+/// A malicious or broken node cannot push AutoPay into paying an abnormal fee.
+fn transfer_with_fee_cap(app: &tauri::AppHandle, mgr: &RpcManager, amount_atomic: u64, dest: &str) -> Result<String, String> {
+    let cap = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?
+        .lock().map_err(|e| e.to_string())?.wallet_cap.clone();
+    let rpc_error = |resp: &serde_json::Value| resp.get("error").map(|err| {
+        format!("transfer error: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("?"))
+    });
+
+    let prepared = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        "jsonrpc":"2.0","id":"tx","method":"transfer",
+        "params":{
+            "destinations":[{"amount": amount_atomic, "address": dest}],
+            "account_index": 0, "priority": 1, "get_tx_key": false,
+            "do_not_relay": true, "get_tx_metadata": true
+        }
+    }))?;
+    if let Some(e) = rpc_error(&prepared) { return Err(e); }
+    let fee = prepared["result"]["fee"].as_u64().ok_or("transfer error: no fee in the prepared transaction")?;
+    if let Err(e) = cap.check_fee(fee) {
+        log::warn!("[Payment] 🛑 Prepared transaction dropped: network fee above the cap — nothing sent");
+        return Err(e.to_string());
+    }
+    let metadata = prepared["result"]["tx_metadata"].as_str().filter(|m| !m.is_empty())
+        .ok_or("transfer error: no metadata in the prepared transaction")?;
+
+    let relayed = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        "jsonrpc":"2.0","id":"relay","method":"relay_tx","params":{"hex": metadata}
+    }))?;
+    if let Some(e) = rpc_error(&relayed) { return Err(e); }
+    Ok(relayed["result"]["tx_hash"].as_str().unwrap_or("").to_string())
+}
+
 /// Wallet cap settings and current usage for the Wallets page.
 #[tauri::command]
 async fn get_wallet_cap(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
@@ -1787,9 +1820,9 @@ async fn set_wallet_cap(
     if cap.is_looser_than(&s.wallet_cap) {
         check_master_password(&s, password)?;
     }
-    log::info!("[Policy] Wallet guards updated: cap={} ({:?}, {} days), floor={}, daily sends={}, new-address delay={} h",
+    log::info!("[Policy] Wallet guards updated: cap={} ({:?}, {} days), floor={}, daily sends={}, new-address delay={} h, fee cap={}",
         cap.enabled, cap.mode, cap.period_days, cap.floor_xmr > 0.0, cap.max_sends_per_day,
-        cap.new_address_delay_hours);
+        cap.new_address_delay_hours, cap.max_fee_xmr > 0.0);
     s.wallet_cap = cap;
     save_policy_vault(&s)?;
     s.cap_blocked_until.clear();
@@ -2705,24 +2738,16 @@ async fn execute_pv_payment(
             return Err(e);
         }
 
-        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"tx","method":"transfer",
-            "params":{
-                "destinations":[{"amount": amount_pico, "address": dest}],
-                "account_index": 0,
-                "priority": 1,
-                "get_tx_key": false
-            }
-        }));
+        let sent = transfer_with_fee_cap(&app_rpc, &mgr, amount_pico, &dest);
         return_wallet_session(mgr);
-        let resp = resp?;
-
-        if let Some(err) = resp.get("error") {
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-            log::error!("[Treasurer] PV id={} — transfer error: {}", pv_id, msg);
-            return Err(format!("Payment failed: {}", msg));
-        }
-        let tx_hash = resp["result"]["tx_hash"].as_str().unwrap_or("").to_string();
+        let tx_hash = match sent {
+            Ok(h) => h,
+            Err(e) if e.starts_with("POLICY:") => return Err(e),
+            Err(e) => {
+                log::error!("[Treasurer] PV id={} — {}", pv_id, e);
+                return Err(format!("Payment failed: {}", e));
+            }
+        };
         if tx_hash.is_empty() {
             return Err("Payment failed: transfer returned no tx_hash".to_string());
         }
@@ -2829,21 +2854,9 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
             return Err(e);
         }
 
-        let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-            "jsonrpc":"2.0","id":"tx","method":"transfer",
-            "params":{
-                "destinations":[{"amount": amount_pico, "address": dest}],
-                "account_index": 0, "priority": 1
-            }
-        }));
+        let sent = transfer_with_fee_cap(&app_rpc, &mgr, amount_pico, &dest);
         return_wallet_session(mgr);
-        let resp = resp?;
-
-        if let Some(err) = resp.get("error") {
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-            return Err(format!("transfer error: {}", msg));
-        }
-        Ok(resp["result"]["tx_hash"].as_str().unwrap_or("").to_string())
+        sent
     }).await;
 
     match result {
@@ -2858,8 +2871,11 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
                 }
             }
             // Next occurrence after now: a long-overdue subscription must not
-            // trigger a burst of catch-up payments.
-            let new_next = next_occurrence(&sub.schedule, Utc::now());
+            // trigger a burst of catch-up payments. Slots inside the send
+            // cooldown are skipped, otherwise the countdown shows a slot that
+            // cannot be paid (e.g. "*/25" sent at :57 would be due at :00).
+            let cooldown_end = Utc::now() + chrono::Duration::seconds(MONERO_MIN_SEND_INTERVAL_SECS as i64 - 60);
+            let new_next = next_occurrence(&sub.schedule, cooldown_end);
             {
                 if let Ok(db) = db_state.lock() {
                     if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {

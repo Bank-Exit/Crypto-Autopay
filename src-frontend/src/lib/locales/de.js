@@ -328,6 +328,8 @@ export default {
   policySubCap: "Obergrenze dieses Abonnements erreicht: noch {remaining} XMR in 30 Tagen. Nichts wurde gesendet.",
   policyNewAddressDelay: "Neue Adresse: erste Zahlung in {h} h möglich.",
   alertNodeStalled: "Der Monero-Knoten empfängt keine Blöcke mehr — Knotenwechsel.",
+  policyFeeCap: "Ungewöhnliche Netzwerkgebühr (über {fee} XMR): Transaktion verworfen, nichts wurde gesendet.",
+  guardMaxFee: "Max. Netzwerkgebühr",
   guardFloor: "Mindestguthaben",
   guardDailySends: "Max. Zahlungen pro 24 h",
   guardSendsToday: "{n} Zahlung(en) in den letzten 24 h",

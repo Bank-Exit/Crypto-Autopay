@@ -7,7 +7,7 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
-  import { subscribeToLogs, logDebug, logInfo, logWarn, logError, setLogRetentionHours, seedHistory, formatLogTime } from "./lib/AppLogger.js";
+  import { subscribeToLogs, logDebug, logInfo, logWarn, logError, setLogRetentionHours, seedHistory, formatLogTime, clearLogs } from "./lib/AppLogger.js";
   import { t } from "./lib/i18n.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
@@ -256,6 +256,7 @@
           const txt = filteredLogs.map(l => `${formatLogTime(l.t)} [${l.level}] [${l.module}] ${l.msg}`).join('\n');
           navigator.clipboard.writeText(txt).catch(() => {});
         }}>📋 Copier</button>
+        <button title="Vide l'affichage ; le fichier de logs reste conservé selon la durée choisie" on:click={clearLogs}>🗑 {$t.commonClear}</button>
         <span class="logs-hint">Ces logs ne contiennent ni montant ni adresse.</span>
       </div>
     </div>

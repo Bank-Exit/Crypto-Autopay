@@ -328,6 +328,8 @@ export default {
   policySubCap: "Plafond de cet abonnement atteint : il reste {remaining} XMR sur 30 jours. Rien n'a été envoyé.",
   policyNewAddressDelay: "Nouvelle adresse : premier envoi possible dans {h} h.",
   alertNodeStalled: "Le nœud Monero ne reçoit plus de blocs — changement de nœud.",
+  policyFeeCap: "Frais réseau anormaux (au-delà de {fee} XMR) : transaction annulée, rien n'a été envoyé.",
+  guardMaxFee: "Frais réseau max.",
   guardFloor: "Solde plancher",
   guardDailySends: "Envois max. sur 24 h",
   guardSendsToday: "{n} envoi(s) sur les dernières 24 h",

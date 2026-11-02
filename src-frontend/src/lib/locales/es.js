@@ -328,6 +328,8 @@ export default {
   policySubCap: "Límite de esta suscripción alcanzado: quedan {remaining} XMR en 30 días. No se envió nada.",
   policyNewAddressDelay: "Dirección nueva: primer envío posible en {h} h.",
   alertNodeStalled: "El nodo Monero ya no recibe bloques — cambiando de nodo.",
+  policyFeeCap: "Comisión de red anormal (más de {fee} XMR): transacción descartada, no se envió nada.",
+  guardMaxFee: "Comisión de red máx.",
   guardFloor: "Saldo mínimo",
   guardDailySends: "Envíos máx. en 24 h",
   guardSendsToday: "{n} envío(s) en las últimas 24 h",

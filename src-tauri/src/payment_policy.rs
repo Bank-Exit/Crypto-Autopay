@@ -72,6 +72,8 @@ pub struct WalletCap {
     pub max_sends_per_day: u32,
     /// Hours between approving a never-paid address and the first payment to it (0 = off).
     pub new_address_delay_hours: u32,
+    /// Network fee above which a prepared payment is dropped instead of relayed (0 = off).
+    pub max_fee_xmr: f64,
 }
 
 impl Default for WalletCap {
@@ -79,9 +81,13 @@ impl Default for WalletCap {
         Self {
             enabled: true, mode: CapMode::Percent, percent: 33, fixed_xmr: 1.0, period_days: 30,
             floor_xmr: 0.0, max_sends_per_day: 0, new_address_delay_hours: 0,
+            max_fee_xmr: DEFAULT_MAX_FEE_XMR,
         }
     }
 }
+
+/// Normal fees are around 0.00003 XMR; 0.001 only trips on an abnormal fee market.
+pub const DEFAULT_MAX_FEE_XMR: f64 = 0.001;
 
 /// Days covered by a per-subscription cap.
 pub const SUB_CAP_DAYS: i64 = 30;
@@ -124,6 +130,9 @@ impl WalletCap {
         if !(self.floor_xmr.is_finite() && self.floor_xmr >= 0.0) { return Err("Floor must be zero or positive.".into()); }
         if self.max_sends_per_day > 1000 { return Err("At most 1000 sends per day.".into()); }
         if self.new_address_delay_hours > 168 { return Err("Delay must be at most 168 hours.".into()); }
+        if !(self.max_fee_xmr.is_finite() && (0.0..=0.1).contains(&self.max_fee_xmr)) {
+            return Err("Fee cap must be between 0 and 0.1 XMR.".into());
+        }
         Ok(())
     }
 
@@ -173,6 +182,14 @@ impl WalletCap {
         self.check(c.amount_atomic, c.balance_atomic, c.stats.sent_period)
     }
 
+    /// Err when a prepared transaction's fee is above the cap.
+    pub fn check_fee(&self, fee_atomic: u64) -> Result<(), PolicyError> {
+        if self.max_fee_xmr > 0.0 && fee_atomic > (self.max_fee_xmr * 1e12) as u64 {
+            return Err(PolicyError::FeeCap(self.max_fee_xmr));
+        }
+        Ok(())
+    }
+
     /// True when `self` allows more than `current` (needs the master password).
     pub fn is_looser_than(&self, current: &WalletCap) -> bool {
         let cap_looser = current.enabled && (
@@ -183,7 +200,10 @@ impl WalletCap {
                 });
         let sends_looser = current.max_sends_per_day > 0
             && (self.max_sends_per_day == 0 || self.max_sends_per_day > current.max_sends_per_day);
+        let fee_looser = current.max_fee_xmr > 0.0
+            && (self.max_fee_xmr == 0.0 || self.max_fee_xmr > current.max_fee_xmr);
         cap_looser
+            || fee_looser
             || self.floor_xmr < current.floor_xmr
             || sends_looser
             || self.new_address_delay_hours < current.new_address_delay_hours
@@ -214,6 +234,8 @@ pub enum PolicyError {
     SubCap(f64),
     /// Hours left before a newly approved address may be paid.
     NewAddressDelay(u32),
+    /// Fee cap (XMR) exceeded by the prepared transaction.
+    FeeCap(f64),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -234,6 +256,7 @@ impl std::fmt::Display for PolicyError {
             Self::DailySends(n) => write!(f, "POLICY:DAILY_SENDS:{}", n),
             Self::SubCap(x) => write!(f, "POLICY:SUB_CAP:{:.4}", x),
             Self::NewAddressDelay(h) => write!(f, "POLICY:NEW_ADDRESS_DELAY:{}", h),
+            Self::FeeCap(x) => write!(f, "POLICY:FEE_CAP:{:.4}", x),
         }
     }
 }
@@ -518,6 +541,12 @@ mod tests {
         assert!(WalletCap { max_sends_per_day: 0, ..strict.clone() }.is_looser_than(&strict));
         assert!(WalletCap { new_address_delay_hours: 0, ..strict.clone() }.is_looser_than(&strict));
         assert!(!WalletCap { max_sends_per_day: 2, floor_xmr: 1.0, ..strict.clone() }.is_looser_than(&strict));
+        assert!(WalletCap { max_fee_xmr: 0.0, ..cur.clone() }.is_looser_than(&cur));
+        assert!(WalletCap { max_fee_xmr: 0.01, ..cur.clone() }.is_looser_than(&cur));
+        assert!(!WalletCap { max_fee_xmr: 0.0005, ..cur.clone() }.is_looser_than(&cur));
+        assert_eq!(cur.check_fee(30_000_000), Ok(()));
+        assert_eq!(cur.check_fee(2_000_000_000), Err(PolicyError::FeeCap(0.001)));
+        assert_eq!(WalletCap { max_fee_xmr: 0.0, ..cur.clone() }.check_fee(u64::MAX), Ok(()));
     }
 
     #[test]

@@ -270,6 +270,7 @@
           floor_xmr: Math.max(0, Number(capDraft.floor_xmr) || 0),
           max_sends_per_day: Math.max(0, Math.round(Number(capDraft.max_sends_per_day) || 0)),
           new_address_delay_hours: Number(capDraft.new_address_delay_hours) || 0,
+          max_fee_xmr: Math.max(0, Number(capDraft.max_fee_xmr) || 0),
         },
         password,
       });
@@ -312,6 +313,7 @@
       case "DAILY_SENDS": return fmt(tObj.policyDailySends, { n: m[2] });
       case "SUB_CAP": return fmt(tObj.policySubCap, { remaining: m[2] });
       case "NEW_ADDRESS_DELAY": return fmt(tObj.policyNewAddressDelay, { h: m[2] });
+      case "FEE_CAP": return fmt(tObj.policyFeeCap, { fee: m[2] });
       default: return tObj.policyDefault;
     }
   }
@@ -1163,7 +1165,7 @@
         showInfoNotice($t.payFundsConfirming);
       } else if (invokeError === "PAUSED") {
         logInfo("Scheduler", `[PAUSE] Paiements en pause — sub #${sub.id} non envoye`);
-      } else if (/POLICY:(WALLET_CAP|BALANCE_FLOOR|DAILY_SENDS|SUB_CAP|NEW_ADDRESS_DELAY)/.test(invokeError)) {
+      } else if (/POLICY:(WALLET_CAP|BALANCE_FLOOR|DAILY_SENDS|SUB_CAP|NEW_ADDRESS_DELAY|FEE_CAP)/.test(invokeError)) {
         logWarn("Scheduler", `[RETENU] Garde-fou d'envoi actif pour sub #${sub.id} — rien envoye`);
         showInfoNotice(policyMessage(invokeError, $t));
       } else {
@@ -2582,6 +2584,10 @@
                     <span>{$t.guardDailySends}</span>
                     <span class="cap-input"><input type="number" min="0" max="1000" step="1" bind:value={capDraft.max_sends_per_day} /></span>
                     {#if walletCap?.sends_last_day != null}<span class="text-muted cap-usage">{fmt($t.guardSendsToday, { n: walletCap.sends_last_day })}</span>{/if}
+                  </div>
+                  <div class="guard-row">
+                    <span>{$t.guardMaxFee}</span>
+                    <span class="cap-input"><input type="number" min="0" max="0.1" step="0.0001" bind:value={capDraft.max_fee_xmr} /> {$currentNetwork.symbol}</span>
                   </div>
                   <div class="guard-row">
                     <span>{$t.guardNewAddressDelay}</span>

@@ -328,6 +328,8 @@ export default {
   policySubCap: "This subscription's cap is reached: {remaining} XMR left over 30 days. Nothing was sent.",
   policyNewAddressDelay: "New address: first payment possible in {h} h.",
   alertNodeStalled: "The Monero node stopped receiving blocks — switching node.",
+  policyFeeCap: "Abnormal network fee (above {fee} XMR): transaction dropped, nothing was sent.",
+  guardMaxFee: "Max. network fee",
   guardFloor: "Balance floor",
   guardDailySends: "Max. sends per 24 h",
   guardSendsToday: "{n} send(s) over the last 24 h",
