@@ -537,6 +537,37 @@ async fn get_balance(state: tauri::State<'_, Mutex<AppState>>) -> Result<Balance
     Ok(BalanceResponse { xmr: atomic as f64 / 1e12, atomic, daemon_reachable: s.last_daemon_contact_at.is_some() })
 }
 
+/// LibreMonero price route on its onion service; None until it is published.
+/// Kept here rather than in the frontend so the webview cannot point the Tor client elsewhere.
+const LIBREMONERO_ONION_PRICE_URL: Option<&str> = None;
+/// Local Tor SOCKS ports: tor daemon, then Tor Browser.
+const TOR_SOCKS_PORTS: [u16; 2] = [9050, 9150];
+
+/// Fiat quotes through a local Tor client (opt-in fiat display only, never used for payments).
+#[tauri::command]
+async fn fetch_price_onion() -> Result<serde_json::Value, String> {
+    fetch_json_via_tor(LIBREMONERO_ONION_PRICE_URL.ok_or("ONION_UNAVAILABLE")?).await
+}
+
+async fn fetch_json_via_tor(url: &str) -> Result<serde_json::Value, String> {
+    let mut last_err = String::from("TOR_UNAVAILABLE");
+    for port in TOR_SOCKS_PORTS {
+        // socks5h: the .onion name is resolved by Tor, never by the system resolver.
+        let client = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
+            .and_then(|proxy| reqwest::Client::builder()
+                .proxy(proxy)
+                .timeout(std::time::Duration::from_secs(30))
+                .build())
+            .map_err(|e| e.to_string())?;
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => return resp.json().await.map_err(|e| e.to_string()),
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = format!("TOR_UNAVAILABLE: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
 /// Next due date of a cron schedule (computed here so the frontend never re-implements cron).
 #[tauri::command]
 fn next_occurrence_of(schedule: String) -> String {
@@ -3512,6 +3543,7 @@ pub fn run() {
             sweep_all,
             update_subscription_next_payment,
             next_occurrence_of,
+            fetch_price_onion,
             get_subscriptions,
             add_subscription,
             delete_subscription,
@@ -3533,4 +3565,15 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Needs a local Tor client: `cargo test -- --ignored tor_price`.
+    #[tokio::test]
+    #[ignore]
+    async fn tor_price_route() {
+        let data = super::fetch_json_via_tor("https://libremonero.com/api/v1/price").await.unwrap();
+        assert!(data["xmr"]["eur"].as_f64().is_some_and(|p| p > 0.0));
+    }
 }

@@ -27,7 +27,8 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **No amount/address in logs**: Already implemented — verify no regression with new code paths (scheduler, sweep, send_payment).
 - [ ] **History encryption key rotation**: The history key is derived from the master password with a random per-install salt (`history.salt`). If the user changes their password, old entries become unreadable. Plan: re-encrypt on password change.
 - [ ] **Encrypt subscriptions.db**: addresses, amounts and schedules are stored in clear (file is 0600). Plan: SQLCipher keyed from the master password, which means opening the DB only after unlock (today `Database` is opened at startup and shared everywhere).
-- [ ] **Fiat price (LibreMonero only)**: `src-frontend/src/lib/price.js` is a stub until LibreMonero publishes a public price route: set `LIBREMONERO_PRICE_URL`. Dev builds return a mock rate, release builds show "rate unavailable". Opt-in popup warns that the request reveals the IP; consider routing through Tor later.
+- [x] **Fiat price (LibreMonero only)**: `GET https://libremonero.com/api/v1/price`, opt-in, quotes older than 1 h rejected, 5 min cache. Display only, never used for payments.
+- [ ] **Price over Tor**: set `LIBREMONERO_ONION_PRICE_URL` in `src-tauri/src/lib.rs` once LibreMonero publishes its onion service; the app then tries it first through a local Tor client (SOCKS 9050 / 9150) and falls back to clearnet. Test: `cargo test -p monero-autopay -- --ignored tor_price`.
 - [ ] **Post-quantum consideration**: Current encryption is AES-256-GCM + Argon2id. AES-256 is considered quantum-resistant. For the future: evaluate CRYSTALS-Kyber (ML-KEM) for key encapsulation if a threat model requires it.
 - [ ] **Audit**: Before any public release with real funds, a security audit of `autopay-crypto` crate is strongly recommended.
 
