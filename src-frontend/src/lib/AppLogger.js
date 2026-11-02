@@ -3,21 +3,18 @@
  *
  * SECURITY RULES (MANDATORY):
  *   - Never log amounts, wallet addresses, seeds, private keys or any PII.
- *   - "send logs" (opt-in) store only a subscription id + event type — no amounts, no recipients.
  *   - Logs are kept in RAM only (the Rust side keeps its own file, trimmed to the retention
- *     window); send-logs persist to localStorage in encrypted form.
+ *     window).
  *
  * Usage:
- *   import { logDebug, logInfo, logWarn, logError, logSend } from "./AppLogger.js";
+ *   import { logDebug, logInfo, logWarn, logError } from "./AppLogger.js";
  *   logInfo("Dashboard", "Import modal opened");
  *   logWarn("DeepLink", "Same URL received twice — re-triggering");
- *   logSend("sub_42", "payment_attempted");
  */
 
 // Separate caps so that chatty debug lines never evict status, warning and error lines.
 const MAX_DEBUG = 3000;
 const MAX_OTHER = 3000;
-const MAX_SEND = 1000;  // maximum send-log entries (persisted)
 
 // Regex patterns of data that MUST never appear in logs
 const SENSITIVE_RE = [
@@ -119,49 +116,12 @@ export function clearLogs() {
   _notify();
 }
 
-// ----- Send logs (opt-in, localStorage) -----
-let _sendEnabled = false;
-let _sendLogs = [];
-
-/** Enable or disable the payment send-log (requires explicit user consent). */
-export function setSendLogsEnabled(v) {
-  _sendEnabled = Boolean(v);
-  try { localStorage.setItem("_autopay_send_logs_enabled", _sendEnabled ? "1" : "0"); } catch {}
-}
-
-export const isSendLogsEnabled = () => _sendEnabled;
-
-/**
- * Record a payment event.
- * SECURITY: subscription_id only — NO amount, NO destination address.
- * @param {string} subscriptionId  opaque local ID
- * @param {"payment_attempted"|"payment_sent"|"payment_failed"} event
- */
-export function logSend(subscriptionId, event) {
-  if (!_sendEnabled) return;
-  const entry = { t: new Date().toISOString(), id: String(subscriptionId), event };
-  _sendLogs.unshift(entry);
-  if (_sendLogs.length > MAX_SEND) _sendLogs.length = MAX_SEND;
-  _persistSendLogs();
-}
-
-export function getSendLogs() { return [..._sendLogs]; }
-
-export function clearSendLogs() {
-  _sendLogs = [];
-  try { localStorage.removeItem("_autopay_send_logs"); } catch {}
-}
-
-function _persistSendLogs() {
-  try { localStorage.setItem("_autopay_send_logs", JSON.stringify(_sendLogs)); } catch {}
-}
-
 // ----- Init -----
 (function init() {
   try {
-    _sendEnabled = localStorage.getItem("_autopay_send_logs_enabled") === "1";
-    const raw = localStorage.getItem("_autopay_send_logs");
-    if (raw) _sendLogs = JSON.parse(raw).slice(0, MAX_SEND);
+    // Leftovers of the removed opt-in send log.
+    localStorage.removeItem("_autopay_send_logs");
+    localStorage.removeItem("_autopay_send_logs_enabled");
   } catch {}
   logInfo("AppLogger", "Logger initialised");
 })();

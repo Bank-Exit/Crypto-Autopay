@@ -55,8 +55,9 @@ pub enum CapMode {
     Fixed,
 }
 
-/// Wallet-wide ceiling on what all automatic payments together may send over a rolling period,
-/// whatever the subscriptions say. Checked against the wallet's own outgoing transfers.
+/// Wallet-wide guards on automatic payments, whatever the subscriptions say: a ceiling over a
+/// rolling period, a balance floor, a daily number of sends and a waiting time for new
+/// addresses. Checked against the wallet's own outgoing transfers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct WalletCap {
@@ -65,12 +66,47 @@ pub struct WalletCap {
     pub percent: u32,
     pub fixed_xmr: f64,
     pub period_days: u32,
+    /// Balance that automatic payments never go below (0 = off).
+    pub floor_xmr: f64,
+    /// Sends allowed over the last 24 h (0 = off).
+    pub max_sends_per_day: u32,
+    /// Hours between approving a never-paid address and the first payment to it (0 = off).
+    pub new_address_delay_hours: u32,
 }
 
 impl Default for WalletCap {
     fn default() -> Self {
-        Self { enabled: true, mode: CapMode::Percent, percent: 33, fixed_xmr: 1.0, period_days: 30 }
+        Self {
+            enabled: true, mode: CapMode::Percent, percent: 33, fixed_xmr: 1.0, period_days: 30,
+            floor_xmr: 0.0, max_sends_per_day: 0, new_address_delay_hours: 0,
+        }
     }
+}
+
+/// Days covered by a per-subscription cap.
+pub const SUB_CAP_DAYS: i64 = 30;
+
+/// What the wallet reports about its recent outgoing transfers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct OutStats {
+    /// Amounts + fees within the wallet cap period.
+    pub sent_period: u64,
+    pub sends_last_day: u32,
+    /// Amounts paid to the destination over the last SUB_CAP_DAYS.
+    pub to_dest_recent: u64,
+    pub dest_paid_before: bool,
+}
+
+/// Everything needed to decide whether one automatic payment may leave.
+pub struct SendContext {
+    pub amount_atomic: u64,
+    pub balance_atomic: u64,
+    pub stats: OutStats,
+    /// Per-subscription ceiling over SUB_CAP_DAYS, in XMR.
+    pub sub_cap_xmr: Option<f64>,
+    /// When the destination address was first approved (None: approved before this was tracked).
+    pub dest_first_seen: Option<i64>,
+    pub now: i64,
 }
 
 impl WalletCap {
@@ -85,6 +121,9 @@ impl WalletCap {
         if !(1..=100).contains(&self.percent) { return Err("Percent must be between 1 and 100.".into()); }
         if !(self.fixed_xmr.is_finite() && self.fixed_xmr > 0.0) { return Err("Amount must be positive.".into()); }
         if !(1..=365).contains(&self.period_days) { return Err("Period must be between 1 and 365 days.".into()); }
+        if !(self.floor_xmr.is_finite() && self.floor_xmr >= 0.0) { return Err("Floor must be zero or positive.".into()); }
+        if self.max_sends_per_day > 1000 { return Err("At most 1000 sends per day.".into()); }
+        if self.new_address_delay_hours > 168 { return Err("Delay must be at most 168 hours.".into()); }
         Ok(())
     }
 
@@ -107,16 +146,47 @@ impl WalletCap {
         }
     }
 
+    /// All wallet guards plus the per-subscription ones, cheapest to explain first.
+    pub fn check_send(&self, c: &SendContext) -> Result<(), PolicyError> {
+        if self.max_sends_per_day > 0 && c.stats.sends_last_day >= self.max_sends_per_day {
+            return Err(PolicyError::DailySends(self.max_sends_per_day));
+        }
+        if self.new_address_delay_hours > 0 && !c.stats.dest_paid_before {
+            if let Some(seen) = c.dest_first_seen {
+                let ready = seen + self.new_address_delay_hours as i64 * 3600;
+                if c.now < ready {
+                    return Err(PolicyError::NewAddressDelay(((ready - c.now + 3599) / 3600) as u32));
+                }
+            }
+        }
+        if let Some(cap) = c.sub_cap_xmr {
+            let cap = (cap * 1e12) as u64;
+            if c.stats.to_dest_recent.saturating_add(c.amount_atomic) > cap {
+                return Err(PolicyError::SubCap(cap.saturating_sub(c.stats.to_dest_recent) as f64 / 1e12));
+            }
+        }
+        let floor = (self.floor_xmr * 1e12) as u64;
+        let fee = (FEE_MARGIN_XMR * 1e12) as u64;
+        if floor > 0 && c.balance_atomic < c.amount_atomic.saturating_add(fee).saturating_add(floor) {
+            return Err(PolicyError::BalanceFloor(self.floor_xmr));
+        }
+        self.check(c.amount_atomic, c.balance_atomic, c.stats.sent_period)
+    }
+
     /// True when `self` allows more than `current` (needs the master password).
     pub fn is_looser_than(&self, current: &WalletCap) -> bool {
-        if !current.enabled { return false; }
-        if !self.enabled || self.mode != current.mode || self.period_days < current.period_days {
-            return true;
-        }
-        match self.mode {
-            CapMode::Percent => self.percent > current.percent,
-            CapMode::Fixed => self.fixed_xmr > current.fixed_xmr,
-        }
+        let cap_looser = current.enabled && (
+            !self.enabled || self.mode != current.mode || self.period_days < current.period_days
+                || match self.mode {
+                    CapMode::Percent => self.percent > current.percent,
+                    CapMode::Fixed => self.fixed_xmr > current.fixed_xmr,
+                });
+        let sends_looser = current.max_sends_per_day > 0
+            && (self.max_sends_per_day == 0 || self.max_sends_per_day > current.max_sends_per_day);
+        cap_looser
+            || self.floor_xmr < current.floor_xmr
+            || sends_looser
+            || self.new_address_delay_hours < current.new_address_delay_hours
     }
 }
 
@@ -136,6 +206,14 @@ pub enum PolicyError {
     MonthlyTotal(f64),
     /// Remaining allowance (XMR) of the wallet cap for the current period.
     WalletCap(f64),
+    /// Balance floor (XMR) that the payment would cross.
+    BalanceFloor(f64),
+    /// Daily number of sends reached.
+    DailySends(u32),
+    /// Remaining allowance (XMR) of the subscription cap over SUB_CAP_DAYS.
+    SubCap(f64),
+    /// Hours left before a newly approved address may be paid.
+    NewAddressDelay(u32),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -152,6 +230,10 @@ impl std::fmt::Display for PolicyError {
             Self::CadenceTooShort => write!(f, "POLICY:CADENCE_TOO_SHORT"),
             Self::MonthlyTotal(x) => write!(f, "POLICY:MONTHLY_TOTAL:{:.4}", x),
             Self::WalletCap(x) => write!(f, "POLICY:WALLET_CAP:{:.4}", x),
+            Self::BalanceFloor(x) => write!(f, "POLICY:BALANCE_FLOOR:{:.4}", x),
+            Self::DailySends(n) => write!(f, "POLICY:DAILY_SENDS:{}", n),
+            Self::SubCap(x) => write!(f, "POLICY:SUB_CAP:{:.4}", x),
+            Self::NewAddressDelay(h) => write!(f, "POLICY:NEW_ADDRESS_DELAY:{}", h),
         }
     }
 }
@@ -396,6 +478,33 @@ mod tests {
     }
 
     #[test]
+    fn send_guards() {
+        let xmr = |x: f64| (x * 1e12) as u64;
+        let guards = WalletCap {
+            enabled: false, floor_xmr: 1.0, max_sends_per_day: 3, new_address_delay_hours: 24,
+            ..WalletCap::default()
+        };
+        let ctx = |amount: f64, balance: f64, stats: OutStats| SendContext {
+            amount_atomic: xmr(amount), balance_atomic: xmr(balance), stats,
+            sub_cap_xmr: Some(0.5), dest_first_seen: None, now: 100_000,
+        };
+        let paid = OutStats { dest_paid_before: true, ..OutStats::default() };
+        assert!(guards.check_send(&ctx(0.1, 2.0, paid)).is_ok());
+        // Floor: 1.3 - 0.4 - fee leaves less than 1.0.
+        assert_eq!(guards.check_send(&ctx(0.4, 1.3, paid)), Err(PolicyError::BalanceFloor(1.0)));
+        let busy = OutStats { sends_last_day: 3, ..paid };
+        assert_eq!(guards.check_send(&ctx(0.1, 5.0, busy)), Err(PolicyError::DailySends(3)));
+        let sub_used = OutStats { to_dest_recent: xmr(0.45), ..paid };
+        assert_eq!(guards.check_send(&ctx(0.1, 5.0, sub_used)), Err(PolicyError::SubCap(0.05)));
+        // New address approved 2 h ago: 22 h left; once paid or untracked, no wait.
+        let mut c = ctx(0.1, 5.0, OutStats::default());
+        c.dest_first_seen = Some(100_000 - 7200);
+        assert_eq!(guards.check_send(&c), Err(PolicyError::NewAddressDelay(22)));
+        c.stats.dest_paid_before = true;
+        assert!(guards.check_send(&c).is_ok());
+    }
+
+    #[test]
     fn wallet_cap_loosening() {
         let cur = WalletCap::default();
         assert!(WalletCap { percent: 50, ..cur.clone() }.is_looser_than(&cur));
@@ -404,6 +513,11 @@ mod tests {
         assert!(!WalletCap { percent: 20, ..cur.clone() }.is_looser_than(&cur));
         assert!(!WalletCap { period_days: 60, ..cur.clone() }.is_looser_than(&cur));
         assert!(!cur.is_looser_than(&WalletCap { enabled: false, ..cur.clone() }));
+        let strict = WalletCap { floor_xmr: 0.5, max_sends_per_day: 5, new_address_delay_hours: 24, ..cur.clone() };
+        assert!(WalletCap { floor_xmr: 0.2, ..strict.clone() }.is_looser_than(&strict));
+        assert!(WalletCap { max_sends_per_day: 0, ..strict.clone() }.is_looser_than(&strict));
+        assert!(WalletCap { new_address_delay_hours: 0, ..strict.clone() }.is_looser_than(&strict));
+        assert!(!WalletCap { max_sends_per_day: 2, floor_xmr: 1.0, ..strict.clone() }.is_looser_than(&strict));
     }
 
     #[test]

@@ -41,6 +41,7 @@ tauri-plugin-deep-link = "=2.3.0"
 tauri-plugin-single-instance = "2.5.4"
 tauri-plugin-autostart = "2"
 md-5 = "0.10"
+tauri-plugin-notification = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

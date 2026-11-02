@@ -135,6 +135,8 @@
   export let subscriptions = [];
   // Sub ids whose last attempt failed or hit locked funds: the countdown is a retry, not a sent payment.
   export let retrySubIds = new Set();
+  // Per-subscription caps (XMR over 30 days), keyed by sub id.
+  export let subCaps = {};
 
   const SUSPENDED_STATUSES = ["Suspended", "Cancelled", "Expired"];
   const ARCHIVED_STATUSES = ["Cancelled", "Expired"];
@@ -238,6 +240,9 @@
 
           <div class="sub-footer">
             <span class="text-muted sent-count">{sub.payments_sent} {$t.sent}</span>
+            {#if subCaps[sub.id]}
+              <span class="cap-chip" title={$t.subCapTitle}>{fmt($t.subCapChip, { cap: subCaps[sub.id] })}</span>
+            {/if}
 
             <!-- Wallet badge -->
             {#if walletName(sub.wallet_id)}
@@ -288,6 +293,9 @@
                   </button>
                   <button class="kebab-item" on:click={e => editSub(sub, e)}>
                     ✏ {$t.subEdit}
+                  </button>
+                  <button class="kebab-item" on:click={e => { dispatch("cap-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ⛉ {$t.subCapMenu}
                   </button>
                   <button class="kebab-item" on:click={e => togglePause(sub, e)}>
                     {sub.status === "Paused" ? `▶ ${$t.subResume}` : `⏸ ${$t.subPauseShort}`}
@@ -451,4 +459,5 @@
   .archived-divider-label { padding: 0 8px; white-space: nowrap; }
   .btn-sm { padding: 5px 10px; font-size: 13px; }
   .retry-date strong { color: var(--orange); }
+  .cap-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-muted); }
 </style>

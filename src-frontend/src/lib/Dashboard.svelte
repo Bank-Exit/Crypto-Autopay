@@ -83,6 +83,160 @@
   let capPassword = "";
   let capError = "";
   const CAP_PERIODS = [7, 30, 90];
+  const NEW_ADDRESS_DELAYS = [0, 24, 48];
+
+  // ---- Per-subscription caps (XMR over 30 days, sealed in the policy vault) ----
+  let subCaps = {};
+  let subCapModal = null;      // { sub, value, password, needPassword, error }
+
+  async function loadSubCaps() {
+    subCaps = (await tauriInvoke("get_sub_caps")) || {};
+  }
+
+  function openSubCap(sub) {
+    const cur = subCaps[sub.id];
+    subCapModal = { sub, value: cur ?? "", password: "", needPassword: false, error: "" };
+  }
+
+  async function saveSubCap() {
+    const m = subCapModal;
+    const raw = String(m.value ?? "").trim().replace(",", ".");
+    const capXmr = raw === "" ? null : Number(raw);
+    if (capXmr !== null && !(capXmr > 0)) { subCapModal = { ...m, error: $t.policyInvalidAmount }; return; }
+    try {
+      await invokeStrict("set_sub_cap", { subId: m.sub.id, capXmr, password: m.needPassword ? m.password : null });
+      subCapModal = null;
+      await loadSubCaps();
+      await refreshAlerts();
+    } catch (e) {
+      const wrong = String(e).includes("Incorrect password");
+      if (wrong && !m.needPassword) { subCapModal = { ...m, needPassword: true, error: "" }; return; }
+      subCapModal = { ...m, password: "", error: wrong ? $t.unlockWrongPassword : String(e) };
+    }
+  }
+
+  // ---- Global pause (also toggled from the tray) ----
+  let allPaused = false;
+  async function setAllPaused(v) {
+    await tauriInvoke("set_paused", { paused: v });
+    allPaused = v;
+  }
+
+  // ---- Feedback after a real send: system notification + soft chime ----
+  let sendFeedback = { notify: true, sound: true };
+  let audioCtx = null;
+
+  async function loadSendFeedback() {
+    const f = await tauriInvoke("get_send_feedback");
+    if (f) sendFeedback = f;
+  }
+
+  function saveSendFeedback() {
+    tauriInvoke("set_send_feedback", { notify: sendFeedback.notify, sound: sendFeedback.sound });
+  }
+
+  /** Short, quiet two-partial chime with a soft attack: noticeable, never startling. */
+  function playTing() {
+    try {
+      audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx.resume?.();
+      const t0 = audioCtx.currentTime + 0.02;
+      const out = audioCtx.createGain();
+      out.gain.setValueAtTime(0.0001, t0);
+      out.gain.exponentialRampToValueAtTime(0.06, t0 + 0.015);
+      out.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.1);
+      out.connect(audioCtx.destination);
+      for (const [freq, level] of [[1318.5, 1], [1975.5, 0.3]]) {
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        g.gain.value = level;
+        osc.connect(g).connect(out);
+        osc.start(t0);
+        osc.stop(t0 + 1.15);
+      }
+    } catch (e) {
+      logDebug("Notify", `Chime unavailable: ${e}`);
+    }
+  }
+
+  async function notifySent(label) {
+    try {
+      const n = await import("@tauri-apps/plugin-notification");
+      let granted = await n.isPermissionGranted();
+      if (!granted) granted = (await n.requestPermission()) === "granted";
+      // No amount in the notification: notification daemons keep a history.
+      if (granted) n.sendNotification({ title: $t.notifSentTitle, body: label || "" });
+    } catch (e) {
+      logDebug("Notify", `System notification unavailable: ${e}`);
+    }
+  }
+
+  // ---- Seed backup check (every 90 days) ----
+  let seedCheck = null;        // { checked_at, due }
+  let seedReminderHidden = false;
+  let seedModal = null;        // { positions, words, error, busy }
+  const SEED_WORDS = 25;
+
+  async function loadSeedCheck() {
+    seedCheck = await tauriInvoke("get_seed_check");
+  }
+
+  function openSeedCheck() {
+    const picks = new Set();
+    while (picks.size < 3) picks.add(1 + Math.floor(Math.random() * SEED_WORDS));
+    const positions = [...picks].sort((a, b) => a - b);
+    seedModal = { positions, words: positions.map(() => ""), error: "", busy: false };
+  }
+
+  async function submitSeedCheck() {
+    seedModal = { ...seedModal, busy: true, error: "" };
+    try {
+      const ok = await invokeStrict("verify_seed_words", { positions: seedModal.positions, words: seedModal.words });
+      if (ok) {
+        seedModal = null;
+        showInfoNotice($t.seedCheckOk);
+        await loadSeedCheck();
+      } else {
+        seedModal = { ...seedModal, busy: false, error: $t.seedCheckFail, words: seedModal.positions.map(() => "") };
+      }
+    } catch (e) {
+      seedModal = { ...seedModal, busy: false, error: String(e) };
+    }
+  }
+
+  // ---- Monthly report (from the encrypted history) ----
+  function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
+
+  function monthTotals(entries, key) {
+    const items = entries.filter(e => monthKey(new Date(e.sent_at)) === key);
+    return { n: items.length, total: items.reduce((a, e) => a + (Number(e.amount_xmr) || 0), 0) };
+  }
+
+  function monthName(d, lang) {
+    return d.toLocaleDateString(lang, { month: "long", year: "numeric" });
+  }
+
+  $: reportNow = new Date(nowTick);
+  $: reportPrevDate = new Date(reportNow.getFullYear(), reportNow.getMonth() - 1, 1);
+  $: reportThis = monthTotals(historyEntries, monthKey(reportNow));
+  $: reportPrev = monthTotals(historyEntries, monthKey(reportPrevDate));
+
+  /** Once per new month, a short summary of the previous one (only the month key is stored). */
+  function maybeShowMonthlyReport() {
+    const key = monthKey(new Date());
+    let seen = null;
+    try { seen = localStorage.getItem("_autopay_report_month"); } catch {}
+    if (seen === key) return;
+    try { localStorage.setItem("_autopay_report_month", key); } catch {}
+    if (seen === null || reportPrev.n === 0) return;
+    showInfoNotice(fmt($t.reportMonthlyNotice, {
+      month: monthName(reportPrevDate, $currentLang),
+      total: reportPrev.total.toFixed(4),
+      n: reportPrev.n,
+    }));
+  }
   let capOpen = false;
 
   function onWalletCardClick(event) {
@@ -109,7 +263,14 @@
     capError = "";
     try {
       await invokeStrict("set_wallet_cap", {
-        cap: { ...capDraft, percent: Math.round(Number(capDraft.percent)), fixed_xmr: Number(capDraft.fixed_xmr) },
+        cap: {
+          ...capDraft,
+          percent: Math.round(Number(capDraft.percent)),
+          fixed_xmr: Number(capDraft.fixed_xmr),
+          floor_xmr: Math.max(0, Number(capDraft.floor_xmr) || 0),
+          max_sends_per_day: Math.max(0, Math.round(Number(capDraft.max_sends_per_day) || 0)),
+          new_address_delay_hours: Number(capDraft.new_address_delay_hours) || 0,
+        },
         password,
       });
       capPrompt = false;
@@ -147,6 +308,10 @@
       case "CADENCE_TOO_SHORT": return fmt(tObj.policyCadenceTooShort, { days: L.min_cadence_days });
       case "MONTHLY_TOTAL": return fmt(tObj.policyMonthlyTotal, { total: m[2] });
       case "WALLET_CAP": return fmt(tObj.policyWalletCap, { remaining: m[2], days: walletCap?.cap?.period_days ?? 30 });
+      case "BALANCE_FLOOR": return fmt(tObj.policyBalanceFloor, { floor: m[2] });
+      case "DAILY_SENDS": return fmt(tObj.policyDailySends, { n: m[2] });
+      case "SUB_CAP": return fmt(tObj.policySubCap, { remaining: m[2] });
+      case "NEW_ADDRESS_DELAY": return fmt(tObj.policyNewAddressDelay, { h: m[2] });
       default: return tObj.policyDefault;
     }
   }
@@ -336,6 +501,7 @@
       case 'BALANCE_SHORT_UPCOMING':
         return fmt(tObj.alertBalanceShortUpcoming, { n: num ?? '?' });
       case 'WALLET_NOT_SYNCED': return tObj.alertNotSynced;
+      case 'NODE_STALLED': return tObj.alertNodeStalled;
       case 'OFFLINE_WITH_PENDING': {
         const hoursMatch = alert.message.match(/(\d+)h/);
         const h = hoursMatch ? hoursMatch[1] : '?';
@@ -439,7 +605,6 @@
     activeAlerts = alerts || [];
   }
   import { logDebug, logInfo, logWarn, logError, subscribeToLogs, getEntries, clearLogs,
-           setSendLogsEnabled, isSendLogsEnabled, getSendLogs, clearSendLogs,
            setLogRetentionHours, formatLogTime } from "./AppLogger.js";
 
   // Tauri shell.open for external links (safe fallback for browser dev)
@@ -798,7 +963,7 @@
   let rpcStatusLabel = "";
   let rpcBinaryPath = null;
   let publicNodes = [];
-  let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20, send_logs_enabled: false };
+  let rpcConfig = { binary_path: null, daemon_address: "", rpc_port: 18083, tolerance_pct: 20 };
   let activeNode = null;          // node used by the last RPC session
   const CUSTOM_NODE = "__custom__";
   let nodeChoice = "";            // "" = automatic, a public node, or CUSTOM_NODE
@@ -935,6 +1100,7 @@
   async function checkDuePayments() {
     if (paymentInProgress) return;
     if (!walletAddress) return; // not unlocked
+    if (allPaused) return;
     // Enforce 25-min cooldown
     if (lastPaymentSentAt && Date.now() - lastPaymentSentAt < MONERO_MIN_INTERVAL_MS) {
       const remaining = Math.ceil((MONERO_MIN_INTERVAL_MS - (Date.now() - lastPaymentSentAt)) / 60000);
@@ -995,8 +1161,10 @@
       if (invokeError.includes("OUTPUTS_LOCKED")) {
         logWarn("Scheduler", `[ATTENTE] Fonds verrouilles (confirmations en cours) pour sub #${sub.id} — retry dans ~25 min`);
         showInfoNotice($t.payFundsConfirming);
-      } else if (invokeError.includes("POLICY:WALLET_CAP")) {
-        logWarn("Scheduler", `[RETENU] Plafond du wallet atteint pour sub #${sub.id} — rien envoye`);
+      } else if (invokeError === "PAUSED") {
+        logInfo("Scheduler", `[PAUSE] Paiements en pause — sub #${sub.id} non envoye`);
+      } else if (/POLICY:(WALLET_CAP|BALANCE_FLOOR|DAILY_SENDS|SUB_CAP|NEW_ADDRESS_DELAY)/.test(invokeError)) {
+        logWarn("Scheduler", `[RETENU] Garde-fou d'envoi actif pour sub #${sub.id} — rien envoye`);
         showInfoNotice(policyMessage(invokeError, $t));
       } else {
         logError("Scheduler", `[ECHEC] Paiement echoue pour sub #${sub.id} — ${invokeError}`);
@@ -1326,9 +1494,15 @@
     // Load basic wallet info (address, cached balance) — fast, no sync
     await loadWalletInfo();
     loadWalletCap();
+    loadSubCaps();
+    loadSendFeedback();
+    loadSeedCheck();
+    allPaused = !!(await tauriInvoke("get_paused"));
+    await listenWhileMounted("pause-changed", (ev) => { allPaused = !!ev.payload; });
     // Load history config and entries from encrypted vault
     await loadHistoryConfig();
     await loadHistoryEntries();
+    maybeShowMonthlyReport();
     // Load treasurer mode
     await loadTreasurerMode();
     await loadAutostart();
@@ -1411,6 +1585,11 @@
 
     await listenWhileMounted("payment-sent", async (ev) => {
       loadWalletCap();
+      {
+        const sent = subscriptions.find(s => s.id === ev.payload?.sub_id);
+        if (sendFeedback.sound) playTing();
+        if (sendFeedback.notify) notifySent(sent?.label);
+      }
       logDebug("Scheduler", "payment-sent event received — reloading history");
       const payload = ev.payload || {};
       if (payload.sub_id) {
@@ -1457,12 +1636,10 @@
   // ---- Logs panel state ----
   import { writable } from "svelte/store";
   let showLogs = false;
-  let showSendLogs = false;
   let logFilter = "";
   // Reactive store backed by AppLogger
   const liveLogs = writable([]);
   subscribeToLogs(entries => liveLogs.set(entries));
-  const sendLogsStore = writable(isSendLogsEnabled());
 
   // Mock wallets with monthly spend estimates
   let wallets = [
@@ -1561,7 +1738,7 @@
     if (notifSettings.lowBalance)    enabled.push("BALANCE_LOW", "BALANCE_EMPTY");
     if (notifSettings.canary)        enabled.push("CANARY_EXPIRED", "CANARY_UNREACHABLE");
     if (notifSettings.paymentFailed) enabled.push("PAYMENT_FAILED", "PAYMENT_OVERDUE_SOFT", "PAYMENT_OVERDUE_HARD");
-    enabled.push("OUTPUTS_LOCKED", "WALLET_NOT_SYNCED", "RPC_BINARY_MISSING"); // always enabled
+    enabled.push("OUTPUTS_LOCKED", "WALLET_NOT_SYNCED", "NODE_STALLED", "RPC_BINARY_MISSING"); // always enabled
     await tauriInvoke("set_alert_config", {
       balanceLowThresholdDays: notifSettings.lowBalanceThresholdDays,
       enabledAlerts: enabled,
@@ -1740,6 +1917,58 @@
 {/if}
 
 <!-- Password check before unlocking a payment limit -->
+{#if subCapModal}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
+      <h2 style="margin:0 0 6px;font-size:17px">{$t.subCapTitle}</h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">
+        <strong>{subCapModal.sub.label}</strong> — {$t.subCapDesc}
+      </p>
+      <form on:submit|preventDefault={saveSubCap}>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <input type="text" inputmode="decimal" bind:value={subCapModal.value} placeholder={$t.subCapNone}
+            style="flex:1" disabled={subCapModal.needPassword} />
+          <span class="text-muted" style="font-size:12px">{$currentNetwork.symbol}</span>
+        </div>
+        {#if subCapModal.needPassword}
+          <p class="text-muted" style="font-size:12px;margin:0 0 6px">{$t.subCapLoosen} {$t.limitEnterPassword}</p>
+          <input type="password" bind:value={subCapModal.password} autocomplete="current-password"
+            placeholder={$t.commonPassword} style="width:100%;margin-bottom:8px" />
+        {/if}
+        {#if subCapModal.error}<p style="color:#ef4444;font-size:12px;margin:0 0 8px">{subCapModal.error}</p>{/if}
+        <div style="display:flex;gap:10px">
+          <button type="button" class="btn-ghost" style="flex:1;padding:10px" on:click={() => subCapModal = null}>{$t.commonCancel}</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px"
+            disabled={subCapModal.needPassword && !subCapModal.password}>{$t.commonSave}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
+{#if seedModal}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
+      <h2 style="margin:0 0 6px;font-size:17px">{$t.seedCheckTitle}</h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">{$t.seedCheckDesc}</p>
+      <form on:submit|preventDefault={submitSeedCheck}>
+        {#each seedModal.positions as pos, i}
+          <div class="seed-word">
+            <label for="seed-word-{i}">{fmt($t.seedWordN, { n: pos })}</label>
+            <input id="seed-word-{i}" type="text" bind:value={seedModal.words[i]} autocomplete="off" autocapitalize="off" spellcheck="false" />
+          </div>
+        {/each}
+        {#if seedModal.error}<p style="color:#ef4444;font-size:12px;margin:4px 0 8px">{seedModal.error}</p>{/if}
+        <div style="display:flex;gap:10px;margin-top:8px">
+          <button type="button" class="btn-ghost" style="flex:1;padding:10px" on:click={() => seedModal = null}>{$t.commonCancel}</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px"
+            disabled={seedModal.busy || seedModal.words.some(w => !w.trim())}>{$t.commonConfirm}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 {#if capPrompt}
   <div class="modal-backdrop" role="dialog" aria-modal="true">
     <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
@@ -2085,6 +2314,21 @@
 
   <!-- Main content -->
   <main class="content">
+    {#if allPaused}
+      <div class="top-banner pause-banner">
+        <span>⏸ {$t.pauseBanner}</span>
+        <button class="btn-primary btn-sm" on:click={() => setAllPaused(false)}>{$t.pauseResume}</button>
+      </div>
+    {/if}
+    {#if seedCheck?.due && !seedReminderHidden && page === "subscriptions"}
+      <div class="top-banner seed-banner">
+        <span>🔑 {$t.seedReminder}</span>
+        <span class="top-banner-actions">
+          <button class="btn-ghost btn-sm" on:click={() => seedReminderHidden = true}>{$t.seedLater}</button>
+          <button class="btn-primary btn-sm" on:click={openSeedCheck}>{$t.seedCheckBtn}</button>
+        </span>
+      </div>
+    {/if}
 
     <!-- ====== SUBSCRIPTIONS ====== -->
     {#if page === "subscriptions"}
@@ -2143,6 +2387,8 @@
         {wallets}
         {subscriptions}
         {retrySubIds}
+        {subCaps}
+        on:cap-sub={e => openSubCap(e.detail.sub)}
         on:delete-sub={async e => {
           const sub = subscriptions.find(s => s.id === e.detail.id);
           subscriptions = subscriptions.filter(s => s.id !== e.detail.id);
@@ -2312,9 +2558,6 @@
                           <option value={d}>{fmt($t.capPerDays, { days: d })}</option>
                         {/each}
                       </select>
-                      {#if capDirty}
-                        <button class="btn-primary btn-sm" on:click={() => saveWalletCap()}>{$t.commonSave}</button>
-                      {/if}
                     </div>
                     {#if walletCap?.cap?.enabled && walletCap.cap_xmr != null}
                       <div class="limit-bar">
@@ -2331,7 +2574,27 @@
                       </span>
                     {/if}
                   {/if}
-                  <span class="text-muted cap-hint">{capDraft.enabled ? $t.capHint : $t.capOffHint}</span>
+                  <div class="guard-row">
+                    <span>{$t.guardFloor}</span>
+                    <span class="cap-input"><input type="number" min="0" step="0.01" bind:value={capDraft.floor_xmr} /> {$currentNetwork.symbol}</span>
+                  </div>
+                  <div class="guard-row">
+                    <span>{$t.guardDailySends}</span>
+                    <span class="cap-input"><input type="number" min="0" max="1000" step="1" bind:value={capDraft.max_sends_per_day} /></span>
+                    {#if walletCap?.sends_last_day != null}<span class="text-muted cap-usage">{fmt($t.guardSendsToday, { n: walletCap.sends_last_day })}</span>{/if}
+                  </div>
+                  <div class="guard-row">
+                    <span>{$t.guardNewAddressDelay}</span>
+                    <select bind:value={capDraft.new_address_delay_hours}>
+                      {#each NEW_ADDRESS_DELAYS as h}
+                        <option value={h}>{h === 0 ? $t.capOffShort : `${h} h`}</option>
+                      {/each}
+                    </select>
+                  </div>
+                  {#if capDirty}
+                    <div><button class="btn-primary btn-sm" on:click={() => saveWalletCap()}>{$t.commonSave}</button></div>
+                  {/if}
+                  <span class="text-muted cap-hint">{capDraft.enabled ? $t.capHint : $t.capOffHint} {$t.guardZeroOff}</span>
                   {#if capError && !capPrompt}<span style="color:#ef4444;font-size:11px">{capError}</span>{/if}
                   </div>
                   {/if}
@@ -2428,6 +2691,22 @@
             {$t.historyEmpty}
           </div>
         {:else}
+          <div class="report-card card">
+            <div class="report-cell">
+              <span class="text-muted">{$t.reportThisMonth}</span>
+              <strong>{reportThis.total.toFixed(4)} XMR</strong>
+              <span class="text-muted">{fmt($t.reportSends, { n: reportThis.n })}</span>
+            </div>
+            <div class="report-cell">
+              <span class="text-muted">{monthName(reportPrevDate, $currentLang)}</span>
+              <strong>{reportPrev.total.toFixed(4)} XMR</strong>
+              <span class="text-muted">{fmt($t.reportSends, { n: reportPrev.n })}</span>
+            </div>
+            <div class="report-cell">
+              <span class="text-muted">{$t.reportBalance}</span>
+              <strong>{balanceXmr !== null ? balanceXmr.toFixed(4) : "—"} XMR</strong>
+            </div>
+          </div>
           <div class="history-actions">
             <button class="btn-ghost btn-sm" style="font-size:11px" on:click={exportHistory}>⬇ {$t.historyExportBtn}</button>
             <button class="btn-ghost btn-sm" style="color:#ef4444;font-size:11px"
@@ -2552,6 +2831,12 @@
         <p class="mode-desc">
           {$paymentMode === "semi-auto" ? $t.paymentModeSemiAutoDesc : $t.paymentModeAutoDesc}
         </p>
+        <div class="setting-row">
+          <span class="setting-label">{$t.pauseTitle}<br><span class="text-muted" style="font-size:11px">{$t.pauseDesc}</span></span>
+          <button class="btn-ghost btn-sm" on:click={() => setAllPaused(!allPaused)}>
+            {allPaused ? `▶ ${$t.pauseResume}` : `⏸ ${$t.pauseAll}`}
+          </button>
+        </div>
       </div>
 
       <!-- Treasurer mode section -->
@@ -2609,7 +2894,12 @@
         {/if}
         <div class="setting-row">
           <span class="setting-label">{$t.notifPaymentSent}</span>
-          <label class="toggle"><input type="checkbox" bind:checked={notifSettings.paymentSent}/><span class="slider"></span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={sendFeedback.notify} on:change={saveSendFeedback}/><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding-left:34px;gap:8px">
+          <span class="setting-label" style="font-size:12px;color:var(--text-muted)">{$t.notifSound}</span>
+          <button class="btn-ghost btn-sm" style="font-size:11px" on:click={playTing}>♪ {$t.notifSoundTest}</button>
+          <label class="toggle"><input type="checkbox" bind:checked={sendFeedback.sound} on:change={saveSendFeedback}/><span class="slider"></span></label>
         </div>
         <div class="setting-row">
           <span class="setting-label">{$t.notifPaymentFailed}</span>
@@ -2777,47 +3067,6 @@
               <p class="text-muted" style="font-size:12px;padding:8px">{$t.logsNone}</p>
             {/each}
           </div>
-        {/if}
-      </div>
-
-      <!-- Send logs (opt-in) -->
-      <h2 class="section-title">{$t.sendLogsTitle} <span class="badge-opt">opt-in</span></h2>
-      <div class="settings-section card">
-        <p class="log-security-note">
-          {$t.sendLogsNote1}<br>
-          <strong>{$t.sendLogsNote2}</strong> {$t.sendLogsNote3}<br>
-          {$t.sendLogsNote4}
-        </p>
-        <div class="setting-row">
-          <span class="setting-label">{$t.sendLogsEnable}</span>
-          <label class="toggle">
-            <input type="checkbox"
-              checked={$sendLogsStore}
-              on:change={e => { setSendLogsEnabled(e.target.checked); sendLogsStore.set(e.target.checked); }}
-            />
-            <span class="slider"></span>
-          </label>
-        </div>
-        {#if $sendLogsStore}
-          <div class="log-toolbar">
-            <button class="btn-ghost btn-sm" on:click={() => showSendLogs = !showSendLogs}>
-              {showSendLogs ? $t.commonHide : $t.commonShow}
-            </button>
-            <button class="btn-ghost btn-sm" on:click={clearSendLogs}>{$t.commonClear}</button>
-          </div>
-          {#if showSendLogs}
-            <div class="log-list">
-              {#each getSendLogs() as entry (entry.t + entry.id)}
-                <div class="log-row log-info">
-                  <span class="log-time">{entry.t.slice(0,19).replace("T"," ")}</span>
-                  <span class="log-module">[sub#{entry.id}]</span>
-                  <span class="log-msg">{entry.event}</span>
-                </div>
-              {:else}
-                <p class="text-muted" style="font-size:12px;padding:8px">{$t.sendLogsNone}</p>
-              {/each}
-            </div>
-          {/if}
         {/if}
       </div>
 
@@ -3516,7 +3765,6 @@
   .log-warn { background: #f59e0b10; }
   .log-error .log-module { color: #ef4444; }
   .log-error { background: #ef444410; }
-  .badge-opt { font-size: 10px; background: #f59e0b22; color: #b45309; padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
   .badge-v2 { font-size: 10px; background: #3b82f622; color: #1d4ed8; padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
 
   /* RPC section */
@@ -3585,6 +3833,20 @@
   .cap-input { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
   .cap-input input { width: 80px; font-size: 12px; padding: 4px 6px; }
   .cap-usage, .cap-hint { font-size: 10.5px; line-height: 1.4; }
+  .guard-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+  .guard-row > span:first-child { min-width: 170px; }
+  .guard-row select { width: auto; font-size: 12px; padding: 4px 26px 4px 8px; }
+  .top-banner { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+    padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; font-size: 13px; }
+  .top-banner-actions { display: flex; gap: 6px; }
+  .pause-banner { background: #f59e0b22; border: 1px solid #f59e0b66; }
+  .seed-banner { background: var(--bg-card); border: 1px solid var(--border); }
+  .seed-word { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+  .seed-word label { min-width: 70px; margin: 0; text-align: left; }
+  .seed-word input { flex: 1; }
+  .report-card { display: flex; flex-wrap: wrap; gap: 8px 24px; padding: 12px 16px; margin-bottom: 10px; }
+  .report-cell { display: flex; flex-direction: column; gap: 2px; font-size: 12px; min-width: 120px; }
+  .report-cell strong { font-size: 14px; }
   .wallet-top { display: flex; justify-content: space-between; align-items: flex-start; }
   .wallet-name { font-weight: 700; font-size: 14px; }
   .wallet-desc { font-size: 12px; margin-top: 2px; }

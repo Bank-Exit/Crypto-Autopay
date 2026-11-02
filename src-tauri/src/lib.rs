@@ -114,6 +114,14 @@ pub struct AppState {
     pub cap_blocked_until: std::collections::HashMap<String, i64>,
     /// Fingerprints of the terms the user agreed to, per subscription (persisted in the policy vault).
     pub approved_terms: std::collections::HashMap<String, String>,
+    /// Other sealed sending-policy items (pause, per-subscription caps, ...).
+    pub policy_extras: PolicyExtras,
+    /// Outgoing transfers over the last 24 h, as last read from the wallet.
+    pub sends_last_day: Option<u32>,
+    /// Last time the remote node's height moved (0 = unknown).
+    pub daemon_height_changed_at: i64,
+    /// Since when the wallet lags the node by more than WALLET_BEHIND_BLOCKS.
+    pub wallet_behind_since: Option<i64>,
     /// Unix timestamp of the last wallet refresh attempt (UI or background).
     pub last_refresh_at: i64,
     /// Nodes found too slow or failing, with the Unix time until which they are avoided.
@@ -354,6 +362,7 @@ async fn unlock_wallet(
             s.rpc_last_error = None;
             s.balance_atomic = 0;
         }
+        refresh_pause_item(&app_handle);
         return Ok(UnlockResult {
             address: cached_addr,
             balance_xmr: 0.0,
@@ -500,6 +509,7 @@ async fn unlock_wallet(
 
     log::info!("[Unlock] Done. rpc_connected={}, seed_invalid={}", s.rpc_connected, seed_invalid);
     drop(s);
+    refresh_pause_item(&app_handle);
     refresh_alerts_and_tray(&app_handle);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
 }
@@ -787,7 +797,9 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
     };
     let daemon_reachable = daemon_height > 0;
 
+    let mut stalled_node = None;
     if let Ok(mut s) = state.lock() {
+        let now = chrono::Utc::now().timestamp();
         s.balance_atomic = atomic;
         s.unlocked_balance_atomic = unlocked_atomic;
         s.rpc_connected = true;
@@ -795,9 +807,30 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
         if address.is_some() { s.wallet_address = address; }
         if let Some(h) = wallet_height { s.last_wallet_height = h; }
         if daemon_reachable {
+            if daemon_height > s.last_daemon_height || s.daemon_height_changed_at == 0 {
+                s.daemon_height_changed_at = now;
+            }
             s.last_daemon_height = daemon_height;
-            s.last_daemon_contact_at = Some(chrono::Utc::now().timestamp());
+            s.last_daemon_contact_at = Some(now);
+            let behind = wallet_height.is_some_and(|h| daemon_height > h + WALLET_BEHIND_BLOCKS);
+            s.wallet_behind_since = if behind { Some(s.wallet_behind_since.unwrap_or(now)) } else { None };
         }
+        // A node whose height stops moving is stuck or feeding a stale chain: leave it
+        // (a node pinned by the user is only reported).
+        if daemon_reachable && s.daemon_height_changed_at > 0
+            && now - s.daemon_height_changed_at > NODE_STALL_SECS
+            && s.rpc.config.daemon_address.is_none()
+        {
+            if let Some(node) = s.active_node.take() {
+                s.slow_nodes.insert(node.clone(), now + SLOW_NODE_AVOID_SECS);
+                s.daemon_height_changed_at = now;
+                stalled_node = Some(node);
+            }
+        }
+    }
+    if let Some(node) = stalled_node {
+        log::warn!("[Node] {} has not moved for {} min — switching node", node, NODE_STALL_SECS / 60);
+        end_wallet_session("node stalled");
     }
 
     // Recompute alerts immediately after balance update — don't wait for scheduler cycle
@@ -975,6 +1008,11 @@ fn refresh_alerts_and_tray(app_handle: &tauri::AppHandle) {
 /// subscription has been paid since.
 const EVENT_ALERT_KINDS: &[&str] = &["PAYMENT_FAILED", "OUTPUTS_LOCKED", "PAYMENT_BLOCKED_LIMITS"];
 const EVENT_ALERT_TTL_SECS: i64 = 24 * 3600;
+/// Without a new block for this long, the node is considered stuck (~15 expected blocks).
+const NODE_STALL_SECS: i64 = 30 * 60;
+/// Blocks of lag, and for how long, before the wallet is reported as not synced.
+const WALLET_BEHIND_BLOCKS: u64 = 10;
+const WALLET_BEHIND_SECS: i64 = 30 * 60;
 
 /// Record an event alert for a subscription (replaces the previous one of the same kind).
 fn push_alert(app: &tauri::AppHandle, level: AlertLevel, kind: &str, sub_id: &str, message: String) {
@@ -1119,6 +1157,32 @@ fn recompute_alerts(
                 });
             }
         }
+    }
+
+    // ORANGE: the node's height stopped moving (blocks come every ~2 min).
+    // Only while the node answers: an unreachable node is OFFLINE_WITH_PENDING's business.
+    let node_answering = state.last_daemon_contact_at.is_some_and(|t| now_ts - t < 15 * 60);
+    if state.unlocked && node_answering && state.daemon_height_changed_at > 0
+        && now_ts - state.daemon_height_changed_at > NODE_STALL_SECS
+    {
+        alerts.push(AppAlert {
+            level: AlertLevel::Orange,
+            kind: "NODE_STALLED".into(),
+            sub_id: None,
+            message: format!("Node height unchanged for {} min", (now_ts - state.daemon_height_changed_at) / 60),
+            created_at: now_ts,
+        });
+    }
+
+    // ORANGE: the wallet stays behind the node.
+    if state.wallet_behind_since.is_some_and(|t| now_ts - t > WALLET_BEHIND_SECS) {
+        alerts.push(AppAlert {
+            level: AlertLevel::Orange,
+            kind: "WALLET_NOT_SYNCED".into(),
+            sub_id: None,
+            message: "Wallet behind the node".into(),
+            created_at: now_ts,
+        });
     }
 
     // RED: the Monero engine cannot start at all, nothing can be paid.
@@ -1298,6 +1362,8 @@ struct PolicyVault {
     limits: payment_policy::PaymentLimits,
     wallet_cap: payment_policy::WalletCap,
     approved_terms: std::collections::HashMap<String, String>,
+    #[serde(flatten)]
+    extras: PolicyExtras,
 }
 
 impl Default for PolicyVault {
@@ -1307,8 +1373,60 @@ impl Default for PolicyVault {
             limits: Default::default(),
             wallet_cap: Default::default(),
             approved_terms: Default::default(),
+            extras: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PolicyExtras {
+    /// Per-subscription ceiling over payment_policy::SUB_CAP_DAYS, in XMR.
+    pub sub_caps: std::collections::HashMap<String, f64>,
+    /// address_key(address) -> Unix time the address was first approved.
+    pub address_seen: std::collections::HashMap<String, i64>,
+    /// No automatic payment at all while set.
+    pub paused: bool,
+    pub notify_on_send: bool,
+    pub sound_on_send: bool,
+    /// Last successful seed backup check.
+    pub seed_checked_at: Option<i64>,
+}
+
+impl Default for PolicyExtras {
+    fn default() -> Self {
+        Self {
+            sub_caps: Default::default(),
+            address_seen: Default::default(),
+            paused: false,
+            notify_on_send: true,
+            sound_on_send: true,
+            seed_checked_at: None,
+        }
+    }
+}
+
+/// Address identifier stored in the vault (never the address itself).
+fn address_key(address: &str) -> String {
+    blake3::hash(address.trim().as_bytes()).to_hex().to_string()
+}
+
+/// Record that the user agreed to the current terms of `sub`.
+fn approve_terms(s: &mut AppState, sub: &Subscription) {
+    s.approved_terms.insert(sub.id.clone(), sub_fingerprint(sub));
+    s.policy_extras.address_seen
+        .entry(address_key(&sub.destination_address))
+        .or_insert_with(|| chrono::Utc::now().timestamp());
+}
+
+/// Master password check for loosening a guard (constant-time comparison).
+fn check_master_password(s: &AppState, password: Option<String>) -> Result<(), String> {
+    let session = s.session_password.as_deref().ok_or("Wallet is locked.")?;
+    let mut given = password.unwrap_or_default();
+    let same = given.len() == session.len()
+        && given.bytes().zip(session.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    given.zeroize();
+    if same { Ok(()) } else { Err("Incorrect password.".into()) }
 }
 
 fn write_sealed(key: &[u8; 32], path: &std::path::Path, plain: &[u8]) -> Result<(), String> {
@@ -1331,6 +1449,7 @@ fn save_policy_vault(s: &AppState) -> Result<(), String> {
         limits: s.payment_limits.clone(),
         wallet_cap: s.wallet_cap.clone(),
         approved_terms: s.approved_terms.clone(),
+        extras: s.policy_extras.clone(),
     };
     let plain = serde_json::to_vec(&vault).map_err(|e| e.to_string())?;
     write_sealed(key, &s.history_path.with_file_name(POLICY_VAULT_FILE), &plain)
@@ -1354,6 +1473,7 @@ fn apply_policy_vault(s: &mut AppState) {
                 limits: payment_policy::PaymentLimits::load_legacy(&dir),
                 wallet_cap: payment_policy::WalletCap::load_legacy(&dir),
                 approved_terms: payment_policy::load_legacy_approved_terms(&dir),
+                extras: PolicyExtras::default(),
             }
         }
     };
@@ -1362,6 +1482,10 @@ fn apply_policy_vault(s: &mut AppState) {
     s.payment_limits = vault.limits;
     s.wallet_cap = vault.wallet_cap;
     s.approved_terms = vault.approved_terms;
+    // A pause requested from the tray while locked survives the unlock.
+    let paused_while_locked = s.policy_extras.paused;
+    s.policy_extras = vault.extras;
+    s.policy_extras.paused |= paused_while_locked;
     if migrating {
         match save_policy_vault(s) {
             Ok(()) => {
@@ -1434,7 +1558,7 @@ async fn approve_payment(
         .into_iter().find(|s| s.id == sub_id);
     if let Some(sub) = sub {
         let mut s = app_state.lock().map_err(|e| e.to_string())?;
-        s.approved_terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+        approve_terms(&mut s, &sub);
         save_policy_vault(&s)?;
     }
     log::info!("[PaymentMode] Payment approved by user for sub {}", &sub_id[..8.min(sub_id.len())]);
@@ -1543,54 +1667,96 @@ async fn set_payment_limits(
     Ok(())
 }
 
+/// Returned instead of sending while every automatic payment is paused.
+const PAUSED: &str = "PAUSED";
+
 /// Seconds a subscription refused by the wallet cap waits before the next attempt.
 const CAP_RETRY_SECS: i64 = 3600;
 
-/// Sum of outgoing amounts + fees since `since_ts`, confirmed or pending, from the wallet itself
-/// (the app history can be disabled or cleared, the wallet's transfers cannot).
-fn wallet_sent_since(rpc_url: &str, since_ts: i64) -> Result<u64, String> {
+/// Outgoing transfers as the wallet itself reports them, confirmed or pending (the app
+/// history can be disabled or cleared, the wallet's transfers cannot).
+fn wallet_out_stats(rpc_url: &str, period_start: i64, dest: Option<&str>) -> Result<payment_policy::OutStats, String> {
     let r = rpc_manager::ureq_post_json_pub(rpc_url, &serde_json::json!({
         "jsonrpc":"2.0","id":"tr","method":"get_transfers","params":{"out":true,"pending":true}
     }))?;
     if let Some(err) = r.get("error") {
         return Err(format!("get_transfers error: {}", err["message"].as_str().unwrap_or("?")));
     }
-    let mut sent = 0u64;
+    let now = chrono::Utc::now().timestamp();
+    let sub_start = now - payment_policy::SUB_CAP_DAYS * 86400;
+    let mut st = payment_policy::OutStats::default();
     for kind in ["out", "pending"] {
         for t in r["result"][kind].as_array().into_iter().flatten() {
             // A transfer without timestamp counts: unknown means possibly recent.
-            if t["timestamp"].as_i64().unwrap_or(i64::MAX) >= since_ts {
-                sent = sent
+            let ts = t["timestamp"].as_i64().unwrap_or(i64::MAX);
+            if ts >= period_start {
+                st.sent_period = st.sent_period
                     .saturating_add(t["amount"].as_u64().unwrap_or(0))
                     .saturating_add(t["fee"].as_u64().unwrap_or(0));
             }
+            if ts >= now - 86400 { st.sends_last_day += 1; }
+            if let Some(d) = dest {
+                let to_dest: u64 = t["destinations"].as_array().into_iter().flatten()
+                    .filter(|x| x["address"].as_str() == Some(d))
+                    .map(|x| x["amount"].as_u64().unwrap_or(0))
+                    .sum();
+                if to_dest > 0 {
+                    st.dest_paid_before = true;
+                    if ts >= sub_start { st.to_dest_recent = st.to_dest_recent.saturating_add(to_dest); }
+                }
+            }
         }
     }
-    Ok(sent)
+    Ok(st)
 }
 
 fn cap_period_start(cap: &payment_policy::WalletCap) -> i64 {
     chrono::Utc::now().timestamp() - cap.period_days as i64 * 86400
 }
 
-/// Refresh the "sent over the period" figure shown on the Wallets page.
+/// Refresh the usage figures shown on the Wallets page.
 fn record_sent_in_period(app: &tauri::AppHandle, rpc_url: &str) {
     let Some(st) = app.try_state::<Mutex<AppState>>() else { return };
     let Some(cap) = st.lock().ok().map(|s| s.wallet_cap.clone()) else { return };
-    let sent = wallet_sent_since(rpc_url, cap_period_start(&cap)).ok();
-    if let Ok(mut s) = st.lock() { s.sent_in_period_atomic = sent; };
+    let stats = wallet_out_stats(rpc_url, cap_period_start(&cap), None).ok();
+    if let Ok(mut s) = st.lock() {
+        s.sent_in_period_atomic = stats.map(|x| x.sent_period);
+        s.sends_last_day = stats.map(|x| x.sends_last_day);
+    };
 }
 
-/// Enforce the wallet cap right before a transfer. Fails closed: if the wallet cannot tell
+/// Enforce the sending guards right before a transfer. Fails closed: if the wallet cannot tell
 /// what was sent, nothing is sent.
-fn check_wallet_cap(app: &tauri::AppHandle, mgr: &RpcManager, amount_atomic: u64) -> Result<(), String> {
+fn check_send_guards(
+    app: &tauri::AppHandle,
+    mgr: &RpcManager,
+    amount_atomic: u64,
+    dest: &str,
+    sub_id: Option<&str>,
+) -> Result<(), String> {
     let st = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?;
-    let cap = st.lock().map_err(|e| e.to_string())?.wallet_cap.clone();
-    if !cap.enabled { return Ok(()); }
-    let sent = wallet_sent_since(&mgr.rpc_url(), cap_period_start(&cap))?;
+    let (cap, sub_cap_xmr, dest_first_seen) = {
+        let s = st.lock().map_err(|e| e.to_string())?;
+        (
+            s.wallet_cap.clone(),
+            sub_id.and_then(|id| s.policy_extras.sub_caps.get(id).copied()),
+            s.policy_extras.address_seen.get(&address_key(dest)).copied(),
+        )
+    };
+    let stats = wallet_out_stats(&mgr.rpc_url(), cap_period_start(&cap), Some(dest))?;
     let (total, _) = mgr.rpc_get_balance()?;
-    if let Ok(mut s) = st.lock() { s.sent_in_period_atomic = Some(sent); }
-    cap.check(amount_atomic, (total * 1e12) as u64, sent).map_err(|e| e.to_string())
+    if let Ok(mut s) = st.lock() {
+        s.sent_in_period_atomic = Some(stats.sent_period);
+        s.sends_last_day = Some(stats.sends_last_day);
+    }
+    cap.check_send(&payment_policy::SendContext {
+        amount_atomic,
+        balance_atomic: (total * 1e12) as u64,
+        stats,
+        sub_cap_xmr,
+        dest_first_seen,
+        now: chrono::Utc::now().timestamp(),
+    }).map_err(|e| e.to_string())
 }
 
 /// Wallet cap settings and current usage for the Wallets page.
@@ -1604,6 +1770,7 @@ async fn get_wallet_cap(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<
         "sent_xmr": sent.map(|v| v as f64 / 1e12),
         "cap_xmr": cap_atomic.map(|v| v as f64 / 1e12),
         "remaining_xmr": cap_atomic.zip(sent).map(|(c, sent)| c.saturating_sub(sent) as f64 / 1e12),
+        "sends_last_day": s.sends_last_day,
     }))
 }
 
@@ -1618,22 +1785,157 @@ async fn set_wallet_cap(
     cap.validate()?;
     let mut s = app_state.lock().map_err(|e| e.to_string())?;
     if cap.is_looser_than(&s.wallet_cap) {
-        let session = s.session_password.as_deref().ok_or("Wallet is locked.")?;
-        let mut given = password.unwrap_or_default();
-        let same = given.len() == session.len()
-            && given.bytes().zip(session.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-        given.zeroize();
-        if !same { return Err("Incorrect password.".into()); }
+        check_master_password(&s, password)?;
     }
-    log::info!("[Policy] Wallet cap updated: enabled={}, mode={:?}, period={} days",
-        cap.enabled, cap.mode, cap.period_days);
+    log::info!("[Policy] Wallet guards updated: cap={} ({:?}, {} days), floor={}, daily sends={}, new-address delay={} h",
+        cap.enabled, cap.mode, cap.period_days, cap.floor_xmr > 0.0, cap.max_sends_per_day,
+        cap.new_address_delay_hours);
     s.wallet_cap = cap;
     save_policy_vault(&s)?;
     s.cap_blocked_until.clear();
-    s.alerts.retain(|a| !(a.kind == "PAYMENT_BLOCKED_LIMITS" && a.message.contains("POLICY:WALLET_CAP")));
+    s.alerts.retain(|a| a.kind != "PAYMENT_BLOCKED_LIMITS");
     drop(s);
     refresh_alerts_and_tray(&app_handle);
     Ok(())
+}
+
+/// Per-subscription caps (XMR over payment_policy::SUB_CAP_DAYS).
+#[tauri::command]
+async fn get_sub_caps(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<std::collections::HashMap<String, f64>, String> {
+    Ok(app_state.lock().map_err(|e| e.to_string())?.policy_extras.sub_caps.clone())
+}
+
+/// Set or remove a subscription's cap. Raising or removing it needs the master password.
+#[tauri::command]
+async fn set_sub_cap(
+    sub_id: String,
+    cap_xmr: Option<f64>,
+    password: Option<String>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    if cap_xmr.is_some_and(|c| !(c.is_finite() && c > 0.0)) {
+        return Err("Amount must be positive.".into());
+    }
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    let looser = match (s.policy_extras.sub_caps.get(&sub_id).copied(), cap_xmr) {
+        (Some(_), None) => true,
+        (Some(cur), Some(new)) => new > cur,
+        (None, _) => false,
+    };
+    if looser { check_master_password(&s, password)?; }
+    match cap_xmr {
+        Some(c) => { s.policy_extras.sub_caps.insert(sub_id.clone(), c); }
+        None => { s.policy_extras.sub_caps.remove(&sub_id); }
+    }
+    save_policy_vault(&s)?;
+    s.cap_blocked_until.remove(&sub_id);
+    s.alerts.retain(|a| !(a.kind == "PAYMENT_BLOCKED_LIMITS" && a.sub_id.as_deref() == Some(sub_id.as_str())));
+    log::info!("[Policy] Subscription cap {} for sub {}", if cap_xmr.is_some() { "set" } else { "removed" },
+        &sub_id[..8.min(sub_id.len())]);
+    drop(s);
+    refresh_alerts_and_tray(&app_handle);
+    Ok(())
+}
+
+/// Tray entry toggling the global pause (its label follows the state).
+struct TrayPauseItem(tauri::menu::MenuItem<tauri::Wry>);
+
+const TRAY_PAUSE_LABEL: &str = "Mettre en pause les paiements";
+const TRAY_RESUME_LABEL: &str = "Reprendre les paiements";
+
+fn refresh_pause_item(app: &tauri::AppHandle) {
+    let paused = app.try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| s.policy_extras.paused))
+        .unwrap_or(false);
+    if let Some(item) = app.try_state::<TrayPauseItem>() {
+        let _ = item.0.set_text(if paused { TRAY_RESUME_LABEL } else { TRAY_PAUSE_LABEL });
+    }
+}
+
+/// Pause or resume every automatic payment (persisted when the session is unlocked).
+fn apply_pause(app: &tauri::AppHandle, paused: bool) {
+    if let Some(st) = app.try_state::<Mutex<AppState>>() {
+        if let Ok(mut s) = st.lock() {
+            s.policy_extras.paused = paused;
+            if s.history_key.is_some() {
+                if let Err(e) = save_policy_vault(&s) { log::error!("[Policy] Could not save the pause: {}", e); }
+            }
+        }
+    }
+    log::info!("[Policy] {} All automatic payments {}", if paused { "⏸" } else { "▶" },
+        if paused { "paused" } else { "resumed" });
+    refresh_pause_item(app);
+    app.emit("pause-changed", paused).ok();
+}
+
+#[tauri::command]
+fn get_paused(app_state: tauri::State<'_, Mutex<AppState>>) -> bool {
+    app_state.lock().map(|s| s.policy_extras.paused).unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_paused(paused: bool, app_handle: tauri::AppHandle) {
+    apply_pause(&app_handle, paused);
+}
+
+/// System notification and sound after each successful send.
+#[tauri::command]
+fn get_send_feedback(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "notify": s.policy_extras.notify_on_send, "sound": s.policy_extras.sound_on_send }))
+}
+
+#[tauri::command]
+fn set_send_feedback(notify: bool, sound: bool, app_state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mut s = app_state.lock().map_err(|e| e.to_string())?;
+    s.policy_extras.notify_on_send = notify;
+    s.policy_extras.sound_on_send = sound;
+    save_policy_vault(&s)
+}
+
+/// Days between two seed backup checks.
+const SEED_CHECK_EVERY_DAYS: i64 = 90;
+
+#[tauri::command]
+fn get_seed_check(app_state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = app_state.lock().map_err(|e| e.to_string())?;
+    let last = s.policy_extras.seed_checked_at;
+    let due = last.is_none_or(|t| chrono::Utc::now().timestamp() - t > SEED_CHECK_EVERY_DAYS * 86400);
+    Ok(serde_json::json!({ "checked_at": last, "due": due }))
+}
+
+/// Check a few seed words typed from the user's backup (1-based positions).
+#[tauri::command]
+async fn verify_seed_words(
+    positions: Vec<usize>,
+    mut words: Vec<String>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<bool, String> {
+    if positions.is_empty() || positions.len() != words.len() {
+        return Err("Invalid request.".into());
+    }
+    let (vault_path, password) = {
+        let s = app_state.lock().map_err(|e| e.to_string())?;
+        (s.vault_path.clone(), s.session_password.clone().ok_or("Wallet is locked.")?)
+    };
+    let encrypted: EncryptedSeed = serde_json::from_str(
+        &std::fs::read_to_string(&vault_path).map_err(|e| e.to_string())?,
+    ).map_err(|e| e.to_string())?;
+    let seed = tokio::task::spawn_blocking(move || SeedVault::decrypt(&encrypted, &password))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let list: Vec<&str> = seed.split_whitespace().collect();
+    let ok = positions.iter().zip(&words).all(|(p, w)| {
+        *p >= 1 && list.get(p - 1).is_some_and(|x| x.eq_ignore_ascii_case(w.trim()))
+    });
+    for w in words.iter_mut() { w.zeroize(); }
+    log::info!("[Seed] Backup check {}", if ok { "passed" } else { "failed" });
+    if ok {
+        let mut s = app_state.lock().map_err(|e| e.to_string())?;
+        s.policy_extras.seed_checked_at = Some(chrono::Utc::now().timestamp());
+        save_policy_vault(&s)?;
+    }
+    Ok(ok)
 }
 
 /// Make the data dir 0700 and everything in it 0700 (dirs) / 0600 (files): files created
@@ -2397,9 +2699,9 @@ async fn execute_pv_payment(
         }), 600) {
             log::warn!("[Treasurer] refresh failed (continuing): {}", e);
         }
-        if let Err(e) = check_wallet_cap(&app_rpc, &mgr, amount_pico) {
+        if let Err(e) = check_send_guards(&app_rpc, &mgr, amount_pico, &dest, None) {
             return_wallet_session(mgr);
-            log::warn!("[Treasurer] PV id={} refused by the wallet cap", pv_id);
+            log::warn!("[Treasurer] PV id={} held by a sending guard", pv_id);
             return Err(e);
         }
 
@@ -2460,7 +2762,7 @@ async fn pay_subscription_now(sub_id: String, app_handle: tauri::AppHandle) -> R
 
     {
         let mut s = app_handle.state::<Mutex<AppState>>().inner().lock().map_err(|e| e.to_string())?;
-        s.approved_terms.insert(sub.id.clone(), sub_fingerprint(&sub));
+        approve_terms(&mut s, &sub);
         save_policy_vault(&s)?;
     }
 
@@ -2478,6 +2780,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
         let st = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?;
         let s = st.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Wallet is locked.".into()); }
+        if s.policy_extras.paused { return Err(PAUSED.into()); }
         let pw = s.session_password.clone().ok_or("No session password")?;
         let name = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
@@ -2506,6 +2809,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
     let wallet_name2 = wallet_name.clone();
     let pw2 = session_pw.clone();
     let app_rpc = app.clone();
+    let sub_id_guard = sub_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         struct RpcGuard(Arc<AtomicBool>);
@@ -2520,7 +2824,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
         }), 600) {
             log::warn!("[Scheduler] refresh before transfer failed (continuing): {}", e);
         }
-        if let Err(e) = check_wallet_cap(&app_rpc, &mgr, amount_pico) {
+        if let Err(e) = check_send_guards(&app_rpc, &mgr, amount_pico, &dest, Some(&sub_id_guard)) {
             return_wallet_session(mgr);
             return Err(e);
         }
@@ -2585,7 +2889,8 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
             app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
             Ok(tx_hash_out)
         }
-        Ok(Err(e)) if e.starts_with("POLICY:WALLET_CAP") => {
+        Ok(Err(e)) if e == PAUSED => Err(e),
+        Ok(Err(e)) if e.starts_with("POLICY:") => {
             let short = &sub_id[..8.min(sub_id.len())];
             let retry_at = chrono::Utc::now().timestamp() + CAP_RETRY_SECS;
             if let Some(state_rc) = app.try_state::<Mutex<AppState>>() {
@@ -2598,7 +2903,8 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
                     .any(|a| a.kind == "PAYMENT_BLOCKED_LIMITS" && a.sub_id.as_deref() == Some(sub_id.as_str()))))
                 .unwrap_or(false);
             if !already {
-                log::warn!("[Payment] 🛑 Wallet cap reached — payment for sub {} held (nothing sent)", short);
+                let code = e.split(':').nth(1).unwrap_or("?");
+                log::warn!("[Payment] 🛑 Payment for sub {} held by a sending guard ({}) — nothing sent", short, code);
             }
             push_alert(app, AlertLevel::Orange, "PAYMENT_BLOCKED_LIMITS", &sub_id, e.clone());
             Err(e)
@@ -2685,6 +2991,10 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             }
         }
         if s.session_password.is_none() { return; }
+        if s.policy_extras.paused {
+            log::debug!("[Scheduler] All payments paused — skipping");
+            return;
+        }
         s.last_payment_sent_at
     };
 
@@ -2880,6 +3190,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(
             tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -2964,7 +3275,7 @@ pub fn run() {
                     for k in &["BALANCE_LOW","BALANCE_EMPTY","PAYMENT_FAILED","CANARY_EXPIRED",
                                "CANARY_UNREACHABLE","PAYMENT_OVERDUE_SOFT","PAYMENT_OVERDUE_HARD",
                                "WALLET_NOT_SYNCED","OUTPUTS_LOCKED","OFFLINE_WITH_PENDING",
-                               "PAYMENT_BLOCKED_LIMITS","BALANCE_SHORT_UPCOMING"] {
+                               "PAYMENT_BLOCKED_LIMITS","BALANCE_SHORT_UPCOMING","NODE_STALLED"] {
                         s.insert(k.to_string());
                     }
                     s
@@ -2981,6 +3292,10 @@ pub fn run() {
                 payment_limits: payment_policy::PaymentLimits::default(),
                 wallet_cap: payment_policy::WalletCap::default(),
                 approved_terms: std::collections::HashMap::new(),
+                policy_extras: PolicyExtras::default(),
+                sends_last_day: None,
+                daemon_height_changed_at: 0,
+                wallet_behind_since: None,
                 sent_in_period_atomic: None,
                 cap_blocked_until: std::collections::HashMap::new(),
                 treasurer_mode: false,
@@ -3070,12 +3385,15 @@ pub fn run() {
                 // Build tray menu: Open + Quit
                 use tauri::menu::{MenuBuilder, MenuItemBuilder};
                 let menu_open = MenuItemBuilder::with_id("open", "Ouvrir Crypto AutoPay").build(app)?;
+                let menu_pause = MenuItemBuilder::with_id("pause", TRAY_PAUSE_LABEL).build(app)?;
                 let menu_quit = MenuItemBuilder::with_id("quit", "Quitter").build(app)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&menu_open)
+                    .item(&menu_pause)
                     .separator()
                     .item(&menu_quit)
                     .build()?;
+                app.manage(TrayPauseItem(menu_pause));
 
                 let _tray = tauri::tray::TrayIconBuilder::with_id("main")
                     .icon(img)
@@ -3089,6 +3407,12 @@ pub fn run() {
                                     win.unminimize().ok();
                                     win.set_focus().ok();
                                 }
+                            }
+                            "pause" => {
+                                let paused = app.try_state::<Mutex<AppState>>()
+                                    .and_then(|st| st.lock().ok().map(|s| s.policy_extras.paused))
+                                    .unwrap_or(false);
+                                apply_pause(app, !paused);
                             }
                             "quit" => {
                                 log::info!("[Tray] User requested quit via tray menu");
@@ -3153,6 +3477,14 @@ pub fn run() {
             set_payment_limits,
             get_wallet_cap,
             set_wallet_cap,
+            get_sub_caps,
+            set_sub_cap,
+            get_paused,
+            set_paused,
+            get_send_feedback,
+            set_send_feedback,
+            get_seed_check,
+            verify_seed_words,
             set_treasurer_mode,
             get_treasurer_mode,
             validate_pv,

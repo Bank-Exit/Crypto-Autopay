@@ -45,24 +45,35 @@
   // onMount is async, so its returned cleanup would be ignored: detach listeners here,
   // otherwise every hot reload in dev stacks one more Rust log listener.
   let unsubLogs = null;
-  let unlistenRust = null;
   let unlistenDeepLink = null;
   let devKeyHandler = null;
   onDestroy(() => {
     unsubLogs?.(); unlistenDeepLink?.();
-    if (unlistenRust) {
-      unlistenRust();
-      if (window.__autopayRustLogUnlisten === unlistenRust) window.__autopayRustLogUnlisten = null;
-    }
+    if (window.__autopayRustLogSink === forwardRustLog) window.__autopayRustLogSink = null;
     if (devKeyHandler) document.removeEventListener("keydown", devKeyHandler);
   });
+
+  function forwardRustLog({ level, message, location }) {
+    const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
+    if (level >= 5) logError(mod, message);      // ERROR = 5
+    else if (level === 4) logWarn(mod, message); // WARN  = 4
+    else if (level === 3) logInfo(mod, message); // INFO  = 3
+    else logDebug(mod, message);                 // DEBUG = 2, TRACE = 1
+  }
 
   onMount(async () => {
     unsubLogs = subscribeToLogs(entries => { liveLogs = [...entries]; });
 
     // Forward Rust log events (tauri-plugin-log webview target) into AppLogger.
-    // The handle lives on window: a hot-reloaded module must replace the previous
-    // listener, not add a second one (each one would print every Rust line again).
+    // A single listener per page, attached synchronously-guarded: hot-reloaded App instances
+    // only swap the sink, so a slow attach can never leave a second listener behind.
+    window.__autopayRustLogSink = forwardRustLog;
+    if (!window.__autopayRustLogAttached) {
+      window.__autopayRustLogAttached = true;
+      import("@tauri-apps/plugin-log")
+        .then(({ attachLogger }) => attachLogger((entry) => window.__autopayRustLogSink?.(entry)))
+        .catch(() => { window.__autopayRustLogAttached = false; }); // browser dev mode: no backend
+    }
     // Earlier lines (previous sessions, night runs) come back from the Rust log file.
     try {
       const r = await invoke("get_log_retention");
@@ -70,19 +81,6 @@
       seedHistory(await invoke("get_log_history"));
     } catch (e) {
       // Browser dev mode: no backend
-    }
-    try {
-      const { attachLogger } = await import("@tauri-apps/plugin-log");
-      window.__autopayRustLogUnlisten?.();
-      unlistenRust = window.__autopayRustLogUnlisten = await attachLogger(({ level, message, location }) => {
-        const mod = location?.file?.replace(/.*\//, "").replace(".rs", "") ?? "rust";
-        if (level >= 5) logError(mod, message);      // ERROR = 5
-        else if (level === 4) logWarn(mod, message); // WARN  = 4
-        else if (level === 3) logInfo(mod, message); // INFO  = 3
-        else logDebug(mod, message);                 // DEBUG = 2, TRACE = 1
-      });
-    } catch (e) {
-      // In browser dev mode tauri-plugin-log is not available — ignore
     }
   });
 

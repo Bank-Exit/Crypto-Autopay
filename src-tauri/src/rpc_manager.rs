@@ -54,8 +54,6 @@ pub struct RpcConfig {
     /// Payment tolerance window in percent (default 20 → ±20% of period).
     /// E.g. for a monthly sub, payment is triggered within ±6 days of due date.
     pub tolerance_pct: u8,
-    /// Whether to log send events (privacy opt-in).
-    pub send_logs_enabled: bool,
 }
 
 impl Default for RpcConfig {
@@ -65,7 +63,6 @@ impl Default for RpcConfig {
             daemon_address: None,
             rpc_port: 18083,
             tolerance_pct: 20,
-            send_logs_enabled: false,
         }
     }
 }
