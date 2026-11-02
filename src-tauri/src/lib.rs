@@ -2307,7 +2307,95 @@ async fn add_subscription(
         db.insert_subscription(&sub).map_err(|e| e.to_string())?;
     }
 
-    log::info!("Subscription '{}' added (id={})", sub.label, sub.id);
+    log::info!("Subscription added (id={})", sub.id);
+    serde_json::to_value(&sub).map_err(|e| e.to_string())
+}
+
+/// Editable terms of a subscription, read from the frontend form payload.
+struct SubTerms {
+    label: String,
+    dest: String,
+    amount: String,
+    currency: String,
+    start_date: Option<chrono::DateTime<chrono::Utc>>,
+    schedule: String,
+    number_of_payments: u64,
+    canary_url: Option<String>,
+    description: Option<String>,
+    website_url: Option<String>,
+}
+
+fn sub_terms_from_payload(payload: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> Result<SubTerms, String> {
+    use chrono::Datelike;
+    let start_date = payload["start_date"].as_str().filter(|s| !s.is_empty())
+        .and_then(|sd| chrono::DateTime::parse_from_rfc3339(sd).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    // Legacy payloads carry "every N years" in repeat_every: fold it into the schedule.
+    let schedule = payment_policy::with_year_step(
+        payload["schedule"].as_str().unwrap_or("0 0 9 1 * *"),
+        payload["repeat_every"].as_u64().unwrap_or(1).min(u32::MAX as u64) as u32,
+        start_date.unwrap_or(now).year(),
+    ).map_err(|e| e.to_string())?;
+    let description = payment_policy::clean_text(payload["description"].as_str().unwrap_or(""), 500);
+    Ok(SubTerms {
+        label: payment_policy::clean_text(payload["custom_label"].as_str().unwrap_or("—"), 80),
+        dest: payload["destination_address"].as_str().unwrap_or("").trim().to_string(),
+        amount: payload["amount"].as_str().unwrap_or("0").to_string(),
+        currency: payload["currency"].as_str().unwrap_or("XMR").to_string(),
+        start_date,
+        schedule,
+        // Absent means unlimited, as in AutoPay codes (the form omits 0).
+        number_of_payments: payload["number_of_payments"].as_u64().unwrap_or(0),
+        canary_url: payload["canary_url"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        description: (!description.is_empty()).then_some(description),
+        website_url: payload["website_url"].as_str().and_then(payment_policy::clean_website_url),
+    })
+}
+
+/// Edit an existing subscription. Same checks as a new one; changed terms (address, amount,
+/// currency, schedule) no longer match the approved fingerprint, so the next payment asks again.
+#[tauri::command]
+async fn update_subscription(
+    id: String,
+    payload: serde_json::Value,
+    confirm_monthly: Option<bool>,
+    db_state: tauri::State<'_, Mutex<Database>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let now = chrono::Utc::now();
+    let terms = sub_terms_from_payload(&payload, now)?;
+    let (mut sub, others) = {
+        let db = db_state.lock().map_err(|e| e.to_string())?;
+        let (this, others): (Vec<_>, Vec<_>) = db.list_subscriptions().map_err(|e| e.to_string())?
+            .into_iter().partition(|s| s.id == id);
+        (this.into_iter().next().ok_or("Subscription not found")?, others)
+    };
+    {
+        let limits = app_state.lock().map_err(|e| e.to_string())?.payment_limits.clone();
+        check_new_subscription(&terms.dest, &terms.currency, &terms.amount, &terms.schedule,
+            &limits, &others, confirm_monthly.unwrap_or(false))?;
+    }
+    if terms.schedule != sub.schedule {
+        sub.next_payment_at = Some(next_occurrence(&terms.schedule, now));
+    }
+    sub.label = terms.label;
+    sub.description = terms.description;
+    sub.website_url = terms.website_url;
+    sub.destination_address = terms.dest;
+    sub.amount = terms.amount;
+    sub.currency = terms.currency;
+    sub.schedule = terms.schedule;
+    sub.number_of_payments = terms.number_of_payments;
+    sub.canary_url = terms.canary_url;
+    sub.updated_at = now;
+    db_state.lock().map_err(|e| e.to_string())?.update_subscription_terms(&sub).map_err(|e| e.to_string())?;
+    {
+        // A pending or session approval was given for the old terms.
+        let mut s = app_state.lock().map_err(|e| e.to_string())?;
+        s.pending_approvals.remove(&id);
+        s.approved_payments.remove(&id);
+    }
+    log::info!("Subscription updated (id={})", id);
     serde_json::to_value(&sub).map_err(|e| e.to_string())
 }
 
@@ -2320,27 +2408,13 @@ async fn save_subscription(
     db_state: tauri::State<'_, Mutex<Database>>,
     app_state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    use chrono::{Datelike, Utc};
+    use chrono::Utc;
     use uuid::Uuid;
 
     let now = Utc::now();
-    let label = payment_policy::clean_text(payload["custom_label"].as_str().unwrap_or("—"), 80);
-    let dest = payload["destination_address"].as_str().unwrap_or("").trim().to_string();
-    let amount = payload["amount"].as_str().unwrap_or("0").to_string();
-    let currency = payload["currency"].as_str().unwrap_or("XMR").to_string();
-    let start_date = payload["start_date"].as_str().filter(|s| !s.is_empty())
-        .and_then(|sd| chrono::DateTime::parse_from_rfc3339(sd).ok())
-        .map(|d| d.with_timezone(&Utc));
-    // Legacy payloads carry "every N years" in repeat_every: fold it into the schedule.
-    let schedule = payment_policy::with_year_step(
-        payload["schedule"].as_str().unwrap_or("0 0 9 1 * *"),
-        payload["repeat_every"].as_u64().unwrap_or(1).min(u32::MAX as u64) as u32,
-        start_date.unwrap_or(now).year(),
-    ).map_err(|e| e.to_string())?;
-    let number_of_payments = payload["number_of_payments"].as_u64().unwrap_or(1);
+    let SubTerms { label, dest, amount, currency, start_date, schedule, number_of_payments,
+        canary_url, description, website_url } = sub_terms_from_payload(&payload, now)?;
     let start_immediately = payload["start_immediately"].as_bool().unwrap_or(true);
-    let canary_url = payload["canary_url"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
-    let description = payment_policy::clean_text(payload["description"].as_str().unwrap_or(""), 500);
 
     {
         let limits = app_state.lock().map_err(|e| e.to_string())?.payment_limits.clone();
@@ -2361,9 +2435,9 @@ async fn save_subscription(
     let sub = Subscription {
         id: Uuid::new_v4().to_string(),
         wallet_id: "default".to_string(),
-        label: label.clone(),
-        description: if description.is_empty() { None } else { Some(description) },
-        website_url: payload["website_url"].as_str().and_then(payment_policy::clean_website_url),
+        label,
+        description,
+        website_url,
         destination_address: dest,
         payment_network: payload["network"].as_str().unwrap_or("monero").to_string(),
         amount,
@@ -2390,7 +2464,7 @@ async fn save_subscription(
         db.insert_subscription(&sub).map_err(|e| e.to_string())?;
     }
 
-    log::info!("Subscription '{}' saved (id={}, start_immediately={})", sub.label, sub.id, start_immediately);
+    log::info!("Subscription saved (id={}, start_immediately={})", sub.id, start_immediately);
     serde_json::to_value(&sub).map_err(|e| e.to_string())
 }
 
@@ -2834,6 +2908,9 @@ async fn pay_subscription_now(sub_id: String, app_handle: tauri::AppHandle) -> R
 /// Shared by the scheduler and the manual "pay now" command so both behave the same.
 async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription) -> Result<String, String> {
     use chrono::Utc;
+    if sub.payments_remaining() == Some(0) {
+        return Err("All planned payments of this subscription have been sent.".into());
+    }
     let (session_pw, wallet_dir, wallet_name) = {
         let st = app.try_state::<Mutex<AppState>>().ok_or("App state unavailable")?;
         let s = st.lock().map_err(|e| e.to_string())?;
@@ -2908,13 +2985,16 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
             // cooldown are skipped, otherwise the countdown shows a slot that
             // cannot be paid (e.g. "*/25" sent at :57 would be due at :00).
             let cooldown_end = Utc::now() + chrono::Duration::seconds(MONERO_MIN_SEND_INTERVAL_SECS as i64 - 60);
-            let new_next = next_occurrence(&sub.schedule, cooldown_end);
+            let new_next = (sub.payments_remaining() != Some(1))
+                .then(|| next_occurrence(&sub.schedule, cooldown_end));
             {
                 if let Ok(db) = db_state.lock() {
-                    if let Err(e) = db.update_next_payment(&sub_id, Some(new_next), sub.payments_sent + 1) {
+                    if let Err(e) = db.update_next_payment(&sub_id, new_next, sub.payments_sent + 1) {
                         log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
+                    } else if let Some(next) = new_next {
+                        log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", next.to_rfc3339(), sub_id);
                     } else {
-                        log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", new_next.to_rfc3339(), sub_id);
+                        log::info!("[Scheduler] Last planned payment sent for sub {}", sub_id);
                     }
                 }
             }
@@ -2934,7 +3014,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
                 }
             }
             // Emitted once the history entry exists, so the frontend reloads it right away.
-            let new_next_iso = new_next.to_rfc3339();
+            let new_next_iso = new_next.map(|t| t.to_rfc3339());
             app.emit("payment-sent", serde_json::json!({"sub_id": sub_id, "tx_hash": tx_hash, "next_payment_at": new_next_iso})).ok();
             Ok(tx_hash_out)
         }
@@ -3072,8 +3152,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
     let now = Utc::now();
     let due: Vec<_> = subs.into_iter().filter(|s| {
         if s.status != autopay_core::models::SubscriptionStatus::Active { return false; }
-        // Check max_payments (stored in grace_period_hours field temporarily)
-        // TODO: add proper max_payments field to DB
+        if s.payments_remaining() == Some(0) { return false; }
         if let Some(next) = s.next_payment_at {
             next <= now
         } else {
@@ -3546,6 +3625,7 @@ pub fn run() {
             update_subscription_next_payment,
             next_occurrence_of,
             fetch_price_onion,
+            update_subscription,
             get_subscriptions,
             add_subscription,
             delete_subscription,

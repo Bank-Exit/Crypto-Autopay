@@ -308,6 +308,9 @@
                   <button class="kebab-item" on:click={e => editSub(sub, e)}>
                     ✏ {$t.subEdit}
                   </button>
+                  <button class="kebab-item" on:click={e => { dispatch("details-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ⓘ {$t.subDetails}
+                  </button>
                   <button class="kebab-item" on:click={e => { dispatch("cap-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
                     ⛉ {$t.subCapMenu}
                   </button>
@@ -360,6 +363,9 @@
               {#if openMenuId === sub.id}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="kebab-menu" on:click|stopPropagation>
+                  <button class="kebab-item" on:click={e => { dispatch("details-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ⓘ {$t.subDetails}
+                  </button>
                   <button class="kebab-item" on:click={e => { dispatch('restore-sub', { sub }); openMenuId = null; e.stopPropagation(); }}>
                     {$t.subRestore}
                   </button>

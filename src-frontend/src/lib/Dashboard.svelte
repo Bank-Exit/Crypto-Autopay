@@ -820,7 +820,7 @@
     logInfo("Dashboard", `Opening edit modal for sub #${sub.id}`);
     showImportModal = false;
     showNewSubModal = false;
-    editingSubData = { ...sub };
+    editingSubData = { ...sub, raw_schedule: sub._raw_schedule };
     await tick();
     showNewSubModal = true;
   }
@@ -873,17 +873,17 @@
   async function onSubEdit({ detail }) {
     const editId = editingSubData?.id;
     if (!editId) { onSubNew({ detail }); return; }
-    const updated = payloadToSubscription({ ...detail.payload, _sourceCode: null });
-    updated.id = editId;
-    updated._db_id = editingSubData._db_id;
-    updated.payments_sent = editingSubData.payments_sent || 0;
-    updated.next_payment_at = editingSubData.next_payment_at;
-    updated.status = editingSubData.status;
-    subscriptions = subscriptions.map(s => s.id === editId ? updated : s);
-    logInfo("Dashboard", `Sub #${editId} updated`);
     showNewSubModal = false;
     editingSubData = null;
+    const result = await persistNewSubscription("update_subscription", { id: editId, payload: detail.payload });
+    if (result === false) return;
+    if (result) logInfo("Dashboard", `Sub #${editId} updated`);
+    else logWarn("Dashboard", `Sub #${editId} NOT updated`);
+    await reloadSubscriptions();
   }
+
+  let subDetails = null;
+  const fmtStamp = (iso) => iso ? new Date(iso).toLocaleString($currentLang, { dateStyle: "medium", timeStyle: "short" }) : "—";
 
   /**
    * Duplicate checker passed to SubscriptionCodeEditor.
@@ -1114,6 +1114,7 @@
     const due = subscriptions.filter(s => {
       if (!["Active", "Actif"].includes(s.status)) return false;
       if (!s.next_payment_at) return false;
+      if (s.number_of_payments > 0 && s.payments_sent >= s.number_of_payments) return false;
       return new Date(s.next_payment_at) <= now;
     });
     if (due.length === 0) return;
@@ -1630,6 +1631,10 @@
       status: s.status === "active" ? "Active" : s.status === "paused" ? "Paused" : (s.status || "Active"),
       canary_status: s.canary_url ? (s.last_canary_status || "Ok") : "NotConfigured",
       payments_sent: s.payments_sent || 0,
+      number_of_payments: s.number_of_payments ?? 1,
+      canary_url: s.canary_url || "",
+      created_at: s.created_at || null,
+      updated_at: s.updated_at || null,
       wallet_id: wallets[0]?.id || 1,
       address: s.destination_address || null,
       _raw_schedule: s.schedule || null,
@@ -1916,6 +1921,25 @@
           <button class="btn-primary" style="flex:1;padding:10px" on:click={() => closePolicyNotice(false)}>{$t.commonGotIt}</button>
         </div>
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if subDetails}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" role="dialog" aria-modal="true" on:click={() => subDetails = null}>
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px" on:click|stopPropagation>
+      <h2 style="margin:0 0 12px;font-size:17px">{subDetails.label}</h2>
+      <dl class="sub-details">
+        <dt>{$t.subCreatedAt}</dt><dd>{fmtStamp(subDetails.created_at)}</dd>
+        <dt>{$t.subUpdatedAt}</dt><dd>{fmtStamp(subDetails.updated_at)}</dd>
+        <dt>{$t.subPaymentsSent}</dt>
+        <dd>{subDetails.payments_sent}{subDetails.number_of_payments > 0 ? ` / ${subDetails.number_of_payments}` : ""}</dd>
+        {#if subDetails.next_payment_at && subDetails.status === "Active"}
+          <dt>{$t.nextPayment.replace(/\s*:\s*$/, "")}</dt><dd>{fmtStamp(subDetails.next_payment_at)}</dd>
+        {/if}
+      </dl>
+      <button type="button" class="btn-ghost" style="width:100%;padding:10px;margin-top:14px" on:click={() => subDetails = null}>{$t.alertOverlayClose}</button>
     </div>
   </div>
 {/if}
@@ -2395,6 +2419,7 @@
         {subCaps}
         on:open-url={e => openExternal(e.detail.url)}
         on:cap-sub={e => openSubCap(e.detail.sub)}
+        on:details-sub={e => subDetails = e.detail.sub}
         on:delete-sub={async e => {
           const sub = subscriptions.find(s => s.id === e.detail.id);
           subscriptions = subscriptions.filter(s => s.id !== e.detail.id);
@@ -4032,6 +4057,9 @@
     display: flex; align-items: center; justify-content: center;
     padding: 20px;
   }
+  .sub-details { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
+  .sub-details dt { color: var(--text-muted); }
+  .sub-details dd { margin: 0; }
   .modal-panel {
     background: var(--bg-card);
     border-radius: 14px;

@@ -31,7 +31,8 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 | Schedules | Every 25 min (needs the "very short schedules" unlock) … hourly, daily, weekly, monthly, quarterly, yearly, every N years; cron calendar |
 | Options | Start date, number of payments, description, website URL (shown and clickable next to the description), canary URL |
 | Duplicate check | Exact (same address + schedule) or soft (same name, amount, currency) before import |
-| Actions | Pause / resume, pay now, edit, archive, delete, per-subscription cap (⋯ menu) |
+| Actions | Pause / resume, pay now, edit, details, archive, delete, per-subscription cap (⋯ menu) |
+| Timestamps | Creation and last modification (edit, pause / resume, archive), shown in Edit and Details; payments do not count as modifications |
 | Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |
 
 ## Payment engine
@@ -124,7 +125,6 @@ technical logs retention, RPC node / binary path / payment tolerance, start with
 
 ## Known limits
 
-- Editing a subscription only updates the screen: the stored terms do not change yet (`TODO.md`).
 - Canary URLs are stored but not checked yet: `CANARY_*` alerts never fire.
 - `subscriptions.db` is not encrypted (planned: SQLCipher).
 - Bitcoin is display-only; one wallet only; no in-app updater.

@@ -105,7 +105,10 @@
     }
   }
   // Start mode: null = not chosen (blocks submit), 'now' = immediately, 'wait' = next occurrence
-  let startMode = null; // must be chosen by user
+  // Editing keeps the current schedule position: no start choice to make.
+  const isEdit = Boolean(editData?.id);
+  let startMode = isEdit ? "edit" : null; // must be chosen by user
+  const fmtStamp = (iso) => new Date(iso).toLocaleString(lang, { dateStyle: "medium", timeStyle: "short" });
   let showAdvanced = false;
   let generatedCode = "";
   let generatedError = "";
@@ -486,6 +489,11 @@
   <!-- mode="create" = merchant code generator; mode="new" = manual subscriber add (same form, different CTA) -->
   {#if mode === "create" || mode === "new"}
     <div class="sce-form">
+      {#if isEdit && editData.created_at}
+        <p class="sce-stamps">
+          {l("Créé le", "Created")} {fmtStamp(editData.created_at)}{#if editData.updated_at && editData.updated_at !== editData.created_at} · {l("modifié le", "modified")} {fmtStamp(editData.updated_at)}{/if}
+        </p>
+      {/if}
 
       <!-- Network selector (Monero + Bitcoin only in the app) -->
       <div class="field-row">
@@ -638,6 +646,7 @@
       </div>
 
       <!-- Start mode selector (mandatory 3-state) -->
+      {#if !isEdit}
       <div class="start-mode-row">
         <span class="start-mode-label">{l("Quand démarrer ?", "When to start?")} <span style="color:#ef4444;font-size:11px">{startMode === null ? l('(obligatoire)', '(required)') : ''}</span></span>
         <div class="start-mode-seg" role="group" aria-label={l("Mode de démarrage", "Start mode")}>
@@ -657,6 +666,7 @@
           <span class="start-mode-hint">{l("Envoi déclenché dès l'ajout de l'abonnement", "Send triggered as soon as subscription is added")}</span>
         {/if}
       </div>
+      {/if}
 
       <!-- Advanced fields (collapsible) -->
       <button class="btn-toggle-advanced" type="button" on:click={() => showAdvanced = !showAdvanced}>
@@ -696,7 +706,9 @@
           disabled={startMode === null}
           title={startMode === null ? l("Choisissez quand démarrer les envois", "Choose when to start sending") : ''}
           on:click={addSubscriptionDirectly}>
-          {startMode === null ? l("Choisir le mode de démarrage ↑", "Choose start mode ↑") : `＋ ${l("Ajouter à mes abonnements", "Add to my subscriptions")}`}
+          {startMode === null ? l("Choisir le mode de démarrage ↑", "Choose start mode ↑")
+            : isEdit ? l("Enregistrer les modifications", "Save changes")
+            : `＋ ${l("Ajouter à mes abonnements", "Add to my subscriptions")}`}
         </button>
       {:else}
         <button class="btn-primary btn-generate" type="button"
@@ -976,6 +988,7 @@
   .field-sm { flex: 1; min-width: 0; }
 
   .required { color: var(--accent, #e8601a); }
+  .sce-stamps { margin: 0 0 4px; font-size: 11.5px; color: var(--text-muted, #aaa); }
   .hint { font-size: 10.5px; color: var(--text-muted, #aaa); font-weight: 400; }
 
   input, select, textarea {

@@ -112,6 +112,32 @@ impl Database {
         Ok(subs)
     }
 
+    /// Terms and details edited by the user. `updated_at` only moves on user changes
+    /// (edit, pause / resume), never on payments, postpones or canary checks.
+    pub fn update_subscription_terms(&self, sub: &Subscription) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE subscriptions SET label = ?1, description = ?2, website_url = ?3,
+                destination_address = ?4, amount = ?5, currency = ?6, schedule = ?7,
+                number_of_payments = ?8, next_payment_at = ?9, canary_url = ?10, updated_at = ?11
+             WHERE id = ?12",
+            params![
+                sub.label,
+                sub.description,
+                sub.website_url,
+                sub.destination_address,
+                sub.amount,
+                sub.currency,
+                sub.schedule,
+                sub.number_of_payments as i64,
+                sub.next_payment_at.map(|t| t.to_rfc3339()),
+                sub.canary_url,
+                sub.updated_at.to_rfc3339(),
+                sub.id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_subscription_status(
         &self,
         id: &str,
@@ -131,11 +157,10 @@ impl Database {
         payments_sent: u64,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE subscriptions SET next_payment_at = ?1, payments_sent = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE subscriptions SET next_payment_at = ?1, payments_sent = ?2 WHERE id = ?3",
             params![
                 next.map(|t| t.to_rfc3339()),
                 payments_sent as i64,
-                Utc::now().to_rfc3339(),
                 id
             ],
         )?;
@@ -145,8 +170,8 @@ impl Database {
     /// Update only the next_payment_at field by row id (used by frontend scheduler).
     pub fn update_subscription_next_payment(&self, id: &str, next_payment_at: &str) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE subscriptions SET next_payment_at = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![next_payment_at, Utc::now().to_rfc3339(), id],
+            "UPDATE subscriptions SET next_payment_at = ?1 WHERE id = ?2",
+            rusqlite::params![next_payment_at, id],
         )?;
         Ok(())
     }
@@ -158,11 +183,10 @@ impl Database {
         last_ok: Option<DateTime<Utc>>,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE subscriptions SET last_canary_status = ?1, canary_last_ok = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE subscriptions SET last_canary_status = ?1, canary_last_ok = ?2 WHERE id = ?3",
             params![
                 status_str,
                 last_ok.map(|t| t.to_rfc3339()),
-                Utc::now().to_rfc3339(),
                 id
             ],
         )?;
