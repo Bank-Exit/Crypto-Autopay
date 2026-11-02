@@ -29,7 +29,7 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 |---|---|
 | Add | Manual form, import of a `crypto-autopay:1:` / `monero-request:1:` code, QR, or `crypto-autopay://` deep link |
 | Schedules | Every 25 min (needs the "very short schedules" unlock) … hourly, daily, weekly, monthly, quarterly, yearly, every N years; cron calendar |
-| Options | Start date, number of payments, description, canary URL |
+| Options | Start date, number of payments, description, website URL (shown and clickable next to the description), canary URL |
 | Duplicate check | Exact (same address + schedule) or soft (same name, amount, currency) before import |
 | Actions | Pause / resume, pay now, edit, archive, delete, per-subscription cap (⋯ menu) |
 | Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |

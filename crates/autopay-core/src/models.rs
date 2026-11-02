@@ -42,6 +42,10 @@ pub struct Subscription {
     /// Optional long description.
     pub description: Option<String>,
 
+    /// Merchant website the subscription comes from (http/https only).
+    #[serde(default)]
+    pub website_url: Option<String>,
+
     /// Recipient address.
     pub destination_address: String,
 

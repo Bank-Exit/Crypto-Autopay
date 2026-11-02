@@ -635,7 +635,7 @@
     try {
       const { open } = await import("@tauri-apps/plugin-shell");
       await open(url);
-      logInfo("External", `Opened URL: ${url}`);
+      logInfo("External", "Opened an external link"); // no URL: it can identify a recipient
     } catch {
       window.open(url, "_blank", "noopener");
     }
@@ -665,6 +665,7 @@
       id: Date.now(),
       label: payload.custom_label || "—",
       description: payload.description || "",
+      website_url: payload.website_url || null,
       amount: String(payload.amount),
       currency: payload.currency || "XMR",
       schedule: scheduleToHuman(payload.schedule, payload.repeat_every || 1, $currentLang),
@@ -1621,6 +1622,7 @@
       id: s.id,
       label: s.label || "—",
       description: s.description || "",
+      website_url: s.website_url || null,
       amount: String(s.amount || "0"),
       currency: s.currency || "XMR",
       schedule: scheduleToHuman(s.schedule, s.repeat_every || 1, $currentLang),
@@ -2374,9 +2376,6 @@
         {:else if fiatRateError}
           <span class="text-muted refill-hint">{$t.fiatUnavailable}</span>
         {/if}
-        {#if showFiatPopup}
-          <FiatOptInPopup lang={$currentLang} on:confirm={() => { showFiatPopup = false; fiatOptIn.set(true); }} on:cancel={() => showFiatPopup = false} />
-        {/if}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <span class="refill-help-link" role="link" tabindex="0"
           on:click={() => openExternal("https://libre-market.com/m/epicerie/tutorial")}
@@ -2384,12 +2383,17 @@
           {$t.howToGetMoneroLink}
         </span>
       </div>
+      <!-- Outside the banner: its opacity would make the popup translucent. -->
+      {#if showFiatPopup}
+        <FiatOptInPopup lang={$currentLang} on:confirm={() => { showFiatPopup = false; fiatOptIn.set(true); }} on:cancel={() => showFiatPopup = false} />
+      {/if}
 
       <SubscriptionList
         {wallets}
         {subscriptions}
         {retrySubIds}
         {subCaps}
+        on:open-url={e => openExternal(e.detail.url)}
         on:cap-sub={e => openSubCap(e.detail.sub)}
         on:delete-sub={async e => {
           const sub = subscriptions.find(s => s.id === e.detail.id);

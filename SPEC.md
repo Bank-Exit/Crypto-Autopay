@@ -148,6 +148,7 @@ code = json.loads(canonical)
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `description` | string | `""` | Longer description shown in wallet details |
+| `website_url` | string | `null` | Merchant website, shown next to the description so the payer remembers where the subscription comes from. Wallets MUST only open `http`/`https` URLs, and only on an explicit user action |
 | `token` | string | `null` | Token symbol for non-native assets. `null` = native coin (XMR, BTC, ETH…) |
 | `token_contract` | string | `null` | Contract address or program ID for the token. Required if `token` is set |
 | `repeat_every` | integer | `1` | Execute every Nth cron trigger. `2` with annual cron = every 2 years |

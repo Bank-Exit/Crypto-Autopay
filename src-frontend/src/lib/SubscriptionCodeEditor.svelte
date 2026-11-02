@@ -70,6 +70,7 @@
     token_contract: null,
     custom_label: "",
     description: "",
+    website_url: "",
     destination_address: "",
     amount: "",
     currency: "XMR",
@@ -82,6 +83,7 @@
     ...(editData ? {
       custom_label: editData.label || editData.custom_label || "",
       description: editData.description || "",
+      website_url: editData.website_url || "",
       destination_address: editData.destination_address || editData.address || "",
       amount: editData.amount || "",
       currency: editData.currency || "XMR",
@@ -189,6 +191,7 @@
       clean.schedule = withYearStep(payload.schedule, Math.min(10, payload.repeat_every), firstYear);
     }
     if (payload.description.trim()) clean.description = payload.description.trim();
+    if (payload.website_url.trim()) clean.website_url = payload.website_url.trim();
     if (payload.number_of_payments > 0) clean.number_of_payments = payload.number_of_payments;
     if (payload.start_date) clean.start_date = payload.start_date;
     if (payload.canary_url.trim()) clean.canary_url = payload.canary_url.trim();
@@ -665,6 +668,11 @@
           <label class="field">
             <span>{l("Description", "Description")}</span>
             <textarea bind:value={payload.description} rows="2" placeholder={l("Détails de l'abonnement…", "Subscription details…")} />
+          </label>
+
+          <label class="field">
+            <span>{l("URL du site web", "Website URL")} <span class="hint">{l("facultatif — pour se souvenir de la provenance", "optional — to remember where it comes from")}</span></span>
+            <input type="url" bind:value={payload.website_url} placeholder="https://example.org" maxlength="300" />
           </label>
 
           <label class="field field-sm">

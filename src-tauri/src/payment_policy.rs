@@ -300,6 +300,21 @@ pub fn clean_text(text: &str, max_chars: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(max_chars).collect::<String>().trim().to_string()
 }
 
+/// Website URL as shown and opened by the app: http(s) only, no credentials, ≤ 300 chars.
+/// Anything else is dropped rather than rejected: the field is informational.
+pub fn clean_website_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 300 || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let with_scheme = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+    let url = tauri::Url::parse(&with_scheme).ok()?;
+    let ok = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| h.contains('.'))
+        && url.username().is_empty() && url.password().is_none();
+    ok.then(|| url.to_string())
+}
+
 /// Average XMR per 30 days for one subscription.
 pub fn monthly_projection(amount: &str, schedule: &str) -> f64 {
     match (parse_amount(amount), average_interval_minutes(schedule)) {
@@ -482,6 +497,18 @@ pub fn average_interval_minutes(schedule: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn website_urls() {
+        assert_eq!(clean_website_url("libre-market.com/m/x").as_deref(), Some("https://libre-market.com/m/x"));
+        assert_eq!(clean_website_url(" http://example.org ").as_deref(), Some("http://example.org/"));
+        assert_eq!(clean_website_url("javascript:alert(1)"), None);
+        assert_eq!(clean_website_url("file:///etc/passwd"), None);
+        assert_eq!(clean_website_url("https://user:pw@example.org"), None);
+        assert_eq!(clean_website_url("https://localhost"), None);
+        assert_eq!(clean_website_url("a b.com"), None);
+        assert_eq!(clean_website_url(""), None);
+    }
 
     #[test]
     fn wallet_cap_percent_of_starting_balance() {

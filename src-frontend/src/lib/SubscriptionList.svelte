@@ -138,6 +138,14 @@
   // Per-subscription caps (XMR over 30 days), keyed by sub id.
   export let subCaps = {};
 
+  /** Host of an http(s) website URL, or null (nothing else is ever opened). */
+  function siteHost(url) {
+    try {
+      const u = new URL(url);
+      return u.protocol === "https:" || u.protocol === "http:" ? u.host.replace(/^www\./, "") : null;
+    } catch { return null; }
+  }
+
   const SUSPENDED_STATUSES = ["Suspended", "Cancelled", "Expired"];
   const ARCHIVED_STATUSES = ["Cancelled", "Expired"];
 
@@ -220,8 +228,14 @@
             <span class="badge {statusBadgeClass(sub)}">{statusLabel(sub, $t)}</span>
           </div>
 
-          {#if sub.description}
-            <div class="sub-desc text-muted">{sub.description}</div>
+          {#if sub.description || siteHost(sub.website_url)}
+            <div class="sub-desc-row">
+              {#if sub.description}<span class="sub-desc text-muted">{sub.description}</span>{/if}
+              {#if siteHost(sub.website_url)}
+                <button type="button" class="sub-site" title={sub.website_url}
+                  on:click|stopPropagation={() => dispatch("open-url", { url: sub.website_url })}>↗ {siteHost(sub.website_url)}</button>
+              {/if}
+            </div>
           {/if}
 
           <div class="sub-meta">
@@ -383,6 +397,10 @@
   .sub-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .sub-label { font-weight: 700; font-size: 14px; color: var(--text); }
   .sub-desc { font-size: 12px; }
+  .sub-desc-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; }
+  .sub-site { background: none; border: none; padding: 0; font: inherit; font-size: 12px;
+    color: var(--text-muted); cursor: pointer; text-decoration: none; }
+  .sub-site:hover, .sub-site:focus-visible, .sub-site:active { text-decoration: underline; color: var(--text); }
 
   .sub-meta { display: flex; align-items: center; gap: 6px; font-size: 13px; flex-wrap: wrap; }
   .sub-amount { color: var(--text); }

@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
     raw_code            TEXT,
-    notes               TEXT
+    notes               TEXT,
+    website_url         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payments (

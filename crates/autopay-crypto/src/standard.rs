@@ -59,6 +59,10 @@ pub struct AutoPayCodeV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Merchant website, shown to the payer as the origin of the subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+
     /// Blockchain to use: "monero" (V1), "bitcoin" (V3+).
     pub payment_network: String,
 
@@ -312,6 +316,7 @@ fn map_compat_to_v1(v: serde_json::Value) -> Result<AutoPayCodeV1, CodeError> {
             .unwrap_or("Imported subscription")
             .to_string(),
         description: None,
+        website_url: None,
         payment_network: "monero".to_string(),
         sellers_wallet: v["sellers_wallet"]
             .as_str()
@@ -353,6 +358,7 @@ mod tests {
             v: 1,
             custom_label: "Test Media — Monthly".to_string(),
             description: Some("Monthly newsletter access.".to_string()),
+            website_url: None,
             payment_network: "monero".to_string(),
             sellers_wallet: "4At3X5rvVypTofgmueN9s9QtrzdRe5BueFrskAZi17BoYbhzysozzoMFB6zWnTKdGC6AxEAbEE5czFR3hbEEJbsm4hCeX2S".to_string(),
             currency: "EUR".to_string(),

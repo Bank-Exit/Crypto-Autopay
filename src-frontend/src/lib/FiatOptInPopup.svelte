@@ -60,6 +60,7 @@
   }
   .fiat-popup {
     max-width: 320px; width: 90%; padding: 1.25rem;
+    background: var(--bg-card); opacity: 1;
     display: flex; flex-direction: column; gap: 10px;
   }
   .fiat-popup-title { font-weight: 700; font-size: 0.95rem; margin: 0; }

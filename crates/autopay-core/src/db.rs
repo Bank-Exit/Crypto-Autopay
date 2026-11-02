@@ -36,6 +36,14 @@ impl Database {
 
     fn migrate(&self) -> Result<(), DbError> {
         self.conn.execute_batch(include_str!("schema.sql"))?;
+        // Columns added after the first release: schema.sql only creates missing tables.
+        let has_website: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name = 'website_url'",
+            [], |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !has_website {
+            self.conn.execute_batch("ALTER TABLE subscriptions ADD COLUMN website_url TEXT;")?;
+        }
         Ok(())
     }
 
@@ -48,8 +56,8 @@ impl Database {
                 payment_network, amount, currency, schedule, number_of_payments,
                 payments_sent, next_payment_at, status, grace_period_hours,
                 canary_url, merchant_pubkey, last_canary_status, canary_last_ok,
-                webhook_url, created_at, updated_at, raw_code, notes
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                webhook_url, created_at, updated_at, raw_code, notes, website_url
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             params![
                 sub.id,
                 sub.wallet_id,
@@ -74,6 +82,7 @@ impl Database {
                 sub.updated_at.to_rfc3339(),
                 sub.raw_code,
                 sub.notes,
+                sub.website_url,
             ],
         )?;
         Ok(())
@@ -245,6 +254,7 @@ fn row_to_subscription(row: &rusqlite::Row) -> Result<Subscription, rusqlite::Er
         updated_at: row.get::<_, String>("updated_at")?.parse().unwrap_or_else(|_| Utc::now()),
         raw_code: row.get("raw_code")?,
         notes: row.get("notes")?,
+        website_url: row.get("website_url")?,
     })
 }
 
