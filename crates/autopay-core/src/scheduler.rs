@@ -205,7 +205,7 @@ impl SubscriptionScheduler {
                     if next.is_none() && !sub.is_infinite() {
                         let _ = db.update_subscription_status(
                             &sub.id,
-                            &SubscriptionStatus::Cancelled,
+                            &SubscriptionStatus::Completed,
                         );
                     }
                 }

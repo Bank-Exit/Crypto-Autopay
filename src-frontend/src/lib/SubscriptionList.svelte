@@ -149,7 +149,9 @@
   const SUSPENDED_STATUSES = ["Suspended", "Cancelled", "Expired"];
   const ARCHIVED_STATUSES = ["Cancelled", "Expired"];
 
-  $: activeSubs = subscriptions.filter(s => !ARCHIVED_STATUSES.includes(s.status));
+  // Completed ones stay visible (greyed) below the running ones.
+  $: activeSubs = subscriptions.filter(s => !ARCHIVED_STATUSES.includes(s.status))
+    .sort((a, b) => (a.status === "Completed") - (b.status === "Completed"));
   $: archivedSubs = subscriptions.filter(s => ARCHIVED_STATUSES.includes(s.status));
 
   // Legacy: if used with archived=true prop, respect it
@@ -187,6 +189,7 @@
     if (sub.status === "Cancelled") return t.cancelled;
     if (sub.status === "Expired") return t.expired;
     if (sub.status === "Pending") return t.pending;
+    if (sub.status === "Completed") return t.completed;
     return sub.status;
   }
 
@@ -217,7 +220,8 @@
     </div>
   {:else}
     {#each activeSubs as sub (sub.id)}
-      <div class="sub-card card" class:sub-archived={archived} class:sub-suspended={isSuspended(sub)}>
+      <div class="sub-card card" class:sub-archived={archived} class:sub-suspended={isSuspended(sub)}
+        class:sub-completed={sub.status === "Completed"}>
         <div class="sub-left">
           <span class="status-dot {statusDotColor(sub)}"></span>
         </div>
@@ -253,7 +257,11 @@
           </div>
 
           <div class="sub-footer">
-            <span class="text-muted sent-count">{sub.payments_sent} {$t.sent}</span>
+            {#if sub.status === "Completed"}
+              <span class="text-muted sent-count">✓ {fmt($t.subCompletedCount, { n: sub.payments_sent, total: sub.number_of_payments })}</span>
+            {:else}
+              <span class="text-muted sent-count">{sub.payments_sent}{sub.number_of_payments > 0 ? ` / ${sub.number_of_payments}` : ""} {$t.sent}</span>
+            {/if}
             {#if subCaps[sub.id]}
               <span class="cap-chip" title={$t.subCapTitle}>{fmt($t.subCapChip, { cap: subCaps[sub.id] })}</span>
             {/if}
@@ -266,7 +274,9 @@
             {/if}
 
             <!-- NEXT date only if not suspended -->
-            {#if !isSuspended(sub) && sub.next_payment_at}
+            {#if sub.status === "Completed"}
+              <!-- nothing scheduled any more -->
+            {:else if !isSuspended(sub) && sub.next_payment_at}
               <span class="next-date" class:retry-date={retrySubIds.has(sub.id)}>
                 <span class="text-muted">{retrySubIds.has(sub.id) ? $t.retryNext : $t.next}</span>
                 <strong>{formatDate(sub.next_payment_at, $currentLang)}</strong>
@@ -288,7 +298,7 @@
 
         <div class="sub-actions">
           <!-- Play / Pause -->
-          {#if !isSuspended(sub)}
+          {#if !isSuspended(sub) && sub.status !== "Completed"}
             <button class="btn-ghost btn-sm" title={sub.status === "Paused" ? $t.subResume : $t.subPause}
               on:click={e => togglePause(sub, e)}>
               {sub.status === "Paused" ? "▶" : "⏸"}
@@ -301,7 +311,18 @@
             {#if openMenuId === sub.id}
               <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
               <div class="kebab-menu" on:click|stopPropagation>
-                {#if !isSuspended(sub)}
+                {#if sub.status === "Completed"}
+                  <button class="kebab-item" on:click={e => editSub(sub, e)} title={$t.subExtendHint}>
+                    ✏ {$t.subEdit}
+                  </button>
+                  <button class="kebab-item" on:click={e => { dispatch("details-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ⓘ {$t.subDetails}
+                  </button>
+                  <div class="kebab-divider"></div>
+                  <button class="kebab-item kebab-warn" on:click={e => archiveSub(sub, e)}>
+                    {$t.subArchive}
+                  </button>
+                {:else if !isSuspended(sub)}
                   <button class="kebab-item kebab-trigger" on:click={e => triggerNow(sub, e)}>
                     ▶ {$t.subTriggerNow}
                   </button>
@@ -395,6 +416,7 @@
   .sub-card:hover { background: var(--bg-card-hover); }
   .sub-archived { opacity: 0.5; }
   .sub-suspended { opacity: 0.72; }
+  .sub-completed { opacity: 0.55; filter: grayscale(1); }
 
   .sub-left { display: flex; align-items: flex-start; padding-top: 4px; }
 

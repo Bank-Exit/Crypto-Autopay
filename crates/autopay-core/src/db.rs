@@ -44,6 +44,7 @@ impl Database {
         if !has_website {
             self.conn.execute_batch("ALTER TABLE subscriptions ADD COLUMN website_url TEXT;")?;
         }
+        self.complete_exhausted()?;
         Ok(())
     }
 
@@ -112,14 +113,26 @@ impl Database {
         Ok(subs)
     }
 
+    /// Mark subscriptions whose planned payments have all been sent as completed.
+    /// Not a user change: `updated_at` is left alone.
+    pub fn complete_exhausted(&self) -> Result<usize, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE subscriptions SET status = 'completed', next_payment_at = NULL
+             WHERE status IN ('active', 'paused', 'past_due', 'pending')
+               AND number_of_payments > 0 AND payments_sent >= number_of_payments",
+            [],
+        )?)
+    }
+
     /// Terms and details edited by the user. `updated_at` only moves on user changes
     /// (edit, pause / resume), never on payments, postpones or canary checks.
     pub fn update_subscription_terms(&self, sub: &Subscription) -> Result<(), DbError> {
         self.conn.execute(
             "UPDATE subscriptions SET label = ?1, description = ?2, website_url = ?3,
                 destination_address = ?4, amount = ?5, currency = ?6, schedule = ?7,
-                number_of_payments = ?8, next_payment_at = ?9, canary_url = ?10, updated_at = ?11
-             WHERE id = ?12",
+                number_of_payments = ?8, next_payment_at = ?9, canary_url = ?10, updated_at = ?11,
+                status = ?12
+             WHERE id = ?13",
             params![
                 sub.label,
                 sub.description,
@@ -132,6 +145,7 @@ impl Database {
                 sub.next_payment_at.map(|t| t.to_rfc3339()),
                 sub.canary_url,
                 sub.updated_at.to_rfc3339(),
+                sub.status.to_string(),
                 sub.id,
             ],
         )?;
@@ -247,6 +261,7 @@ fn row_to_subscription(row: &rusqlite::Row) -> Result<Subscription, rusqlite::Er
         "expired" => SubscriptionStatus::Expired,
         "pending" => SubscriptionStatus::Pending,
         "suspended" => SubscriptionStatus::Suspended,
+        "completed" => SubscriptionStatus::Completed,
         _ => SubscriptionStatus::Active,
     };
 
@@ -302,4 +317,38 @@ fn row_to_payment(row: &rusqlite::Row) -> Result<PaymentRecord, rusqlite::Error>
         initiated_at: row.get::<_, String>("initiated_at")?.parse().unwrap_or_else(|_| Utc::now()),
         confirmed_at: parse_dt(row.get("confirmed_at")?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(id: &str, planned: u64, sent: u64) -> Subscription {
+        let now = Utc::now();
+        Subscription {
+            id: id.into(), wallet_id: "default".into(), label: "t".into(), description: None,
+            website_url: None, destination_address: "4x".into(), payment_network: "monero".into(),
+            amount: "0.01".into(), currency: "XMR".into(), schedule: "0 0 9 1 * *".into(),
+            number_of_payments: planned, payments_sent: sent, next_payment_at: Some(now),
+            status: SubscriptionStatus::Active, grace_period_hours: 24, canary_url: None,
+            merchant_pubkey: None, last_canary_status: None, canary_last_ok: None, webhook_url: None,
+            created_at: now, updated_at: now, raw_code: None, notes: None,
+        }
+    }
+
+    #[test]
+    fn exhausted_subscriptions_complete() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_subscription(&sub("done", 3, 3)).unwrap();
+        db.insert_subscription(&sub("over", 3, 20)).unwrap();
+        db.insert_subscription(&sub("left", 3, 2)).unwrap();
+        db.insert_subscription(&sub("unlimited", 0, 50)).unwrap();
+        assert_eq!(db.complete_exhausted().unwrap(), 2);
+        let subs = db.list_subscriptions().unwrap();
+        let get = |id: &str| subs.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(get("done").status, SubscriptionStatus::Completed);
+        assert!(get("over").next_payment_at.is_none());
+        assert_eq!(get("left").status, SubscriptionStatus::Active);
+        assert_eq!(get("unlimited").status, SubscriptionStatus::Active);
+    }
 }

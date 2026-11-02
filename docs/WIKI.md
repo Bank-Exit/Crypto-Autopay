@@ -32,6 +32,7 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 | Options | Start date, number of payments, description, website URL (shown and clickable next to the description), canary URL |
 | Duplicate check | Exact (same address + schedule) or soft (same name, amount, currency) before import |
 | Actions | Pause / resume, pay now, edit, details, archive, delete, per-subscription cap (⋯ menu) |
+| Completion | Once all planned payments are sent the subscription becomes "Completed" (greyed, no next date); raising the number of payments in Edit resumes it |
 | Timestamps | Creation and last modification (edit, pause / resume, archive), shown in Edit and Details; payments do not count as modifications |
 | Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |
 

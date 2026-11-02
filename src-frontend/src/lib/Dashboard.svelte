@@ -1628,7 +1628,8 @@
       currency: s.currency || "XMR",
       schedule: scheduleToHuman(s.schedule, s.repeat_every || 1, $currentLang),
       next_payment_at: s.next_payment_at || null, // keep full ISO timestamp — do NOT slice to date only
-      status: s.status === "active" ? "Active" : s.status === "paused" ? "Paused" : (s.status || "Active"),
+      // DB snake_case ("past_due") -> UI PascalCase ("PastDue")
+      status: (s.status || "active").replace(/(^|_)(\w)/g, (_, __, c) => c.toUpperCase()),
       canary_status: s.canary_url ? (s.last_canary_status || "Ok") : "NotConfigured",
       payments_sent: s.payments_sent || 0,
       number_of_payments: s.number_of_payments ?? 1,
@@ -2439,12 +2440,12 @@
         on:archive-sub={async e => {
           const sub = e.detail.sub;
           subscriptions = subscriptions.map(s => s.id === sub.id ? { ...s, status: "Cancelled" } : s);
-          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: true });
+          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: true, archived: true });
         }}
         on:restore-sub={async e => {
           const sub = e.detail.sub;
-          subscriptions = subscriptions.map(s => s.id === sub.id ? { ...s, status: "Paused" } : s);
-          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: false });
+          if (sub._db_id) await tauriInvoke("set_subscription_status", { id: sub._db_id, paused: true });
+          await reloadSubscriptions();
         }}
       />
       <!-- Footer marketing + bottom spacer -->

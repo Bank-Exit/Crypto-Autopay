@@ -2375,9 +2375,7 @@ async fn update_subscription(
         check_new_subscription(&terms.dest, &terms.currency, &terms.amount, &terms.schedule,
             &limits, &others, confirm_monthly.unwrap_or(false))?;
     }
-    if terms.schedule != sub.schedule {
-        sub.next_payment_at = Some(next_occurrence(&terms.schedule, now));
-    }
+    let reschedule = terms.schedule != sub.schedule || sub.next_payment_at.is_none();
     sub.label = terms.label;
     sub.description = terms.description;
     sub.website_url = terms.website_url;
@@ -2388,6 +2386,14 @@ async fn update_subscription(
     sub.number_of_payments = terms.number_of_payments;
     sub.canary_url = terms.canary_url;
     sub.updated_at = now;
+    // More payments planned than sent reopens a completed subscription, and the reverse ends it.
+    if sub.payments_remaining() == Some(0) {
+        sub.status = SubscriptionStatus::Completed;
+        sub.next_payment_at = None;
+    } else {
+        if sub.status == SubscriptionStatus::Completed { sub.status = SubscriptionStatus::Active; }
+        if reschedule { sub.next_payment_at = Some(next_occurrence(&sub.schedule, now)); }
+    }
     db_state.lock().map_err(|e| e.to_string())?.update_subscription_terms(&sub).map_err(|e| e.to_string())?;
     {
         // A pending or session approval was given for the old terms.
@@ -2658,16 +2664,20 @@ async fn delete_subscription(
     db.delete_subscription(&id).map_err(|e| e.to_string())
 }
 
-/// Pause or resume a subscription.
+/// Pause, resume or archive a subscription.
 #[tauri::command]
 async fn set_subscription_status(
     id: String,
     paused: bool,
+    archived: Option<bool>,
     db_state: tauri::State<'_, Mutex<Database>>,
 ) -> Result<(), String> {
-    let status = if paused { SubscriptionStatus::Paused } else { SubscriptionStatus::Active };
+    let status = if archived.unwrap_or(false) { SubscriptionStatus::Cancelled }
+        else if paused { SubscriptionStatus::Paused } else { SubscriptionStatus::Active };
     let db = db_state.lock().map_err(|e| e.to_string())?;
-    db.update_subscription_status(&id, &status).map_err(|e| e.to_string())
+    db.update_subscription_status(&id, &status).map_err(|e| e.to_string())?;
+    // Resuming a subscription whose payments are all sent leaves it completed.
+    db.complete_exhausted().map(|_| ()).map_err(|e| e.to_string())
 }
 
 // ============================================================
@@ -2993,8 +3003,10 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
                         log::error!("[Scheduler] DB update failed for sub {}: {}", sub_id, e);
                     } else if let Some(next) = new_next {
                         log::info!("[Scheduler] next_payment_at advanced to {} for sub {}", next.to_rfc3339(), sub_id);
+                    } else if let Err(e) = db.complete_exhausted() {
+                        log::error!("[Scheduler] Could not mark sub {} as completed: {}", sub_id, e);
                     } else {
-                        log::info!("[Scheduler] Last planned payment sent for sub {}", sub_id);
+                        log::info!("[Scheduler] Last planned payment sent, sub {} completed", sub_id);
                     }
                 }
             }

@@ -19,6 +19,8 @@ pub enum SubscriptionStatus {
     Pending,
     /// Suspended by AutoPay due to canary failure or security alert.
     Suspended,
+    /// Every planned payment has been sent. Editing the number of payments reopens it.
+    Completed,
 }
 
 impl std::fmt::Display for SubscriptionStatus {
