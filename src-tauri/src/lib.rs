@@ -38,6 +38,7 @@ mod unlock_guard;
 mod log_retention;
 mod netcheck;
 mod boot_log;
+mod defender;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -2641,6 +2642,33 @@ fn get_rpc_config(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json
     }))
 }
 
+/// Windows: with the user's consent (UAC), exclude the bundled Monero engine from Defender
+/// and restore it from quarantine. "restored", or "reinstall" when nothing was quarantined.
+#[tauri::command]
+async fn defender_allow_rpc() -> Result<String, String> {
+    let result = tokio::task::spawn_blocking(defender::allow).await.map_err(|e| e.to_string())?;
+    match result {
+        Ok(defender::Allow::Restored) => {
+            log::info!("[Defender] Monero engine excluded from scans and available");
+            Ok("restored".into())
+        }
+        Ok(defender::Allow::ReinstallNeeded) => {
+            log::warn!("[Defender] Monero engine excluded, but not found in quarantine: reinstall needed");
+            Ok("reinstall".into())
+        }
+        Err(e) => {
+            log::warn!("[Defender] Exclusion not applied: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// The exact PowerShell run by `defender_allow_rpc`, shown to the user before running it.
+#[tauri::command]
+fn defender_script() -> Option<String> {
+    defender::sidecar_path().map(|p| defender::allow_script(&p))
+}
+
 /// Check if a monero-wallet-rpc binary can be found.
 #[tauri::command]
 fn detect_rpc_binary(state: tauri::State<'_, Mutex<AppState>>) -> Option<String> {
@@ -3691,6 +3719,8 @@ pub fn run() {
             get_log_retention,
             set_log_retention,
             get_log_history,
+            defender_allow_rpc,
+            defender_script,
             boot_log_append,
             boot_frontend_ready,
             get_startup_log,

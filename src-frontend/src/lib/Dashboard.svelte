@@ -1038,6 +1038,30 @@
 
   // Sidebar health dot: green only when the RPC is confirmed working and nothing is pending.
   let showRpcBinaryPopup = false;
+  let defenderBusy = false;
+  let defenderMsg = "";
+  let defenderMsgKind = "";
+  let defenderScript = "";
+
+  async function allowInDefender() {
+    defenderBusy = true;
+    defenderMsg = "";
+    try {
+      const r = await invokeStrict("defender_allow_rpc");
+      defenderMsgKind = r === "restored" ? "ok" : "warn";
+      defenderMsg = r === "restored" ? $t.rpcDefenderRestored : $t.rpcDefenderReinstall;
+    } catch (e) {
+      const msg = String(e?.message ?? e);
+      defenderMsgKind = "err";
+      defenderMsg = msg.includes("CANCELLED") ? $t.rpcDefenderCancelled : `${$t.rpcDefenderFailed} (${msg})`;
+    } finally {
+      defenderBusy = false;
+    }
+  }
+
+  async function toggleDefenderScript() {
+    defenderScript = defenderScript ? "" : ((await tauriInvoke("defender_script")) || "");
+  }
   let rpcBinaryPopupShown = false;
   $: rpcDiag = rpcError ? rpcDiagnosis(rpcError, $t) : null;
   $: if (rpcDiag?.binaryMissing && !rpcBinaryPopupShown) { rpcBinaryPopupShown = true; showRpcBinaryPopup = true; }
@@ -2060,6 +2084,18 @@
       </div>
       <div class="modal-body rpc-missing-body">
         <p>{$t.rpcMissingIntro}</p>
+        {#if isWindows}
+          <div class="rpc-defender">
+            <strong>{$t.rpcDefenderTitle}</strong>
+            <p>{$t.rpcDefenderDetail}</p>
+            <div class="rpc-missing-actions rpc-defender-actions">
+              <button class="btn-primary" disabled={defenderBusy} on:click={allowInDefender}>{defenderBusy ? $t.rpcDefenderBusy : $t.rpcDefenderAction}</button>
+              <button class="btn-ghost" on:click={toggleDefenderScript}>{defenderScript ? $t.rpcDefenderHideScript : $t.rpcDefenderShowScript}</button>
+            </div>
+            {#if defenderMsg}<p class="rpc-defender-msg {defenderMsgKind}">{defenderMsg}</p>{/if}
+            {#if defenderScript}<pre class="rpc-defender-script">{defenderScript}</pre>{/if}
+          </div>
+        {/if}
         <ol>
           <li><strong>{$t.rpcMissingAvTitle}</strong><br/>{$t.rpcMissingAvDetail}</li>
           <li><strong>{$t.rpcMissingReinstallTitle}</strong><br/>{$t.rpcMissingReinstallDetail}</li>
@@ -4092,6 +4128,13 @@
   .rpc-missing-body ol { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
   .rpc-missing-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
   .rpc-missing-actions a { text-decoration:none; }
+  .rpc-defender { border:1px solid var(--border, #444); border-radius:8px; padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
+  .rpc-defender p { margin:0; }
+  .rpc-defender-actions { justify-content:flex-start; }
+  .rpc-defender-msg.ok { color:#3fb950; }
+  .rpc-defender-msg.warn { color:#d29922; }
+  .rpc-defender-msg.err { color:#f85149; }
+  .rpc-defender-script { margin:0; max-height:180px; overflow:auto; font-size:11px; white-space:pre-wrap; word-break:break-all; user-select:text; }
   .rpc-official { display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px; }
   .info-tip { position:relative; cursor:help; color:var(--accent); font-size:12px; outline:none; }
   .info-tip-body {

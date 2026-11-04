@@ -81,6 +81,7 @@ Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs
 - Public node list with automatic failover (slow / unreachable / stalled > 30 min); a pinned custom node is only alerted, never rotated.
 - RPC status dot: connected / checking / offline / error.
 - No network at all (cable out, Wi-Fi off) is detected locally — the OS routing table is asked, nothing is sent — so no node search or wallet opening is attempted; "no node reachable" is reported separately. Skipped when the pinned node is local / LAN.
+- Windows: if Defender quarantined the engine, the "engine not found" screen offers "Allow in Windows Defender" (UAC prompt). It excludes only `autopay-wallet-rpc.exe` (not the folder) and restores that exact file from quarantine; otherwise it asks to rerun the installer. The PowerShell it runs can be shown first.
 
 ## History & reports
 
@@ -132,3 +133,4 @@ technical logs retention, RPC node / binary path / payment tolerance, start with
 - Canary URLs are stored but not checked yet: `CANARY_*` alerts never fire.
 - `subscriptions.db` is not encrypted (planned: SQLCipher).
 - Bitcoin is display-only; one wallet only; no in-app updater.
+- macOS 10.15+ (the arm64 build is Apple Silicon only, so macOS 11+).
