@@ -1034,6 +1034,7 @@
   // Observed throughput of wallet-rpc on a remote node (~35-50 blocks/s), kept conservative.
   const SYNC_BLOCKS_PER_SEC = 30;
   let isOffline = false;          // true when the last completed refresh could not reach the Monero node
+  let offlineNoNetwork = false;   // the OS has no network route at all (checked by the backend)
 
   // Sidebar health dot: green only when the RPC is confirmed working and nothing is pending.
   let showRpcBinaryPopup = false;
@@ -1421,6 +1422,7 @@
     balanceXmr = b.xmr;
     // Only a completed refresh says anything reliable about connectivity.
     isOffline = b.daemon_reachable === false;
+    offlineNoNetwork = false;
     // Update wallets[0].balance for the Wallets page (async ctx = no reactive loop)
     if (wallets.length > 0) {
       wallets[0] = { ...wallets[0], balance: b.xmr.toFixed(4) };
@@ -1460,6 +1462,8 @@
         busy = true;
         ({ balanceLoading, syncStep, syncStartedAt, syncPhaseStartedAt } = shownBefore);
         logDebug("Dashboard", "Balance refresh skipped (wallet busy) — waiting for the running sync");
+      } else if (errStr.includes("OFFLINE:")) {
+        isOffline = offlineNoNetwork = true;
       } else if (errStr.includes("Locked")) {
         logInfo("Dashboard", "Balance refresh skipped (wallet verrouillé)");
         balanceXmr = null;
@@ -1468,7 +1472,7 @@
         rpcError = errStr;
         // NOTE: Do NOT detect offline from "Connexion refusée" — that is the LOCAL
         // wallet-rpc (127.0.0.1:18083) restarting, not an internet connectivity issue.
-        // isOffline is set exclusively from daemon_reachable of a completed refresh.
+        // isOffline comes from daemon_reachable of a completed refresh, or the backend "OFFLINE:" verdict.
         logWarn("Dashboard", `Balance refresh failed: ${e}`);
       }
     }
@@ -1542,6 +1546,7 @@
     await listenWhileMounted("wallet-refreshed", (ev) => {
       const p = ev.payload || {};
       if (p.ok && p.balance) applyBalance(p.balance);
+      else if (String(p.error).includes("OFFLINE:")) isOffline = offlineNoNetwork = true;
       else if (p.error) { rpcOk = false; rpcError = String(p.error); }
       if (!uiRefreshRunning) endSyncDisplay();
       loadRpcState();
@@ -2262,7 +2267,7 @@
       </div>
       {#if isOffline}
         <div class="offline-banner">
-          {$t.offlineBanner}
+          {offlineNoNetwork ? $t.offlineBanner : $t.offlineNodesBanner}
           <button class="btn-inline" on:click={() => { isOffline = false; refreshBalance(); }}>{$t.commonRetry}</button>
         </div>
       {:else if balanceLoading}

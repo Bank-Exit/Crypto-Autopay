@@ -29,6 +29,11 @@ function sanitize(msg) {
   return s;
 }
 
+// Until the first unlock, lines also go to the backend startup journal (readable from the
+// locked screen and when the window stays blank); afterwards they stay in RAM only.
+let _bootPhase = true;
+export function endBootPhase() { _bootPhase = false; }
+
 // ----- Technical logs (always on, RAM only) -----
 let _entries = [];   // newest first
 let _seq = 0;
@@ -85,6 +90,9 @@ function _add(level, module, msg) {
   const safe = sanitize(msg);
   const entry = { id: ++_seq, t: new Date().toISOString(), level, module, msg: safe };
   _entries.unshift(entry);
+  if (_bootPhase && level !== "debug") {
+    window.__TAURI_INTERNALS__?.invoke?.("boot_log_append", { level, module, msg: safe })?.catch?.(() => {});
+  }
   if (_retentionHours === 0 && level === "debug") _entries.shift();
   if (_entries.length > MAX_DEBUG + MAX_OTHER || _seq % 200 === 0) _trim();
   // Also mirror to browser console

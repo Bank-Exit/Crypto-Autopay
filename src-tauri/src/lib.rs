@@ -36,6 +36,8 @@ mod rpc_manager;
 mod payment_policy;
 mod unlock_guard;
 mod log_retention;
+mod netcheck;
+mod boot_log;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -167,6 +169,7 @@ async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Str
     if let Some(mut key) = s.history_key.take() { key.zeroize(); }
     // Keep wallet_address cached (it's in the .address file anyway)
     log::info!("[Security] Wallet locked — session ended");
+    log_retention::set_viewable(false);
     drop(s);
     end_wallet_session("wallet locked");
     Ok(())
@@ -301,6 +304,7 @@ async fn unlock_wallet(
         let s = state.lock().map_err(|e| e.to_string())?;
         if s.unlocked && s.session_password.is_some() {
             log::info!("[Unlock] Session resumed (background session still active)");
+            session_unlocked(&app_handle);
             return Ok(UnlockResult {
                 address: s.wallet_address.clone().unwrap_or_default(),
                 balance_xmr: s.balance_atomic as f64 / 1e12,
@@ -363,6 +367,7 @@ async fn unlock_wallet(
             s.balance_atomic = 0;
         }
         refresh_pause_item(&app_handle);
+        session_unlocked(&app_handle);
         return Ok(UnlockResult {
             address: cached_addr,
             balance_xmr: 0.0,
@@ -376,7 +381,11 @@ async fn unlock_wallet(
     let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
     let app_rpc = app_handle.clone();
 
-    let rpc_result: Result<(String, f64), (String, bool)> = tokio::task::spawn_blocking(move || {
+    let configured_node = state.lock().map_err(|e| e.to_string())?.rpc.config.daemon_address.clone();
+    let rpc_result: Result<(String, f64), (String, bool)> = if netcheck::offline(configured_node.as_deref()) {
+        log::info!("[Network] No network connection — wallet opened without sync");
+        Err((netcheck::OFFLINE.to_string(), false))
+    } else { tokio::task::spawn_blocking(move || {
         log::debug!("[Unlock/RPC] spawn_blocking started");
         // The wallet files may be recreated below: no other process may hold them.
         stop_wallet_session("unlock");
@@ -476,7 +485,7 @@ async fn unlock_wallet(
     .unwrap_or_else(|e| {
         log::error!("[Unlock/RPC] tokio spawn_blocking panicked: {}", e);
         Err((format!("Internal task error: {e}"), false))
-    });
+    }) };
 
     let (address, balance_xmr, rpc_error, seed_invalid) = match rpc_result {
         Ok((addr, bal)) => {
@@ -511,6 +520,7 @@ async fn unlock_wallet(
     drop(s);
     refresh_pause_item(&app_handle);
     refresh_alerts_and_tray(&app_handle);
+    session_unlocked(&app_handle);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
 }
 
@@ -663,8 +673,24 @@ async fn refresh_balance(app_handle: tauri::AppHandle) -> Result<BalanceResponse
 async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse, String> {
     let state = app_handle.state::<Mutex<AppState>>();
     let (wallet_name, wallet_dir, password, rpc_busy, need_address) = {
-        let s = state.lock().map_err(|e| e.to_string())?;
+        let mut s = state.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Locked".into()); }
+        if netcheck::offline(s.rpc.config.daemon_address.as_deref()) {
+            if s.rpc_last_error.as_deref() != Some(netcheck::OFFLINE) {
+                log::info!("[Network] No network connection — sync paused until it comes back");
+            }
+            s.last_refresh_at = chrono::Utc::now().timestamp();
+            s.rpc_connected = false;
+            s.rpc_last_error = Some(netcheck::OFFLINE.into());
+            s.ready_state = None;
+            drop(s);
+            refresh_alerts_and_tray(app_handle);
+            app_handle.emit("wallet-refreshed", serde_json::json!({ "ok": false, "error": netcheck::OFFLINE })).ok();
+            return Err(netcheck::OFFLINE.into());
+        }
+        if s.rpc_last_error.as_deref() == Some(netcheck::OFFLINE) {
+            log::info!("[Network] Network connection is back — syncing");
+        }
         let need_address = s.wallet_address.is_none();
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
@@ -1648,6 +1674,7 @@ async fn set_log_retention(hours: u32, app_handle: tauri::AppHandle) -> Result<(
 /// Log lines still inside the retention window, for the logs drawer.
 #[tauri::command]
 async fn get_log_history(app_handle: tauri::AppHandle) -> Result<Vec<log_retention::HistoryLine>, String> {
+    if !log_retention::viewable() { return Err("Locked".into()); }
     let log_dir = app_handle.path().app_log_dir().map_err(|e| e.to_string())?;
     Ok(log_retention::history(&log_dir))
 }
@@ -1904,6 +1931,36 @@ async fn set_sub_cap(
 
 /// Tray entry toggling the global pause (its label follows the state).
 struct TrayPauseItem(tauri::menu::MenuItem<tauri::Wry>);
+struct TrayBootLogItem(tauri::menu::MenuItem<tauri::Wry>);
+
+/// Technical logs become readable, and the startup journal has done its job.
+fn session_unlocked(app: &tauri::AppHandle) {
+    log_retention::set_viewable(true);
+    boot_log::finish();
+    if let Some(item) = app.try_state::<TrayBootLogItem>() {
+        let _ = item.0.set_enabled(false);
+    }
+}
+
+/// Startup journal line from the frontend (only kept before the first unlock).
+#[tauri::command]
+fn boot_log_append(level: String, module: String, msg: String) {
+    if !boot_log::active() { return; }
+    let level = match level.as_str() { "error" => "ERROR", "warn" => "WARN", "debug" => "DEBUG", _ => "INFO" };
+    let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    boot_log::write(level, &format!("ui:{}", clip(&module, 40)), &clip(&msg, 500));
+}
+
+#[tauri::command]
+fn boot_frontend_ready() {
+    boot_log::set_frontend_ready();
+}
+
+/// Startup journal for the locked screen's logs drawer (empty once unlocked).
+#[tauri::command]
+fn get_startup_log() -> String {
+    boot_log::read()
+}
 
 const TRAY_PAUSE_LABEL: &str = "Mettre en pause les paiements";
 const TRAY_RESUME_LABEL: &str = "Reprendre les paiements";
@@ -3136,6 +3193,10 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
             log::debug!("[Scheduler] All payments paused — skipping");
             return;
         }
+        if netcheck::offline(s.rpc.config.daemon_address.as_deref()) {
+            log::debug!("[Scheduler] No network connection — skipping");
+            return;
+        }
         s.last_payment_sent_at
     };
 
@@ -3321,13 +3382,20 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// After this long without the interface reporting in, the startup journal is shown instead.
+const BOOT_UI_TIMEOUT_SECS: u64 = 30;
+
 pub fn run() {
     // Files created from now on (vault, DB and its WAL, logs, wallet cache, webview storage)
     // are private to the current user.
     #[cfg(unix)]
     unsafe { libc::umask(0o077); }
+    boot_log::init();
 
     tauri::Builder::default()
+        .on_page_load(|_webview, payload| {
+            boot_log::write("INFO", "boot", &format!("Page load {:?}: {}", payload.event(), payload.url().path()));
+        })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
@@ -3357,6 +3425,11 @@ pub fn run() {
             })
         )
         .setup(|app| {
+            boot_log::write("INFO", "boot", "Setup started");
+            match tauri::webview_version() {
+                Ok(v) => boot_log::write("INFO", "boot", &format!("WebView {v}")),
+                Err(e) => boot_log::write("ERROR", "boot", &format!("WebView not found: {e}")),
+            }
             // Resolve app data directory
             let data_dir = app.path().app_data_dir()
                 .expect("Failed to resolve app data dir");
@@ -3462,7 +3535,15 @@ pub fn run() {
                     .level_for("app_lib", log::LevelFilter::Debug)
                     .targets([
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                        // Nothing reaches the logs drawer before unlock.
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview)
+                            .filter(|_| log_retention::viewable()),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Dispatch(
+                            tauri_plugin_log::fern::Dispatch::new().chain(tauri_plugin_log::fern::Output::call(
+                                |record| boot_log::append(&record.args().to_string()),
+                            )),
+                        ))
+                        .filter(|_| boot_log::active()),
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
                             file_name: Some("autopay".into()),
                         })
@@ -3526,14 +3607,17 @@ pub fn run() {
                 use tauri::menu::{MenuBuilder, MenuItemBuilder};
                 let menu_open = MenuItemBuilder::with_id("open", "Ouvrir Crypto AutoPay").build(app)?;
                 let menu_pause = MenuItemBuilder::with_id("pause", TRAY_PAUSE_LABEL).build(app)?;
+                let menu_boot_log = MenuItemBuilder::with_id("boot_log", "Journal de démarrage / Startup log").build(app)?;
                 let menu_quit = MenuItemBuilder::with_id("quit", "Quitter").build(app)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&menu_open)
                     .item(&menu_pause)
+                    .item(&menu_boot_log)
                     .separator()
                     .item(&menu_quit)
                     .build()?;
                 app.manage(TrayPauseItem(menu_pause));
+                app.manage(TrayBootLogItem(menu_boot_log));
 
                 let _tray = tauri::tray::TrayIconBuilder::with_id("main")
                     .icon(img)
@@ -3554,6 +3638,7 @@ pub fn run() {
                                     .unwrap_or(false);
                                 apply_pause(app, !paused);
                             }
+                            "boot_log" => boot_log::open_in_viewer(),
                             "quit" => {
                                 log::info!("[Tray] User requested quit via tray menu");
                                 app.exit(0);
@@ -3576,6 +3661,23 @@ pub fn run() {
                 log::warn!("[Tray] Could not load tray icon — tray not available");
             }
 
+            // A blank window gives the tester nothing to report: if the interface has not
+            // come up after a while, show the startup journal in plain HTML instead.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(BOOT_UI_TIMEOUT_SECS)).await;
+                    if boot_log::frontend_ready() || !boot_log::active() { return; }
+                    log::error!("[Boot] Interface not displayed after {} s (blank window?)", BOOT_UI_TIMEOUT_SECS);
+                    if let Some(win) = handle.get_webview_window("main") {
+                        if let Err(e) = win.eval(boot_log::fallback_page_script()) {
+                            log::error!("[Boot] Fallback page failed: {}", e);
+                        }
+                    }
+                });
+            }
+            boot_log::write("INFO", "boot", "Setup done");
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -3589,6 +3691,9 @@ pub fn run() {
             get_log_retention,
             set_log_retention,
             get_log_history,
+            boot_log_append,
+            boot_frontend_ready,
+            get_startup_log,
             get_pending_deep_link,
             lock_wallet,
             generate_seed,

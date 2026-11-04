@@ -80,6 +80,7 @@ Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs
 - Bundled `autopay-wallet-rpc` (official Monero binary, pinned + SHA-256 checked), bound to `127.0.0.1`, random digest credentials per session.
 - Public node list with automatic failover (slow / unreachable / stalled > 30 min); a pinned custom node is only alerted, never rotated.
 - RPC status dot: connected / checking / offline / error.
+- No network at all (cable out, Wi-Fi off) is detected locally — the OS routing table is asked, nothing is sent — so no node search or wallet opening is attempted; "no node reachable" is reported separately. Skipped when the pinned node is local / LAN.
 
 ## History & reports
 
@@ -106,7 +107,8 @@ technical logs retention, RPC node / binary path / payment tolerance, start with
 ## Privacy & security
 
 - No telemetry, no account, nothing sent anywhere except to the Monero node (and the opt-in fiat rate).
-- Technical logs: **no amount, no address** (internal id + time only); file `0600`, sliding retention; drawer with copy / clear.
+- Technical logs: **no amount, no address** (internal id + time only); file `0600`, sliding retention; drawer with copy / clear, **only in an unlocked session**.
+- Startup log (`logs/startup.log`, previous launch in `startup.previous.log`): from process start to the first unlock, then deleted. Home folder shown as `~`. Readable from the locked screen's Logs button, from the tray menu ("Journal de démarrage", opens the text viewer), and shown in the window if the interface is not up after 30 s.
 - Secrets zeroized on lock; constant-time password comparison.
 - Threat model: RPC not reachable from the network; main risk is local malware (see `TODO.md` > Security).
 - Releases: `SHA256SUMS` signed with the project key — `docs/SIGNING_RELEASES.md`, `docs/VERIFY_DOWNLOAD.md`.
@@ -123,6 +125,7 @@ technical logs retention, RPC node / binary path / payment tolerance, start with
 | `subscriptions.db` | subscriptions (SQLite) | **no** — edits trigger a confirmation, not a payment |
 | `autopay_wallet*` | Monero wallet files | yes (wallet password) |
 | `logs/autopay.log` | technical logs | no (nothing sensitive by design) |
+| `logs/startup.log` | startup log, deleted at unlock (macOS: `~/Library/Logs/com.libre-market.autopay/`, Windows: `%LOCALAPPDATA%\com.libre-market.autopay\logs\`) | no |
 
 ## Known limits
 

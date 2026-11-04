@@ -7,7 +7,7 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import { theme } from "./lib/theme.js";
   import { selectedNetwork } from "./lib/network.js";
-  import { subscribeToLogs, logDebug, logInfo, logWarn, logError, setLogRetentionHours, seedHistory, formatLogTime, clearLogs } from "./lib/AppLogger.js";
+  import { subscribeToLogs, logDebug, logInfo, logWarn, logError, setLogRetentionHours, seedHistory, formatLogTime, clearLogs, endBootPhase } from "./lib/AppLogger.js";
   import { t } from "./lib/i18n.js";
 
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
@@ -31,8 +31,24 @@
 
   $: if (appState === "dashboard") resetAutoLock();
 
-  // Logs drawer
+  // Logs drawer. Technical logs are only shown in an unlocked session; locked screens
+  // only get the startup journal (no amount, no address, deleted at unlock).
   let showLogs = false;
+  $: logsUnlocked = appState === "dashboard";
+  let startupLog = "";
+  $: if (showLogs && !logsUnlocked) loadStartupLog();
+  async function loadStartupLog() {
+    try { startupLog = await invoke("get_startup_log"); } catch { startupLog = ""; }
+  }
+
+  let historySeeded = false;
+  async function onSessionUnlocked() {
+    endBootPhase();
+    if (historySeeded) return;
+    historySeeded = true;
+    // Earlier lines (previous sessions, night runs) come back from the Rust log file.
+    try { seedHistory(await invoke("get_log_history")); } catch { /* browser dev mode */ }
+  }
   let liveLogs = [];
   let logFilter = "all"; // "all" | "warn" | "error"
   let showDebugLogs = localStorage.getItem("_autopay_logs_debug") === "1";
@@ -74,11 +90,9 @@
         .then(({ attachLogger }) => attachLogger((entry) => window.__autopayRustLogSink?.(entry)))
         .catch(() => { window.__autopayRustLogAttached = false; }); // browser dev mode: no backend
     }
-    // Earlier lines (previous sessions, night runs) come back from the Rust log file.
     try {
       const r = await invoke("get_log_retention");
       setLogRetentionHours(r?.hours ?? 12);
-      seedHistory(await invoke("get_log_history"));
     } catch (e) {
       // Browser dev mode: no backend
     }
@@ -198,6 +212,7 @@
         const { address, balance, rpcError } = e.detail || {};
         if (rpcError) console.warn("[Unlock] RPC unavailable (offline mode):", rpcError);
         appState = "dashboard";
+        onSessionUnlocked();
         await checkPendingDeepLink();
       }}
       on:reset={onReset}
@@ -218,7 +233,7 @@
         <polyline points="10 9 9 9 8 9"/>
       </svg>
       Logs
-      {#if liveLogs.filter(l => l.level === "error").length > 0}
+      {#if logsUnlocked && liveLogs.filter(l => l.level === "error").length > 0}
         <span class="logs-badge">{liveLogs.filter(l => l.level === "error").length}</span>
       {/if}
     </button>
@@ -228,6 +243,17 @@
   {#if showLogs}
     <div class="logs-overlay" role="button" tabindex="-1" aria-label={$t.logsDrawerClose} on:click={() => showLogs = false} on:keydown={e => e.key === 'Escape' && (showLogs = false)}></div>
     <div class="logs-drawer">
+      {#if !logsUnlocked}
+      <div class="logs-header">
+        <span>📋 {$t.logsStartupTitle}</span>
+        <button class="logs-close" style="margin-left:auto" on:click={() => showLogs = false}>✕</button>
+      </div>
+      <pre class="logs-body logs-startup">{startupLog || $t.logsStartupEmpty}</pre>
+      <div class="logs-footer">
+        <button disabled={!startupLog} on:click={() => navigator.clipboard.writeText(startupLog).catch(() => {})}>📋 Copier</button>
+        <span class="logs-hint">{$t.logsLockedNote}</span>
+      </div>
+      {:else}
       <div class="logs-header">
         <span>📋 Logs <span style="font-size:10px;color:#aaa;font-weight:400">{$t.logsDrawerNewest}</span></span>
         <div class="logs-filters">
@@ -259,6 +285,7 @@
         <button title="Vide l'affichage ; le fichier de logs reste conservé selon la durée choisie" on:click={clearLogs}>🗑 {$t.commonClear}</button>
         <span class="logs-hint">Ces logs ne contiennent ni montant ni adresse.</span>
       </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -334,6 +361,7 @@
     display: flex; flex-direction: column; gap: 2px;
   }
   .logs-empty { color: var(--text-muted); padding: 20px 0; text-align: center; }
+  .logs-startup { margin: 0; display: block; white-space: pre-wrap; word-break: break-all; color: var(--text); }
   .log-line {
     display: flex; gap: 6px; line-height: 1.4; padding: 1px 0;
     border-bottom: 1px solid var(--border)08;

@@ -5,7 +5,7 @@
 //! file is trimmed in place, so the file never holds more than the chosen period.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::Serialize;
@@ -21,6 +21,16 @@ const MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 const HISTORY_MAX_LINES: usize = 5000;
 
 static RETENTION_HOURS: AtomicU32 = AtomicU32::new(DEFAULT_HOURS);
+/// Technical logs are only shown in an unlocked session.
+static VIEWABLE: AtomicBool = AtomicBool::new(false);
+
+pub fn viewable() -> bool {
+    VIEWABLE.load(Ordering::Relaxed)
+}
+
+pub fn set_viewable(on: bool) {
+    VIEWABLE.store(on, Ordering::Relaxed);
+}
 
 pub fn hours() -> u32 {
     RETENTION_HOURS.load(Ordering::Relaxed)
