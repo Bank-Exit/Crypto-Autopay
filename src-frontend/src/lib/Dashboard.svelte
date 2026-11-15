@@ -566,6 +566,25 @@
     const v = await tauriInvoke("get_autostart");
     if (v !== null) autostartEnabled = !!v;
   }
+  // Account statement, read from the wallet (null = not loaded yet)
+  let statement = null;
+  let statementError = false;
+  let statementLoading = false;
+  async function loadStatement() {
+    if (statementLoading) return;
+    statementLoading = true;
+    try {
+      statement = await invokeStrict("get_account_statement");
+      statementError = false;
+    } catch (e) {
+      if (String(e).includes("RPC busy")) setTimeout(() => page === "wallets" && loadStatement(), 3000);
+      else statementError = statement === null;
+    } finally {
+      statementLoading = false;
+    }
+  }
+  $: if (page === "wallets") loadStatement();
+
   let unattended = null; // { enabled, active }, null = unknown (browser dev mode)
   async function loadUnattended() {
     unattended = await tauriInvoke("get_unattended");
@@ -2237,15 +2256,11 @@
 
     <nav class="sidebar-nav">
       <!-- No emojis except Trouver des souscriptions -->
+      <button class="nav-item" class:active={page === "wallets" || page === "history"} on:click={() => page = "wallets"}>
+        {$t.navAccount}
+      </button>
       <button class="nav-item" class:active={page === "subscriptions"} on:click={() => page = "subscriptions"}>
         {$t.navSubscriptions}
-      </button>
-      <!-- receive moved into wallet card -->
-      <button class="nav-item" class:active={page === "wallets"} on:click={() => page = "wallets"}>
-        {$t.navWallets}
-      </button>
-      <button class="nav-item" class:active={page === "history"} on:click={() => page = "history"}>
-        {$t.navPaymentHistory}
       </button>
       <!-- archived moved inline in subscription list -->
       <button class="nav-item find-nav" class:active={page === "find"} on:click={() => page = "find"}>
@@ -2551,9 +2566,9 @@
     <!-- ====== WALLETS ====== -->
     {:else if page === "wallets"}
       <div class="page-header">
-        <h1>{$t.walletsTitle}</h1>
+        <h1>{$t.navAccount}</h1>
         <div class="page-actions">
-          <button class="btn-primary">＋ {$t.walletAdd}</button>
+          <button class="btn-ghost" on:click={() => page = "history"}>{$t.accountReports}</button>
         </div>
       </div>
 
@@ -2696,6 +2711,39 @@
             </div><!-- /wallet-body -->
             </div><!-- /wallet-card -->
           {/each}
+        </div>
+
+        <div class="statement">
+          <div class="statement-head">
+            <h2 class="section-title">{$t.statementTitle}</h2>
+            <button class="btn-ghost btn-sm" disabled={statementLoading} on:click={loadStatement} aria-label={$t.statementRefresh}>↻</button>
+          </div>
+          {#if statementError}
+            <p class="text-muted statement-note">{$t.statementUnavailable}</p>
+          {:else if statement === null}
+            <p class="text-muted statement-note">{$t.statementLoading}</p>
+          {:else if statement.length === 0}
+            <p class="text-muted statement-note">{$t.statementEmpty}</p>
+          {:else}
+            {#each statement as l}
+              {@const incoming = l.kind === "in" || l.kind === "pool"}
+              <div class="statement-row card" class:statement-failed={l.kind === "failed"}>
+                <div class="statement-main">
+                  <span class="statement-label">
+                    {l.label || (incoming ? $t.statementIn : $t.statementOut)}
+                    {#if l.kind === "pending" || l.kind === "pool"}<span class="badge badge-grey">{$t.statementPending}</span>{/if}
+                    {#if l.kind === "failed"}<span class="badge badge-grey">{$t.statementFailed}</span>{/if}
+                  </span>
+                  <span class="statement-amount" class:statement-in={incoming}>{incoming ? "+" : "−"}{l.amount_xmr.toFixed(4)} {$currentNetwork.symbol}</span>
+                </div>
+                <div class="statement-meta text-muted">
+                  <span>{l.timestamp ? new Date(l.timestamp * 1000).toLocaleString($currentLang) : "—"}</span>
+                  {#if !incoming && l.fee_xmr > 0}<span>{$t.statementFee} {l.fee_xmr.toFixed(6)}</span>{/if}
+                  {#if l.tx_prefix}<span>tx: {l.tx_prefix}…</span>{/if}
+                </div>
+              </div>
+            {/each}
+          {/if}
         </div>
       {/if}
 
@@ -4158,6 +4206,16 @@
   .rpc-missing-body ol { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
   .rpc-missing-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
   .rpc-missing-actions a { text-decoration:none; }
+  .statement { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
+  .statement-head { display: flex; align-items: center; justify-content: space-between; }
+  .statement-note { font-size: 13px; }
+  .statement-row { padding: 10px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .statement-failed { opacity: .6; }
+  .statement-main { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13.5px; }
+  .statement-label { display: flex; align-items: center; gap: 6px; }
+  .statement-amount { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .statement-in { color: var(--green); }
+  .statement-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; }
   .rpc-defender { border:1px solid var(--border, #444); border-radius:8px; padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
   .rpc-defender p { margin:0; }
   .rpc-defender-actions { justify-content:flex-start; }

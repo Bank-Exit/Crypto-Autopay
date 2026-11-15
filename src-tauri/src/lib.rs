@@ -2303,6 +2303,67 @@ async fn get_payment_history(
     Ok(serde_json::json!({ "enabled": true, "entries": entries }))
 }
 
+/// Bank-style statement read from the wallet itself: money in and out, pending and failed
+/// sends, labelled with the subscription when the payment history knows the transaction.
+#[tauri::command]
+async fn get_account_statement(
+    state: tauri::State<'_, Mutex<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (wallet_name, wallet_dir, password, rpc_busy, labels) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if s.session_password.is_none() {
+            return Err("Wallet is locked.".into());
+        }
+        let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
+        let labels: std::collections::HashMap<String, String> = match (&s.history_key, s.history_enabled) {
+            (Some(key), true) => load_history(key, &s.history_path).into_iter()
+                .filter(|e| !e.tx_prefix.is_empty())
+                .map(|e| (e.tx_prefix, e.sub_label)).collect(),
+            _ => Default::default(),
+        };
+        let wd = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        (wallet_name_of(&s.wallet_file_path), wd, pw, Arc::clone(&s.rpc_busy), labels)
+    };
+    if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("RPC busy".into());
+    }
+    let app_rpc = app.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        struct RpcGuard(Arc<AtomicBool>);
+        impl Drop for RpcGuard { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let _guard = RpcGuard(rpc_busy);
+        let mgr = take_wallet_session(&app_rpc, &wallet_dir, &wallet_name, &password)?;
+        let r = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+            "jsonrpc":"2.0","id":"st","method":"get_transfers",
+            "params":{"in":true,"out":true,"pending":true,"failed":true,"pool":true}
+        }));
+        return_wallet_session(mgr);
+        r
+    }).await.map_err(|e| e.to_string())??;
+    if let Some(err) = r.get("error") {
+        return Err(format!("get_transfers error: {}", err["message"].as_str().unwrap_or("?")));
+    }
+    let mut lines = Vec::new();
+    for kind in ["in", "pool", "out", "pending", "failed"] {
+        for t in r["result"][kind].as_array().into_iter().flatten() {
+            let txid = t["txid"].as_str().unwrap_or("");
+            let prefix: String = txid.chars().take(12).collect();
+            lines.push(serde_json::json!({
+                "kind": kind,
+                "amount_xmr": t["amount"].as_u64().unwrap_or(0) as f64 / 1e12,
+                "fee_xmr": t["fee"].as_u64().unwrap_or(0) as f64 / 1e12,
+                "timestamp": t["timestamp"].as_i64().unwrap_or(0),
+                "confirmations": t["confirmations"].as_u64().unwrap_or(0),
+                "tx_prefix": prefix,
+                "label": labels.get(&prefix),
+            }));
+        }
+    }
+    lines.sort_by_key(|l| std::cmp::Reverse(l["timestamp"].as_i64().unwrap_or(0)));
+    Ok(lines)
+}
+
 /// Write the payment history as CSV into the Downloads folder (owner-only file).
 /// Returns the file path. The export holds amounts by design: it is the user's own record.
 #[tauri::command]
@@ -4037,6 +4098,7 @@ pub fn run() {
             get_log_history,
             reset_wallet,
             lock_ui,
+            get_account_statement,
             get_unattended,
             set_unattended,
             defender_allow_rpc,

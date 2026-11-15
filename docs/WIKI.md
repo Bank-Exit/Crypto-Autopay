@@ -84,8 +84,10 @@ Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs
 - No network at all (cable out, Wi-Fi off) is detected locally — the OS routing table is asked, nothing is sent — so no node search or wallet opening is attempted; "no node reachable" is reported separately. Skipped when the pinned node is local / LAN.
 - Windows: if Defender quarantined the engine, the "engine not found" screen offers "Allow in Windows Defender" (UAC prompt). It excludes only `autopay-wallet-rpc.exe` (not the folder) and restores that exact file from quarantine; otherwise it asks to rerun the installer. The PowerShell it runs can be shown first.
 
-## History & reports
+## Account & history
 
+- "Account" is the first menu entry: balance, top-up, limits, and a bank-style statement read from the wallet itself (money in, sends, pending, failed, fees), labelled with the subscription when the history knows the transaction. Needs the unlocked interface and a connected engine.
+- "Reports & export" (from the Account page) opens the encrypted subscription-payment history below.
 - Encrypted payment history (`history.vault`), retention in days, can be turned off (privacy mode).
 - Grouped by period with relative dates, CSV export, clear.
 - Monthly report card (this month, last month, balance) + a one-time summary at each new month.
