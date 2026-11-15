@@ -272,7 +272,7 @@ export default {
   forgotTitle: "Contraseña olvidada",
   forgotDetail: "La contraseña no se puede recuperar. Con tus 25 palabras restauras el monedero y eliges una nueva contraseña. El monedero actual de este ordenador se aparta (carpeta «archive») y tus suscripciones se conservan. Sin tus 25 palabras, los fondos de este monedero se pierden.",
   forgotRestore: "Restaurar con mis 25 palabras",
-  restoreDesc: "Introduce las 25 palabras de tu monedero Monero (AutoPay, Monero GUI, Feather… lista de palabras en inglés). El saldo y las transacciones se vuelven a leer de la blockchain.",
+  restoreDesc: "Introduce las 25 palabras de tu monedero Monero (AutoPay, Monero GUI, Feather… palabras en inglés o francés). El saldo y las transacciones se vuelven a leer de la blockchain.",
   seedGenerating: "Generando tu seed segura…",
   seedWriteDown: "⚠ Anota estas 25 palabras en papel antes de continuar.",
   verifyWordProof: "(palabra n.º {n}: «{word}» ✓)",
@@ -438,7 +438,7 @@ export default {
   // RPC diagnosis
   diagSeedTitle: "Seed de recuperación no válida",
   diagSeedDetail: "Tu frase secreta se creó con una versión antigua defectuosa. La app intentará corregirla automáticamente en el próximo desbloqueo.",
-  diagSeedAction: "Restablecer el wallet",
+  diagSeedAction: "Restaurar con mis 25 palabras",
   diagBinaryTitle: "Herramienta Monero no encontrada",
   diagBinaryDetail: "No se encuentra el motor Monero (monero-wallet-rpc) incluido con AutoPay: ni saldo ni pagos.",
   diagBinaryAction: "Configurar en Ajustes",

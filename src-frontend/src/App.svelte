@@ -13,6 +13,7 @@
   // States: "checking" | "welcome" | "onboarding" | "restore" | "unlock" | "dashboard"
   let appState = "checking";
   let pendingDeepLinkCode = null; // code from a deep link received before unlock
+  let openForgot = false; // Unlock opens on the "restore with my 25 words" panel
 
   // ===== Auto-lock after 3 min of inactivity =====
   // UI-only: the backend session keeps syncing and paying while the screen is locked.
@@ -125,7 +126,6 @@
         pendingDeepLinkCode = null;
         await tick();
         pendingDeepLinkCode = url;
-        if (appState === "welcome") appState = "unlock";
       });
     } catch {}
 
@@ -201,18 +201,21 @@
 
   {:else if appState === "unlock"}
     <Unlock
+      showForgot={openForgot}
       on:unlocked={async (e) => {
+        openForgot = false;
         const { address, balance, rpcError } = e.detail || {};
         if (rpcError) console.warn("[Unlock] RPC unavailable (offline mode):", rpcError);
         appState = "dashboard";
         onSessionUnlocked();
         await checkPendingDeepLink();
       }}
-      on:reset={() => { appState = "restore"; }}
+      on:reset={() => { openForgot = false; appState = "restore"; }}
     />
 
   {:else}
-    <Dashboard externalCode={pendingDeepLinkCode} on:lock={() => { invoke("lock_ui").catch(() => {}); appState = "unlock"; }} />
+    <Dashboard externalCode={pendingDeepLinkCode} on:lock={() => { invoke("lock_ui").catch(() => {}); appState = "unlock"; }}
+      on:restore={() => { invoke("lock_ui").catch(() => {}); openForgot = true; appState = "unlock"; }} />
   {/if}
 
   <!-- Floating Logs button (always visible, bottom-right) -->

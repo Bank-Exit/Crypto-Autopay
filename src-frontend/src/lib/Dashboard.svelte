@@ -1991,8 +1991,9 @@
 {/if}
 
 {#if subDetails}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-backdrop" role="dialog" aria-modal="true" on:click={() => subDetails = null}>
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
     <div class="modal-panel" role="document" style="max-width:400px;padding:20px" on:click|stopPropagation>
       <h2 style="margin:0 0 12px;font-size:17px">{subDetails.label}</h2>
       <dl class="sub-details">
@@ -2196,7 +2197,7 @@
 
 {#if infoNotice}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="info-notice" role="status" on:click={() => infoNotice = ""}>{infoNotice}</div>
+  <button type="button" class="info-notice" aria-live="polite" on:click={() => infoNotice = ""}>{infoNotice}</button>
 {/if}
 
 <!-- Payment success animation overlay -->
@@ -2394,7 +2395,7 @@
                 {:else if diag.action === "retry"}
                   <button class="rpc-diag-btn" on:click={refreshBalance} disabled={balanceLoading}>↻ {diag.actionLabel}</button>
                 {:else if diag.action === "reset"}
-                  <button class="rpc-diag-btn rpc-diag-btn-danger">⚠️ {diag.actionLabel}</button>
+                  <button class="rpc-diag-btn rpc-diag-btn-danger" on:click={() => dispatch("restore")}>⚠️ {diag.actionLabel}</button>
                 {/if}
                 {#if diag.link}
                   <a href={diag.link} class="rpc-diag-link" target="_blank">{diag.linkLabel} ↗</a>
@@ -3090,13 +3091,13 @@
           ·
           <a class="rpc-link" href="https://github.com/monero-project/monero" on:click|preventDefault={() => openExternal("https://github.com/monero-project/monero")}>github.com/monero-project/monero ↗</a>
           {#if isWinOrMac}
-            <span class="info-tip" tabindex="0" role="note">
+            <button type="button" class="info-tip">
               ⓘ {$t.rpcAvTipLabel}
               <span class="info-tip-body">
                 <strong>{$t.rpcAvTipWhy}</strong><br/>
                 {isWindows ? $t.rpcAvTipWindows : $t.rpcAvTipMac}
               </span>
-            </span>
+            </button>
           {/if}
         </p>
         {#if rpcBinaryPath}
@@ -4224,7 +4225,7 @@
   .rpc-defender-msg.err { color:#f85149; }
   .rpc-defender-script { margin:0; max-height:180px; overflow:auto; font-size:11px; white-space:pre-wrap; word-break:break-all; user-select:text; }
   .rpc-official { display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px; }
-  .info-tip { position:relative; cursor:help; color:var(--accent); font-size:12px; outline:none; }
+  .info-tip { position:relative; cursor:help; color:var(--accent); font:inherit; font-size:12px; outline:none; background:none; border:none; padding:0; text-align:left; }
   .info-tip-body {
     display:none; position:absolute; z-index:20; left:0; top:calc(100% + 6px); width:340px;
     padding:10px 12px; border-radius:8px; background:var(--bg-card, #fff); color:var(--text);
@@ -4238,6 +4239,6 @@
     position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000;
     max-width:460px; padding:10px 16px; border-radius:10px; cursor:pointer;
     background:var(--bg-card, #fff); color:var(--text); border:1px solid var(--border);
-    box-shadow:0 6px 20px rgba(0,0,0,.18); font-size:13px; line-height:1.5;
+    box-shadow:0 6px 20px rgba(0,0,0,.18); font:inherit; font-size:13px; line-height:1.5; text-align:left;
   }
 </style>

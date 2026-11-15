@@ -272,7 +272,7 @@ export default {
   forgotTitle: "Passwort vergessen",
   forgotDetail: "Das Passwort lässt sich nicht wiederherstellen. Mit Ihren 25 Wörtern stellen Sie das Wallet wieder her und wählen ein neues Passwort. Das aktuelle Wallet dieses Computers wird beiseitegelegt (Ordner „archive“), Ihre Abonnements bleiben erhalten. Ohne Ihre 25 Wörter ist das Guthaben dieses Wallets verloren.",
   forgotRestore: "Mit meinen 25 Wörtern wiederherstellen",
-  restoreDesc: "Geben Sie die 25 Wörter Ihres Monero-Wallets ein (AutoPay, Monero GUI, Feather… englische Wortliste). Guthaben und Transaktionen werden neu aus der Blockchain gelesen.",
+  restoreDesc: "Geben Sie die 25 Wörter Ihres Monero-Wallets ein (AutoPay, Monero GUI, Feather… englische oder französische Wörter). Guthaben und Transaktionen werden neu aus der Blockchain gelesen.",
   seedGenerating: "Ihr sicherer Seed wird erzeugt…",
   seedWriteDown: "⚠ Notieren Sie diese 25 Wörter auf Papier, bevor Sie fortfahren.",
   verifyWordProof: "(Wort Nr. {n}: „{word}“ ✓)",
@@ -438,7 +438,7 @@ export default {
   // RPC diagnosis
   diagSeedTitle: "Ungültiger Wiederherstellungs-Seed",
   diagSeedDetail: "Ihre geheime Phrase wurde mit einer alten fehlerhaften Version erstellt. Die App versucht, sie beim nächsten Entsperren automatisch zu korrigieren.",
-  diagSeedAction: "Wallet zurücksetzen",
+  diagSeedAction: "Mit meinen 25 Wörtern wiederherstellen",
   diagBinaryTitle: "Monero-Werkzeug nicht gefunden",
   diagBinaryDetail: "Die mit AutoPay gelieferte Monero-Engine (monero-wallet-rpc) wurde nicht gefunden: kein Guthaben, keine Zahlungen.",
   diagBinaryAction: "In den Einstellungen konfigurieren",

@@ -26,7 +26,7 @@ pub struct AppAlert {
 use autopay_crypto::{
     SeedVault, EncryptedSeed,
     generate_seed as crypto_generate_seed,
-    mnemonic_to_bytes,
+    normalize_mnemonic,
     fix_seed_checksum,
 };
 use autopay_core::db::Database;
@@ -231,7 +231,7 @@ async fn create_wallet(
     if words != 25 {
         return Err(format!("SEED_WORD_COUNT:{words}"));
     }
-    mnemonic_to_bytes(&seed).map_err(|e| format!("SEED_INVALID:{e}"))?;
+    let seed = normalize_mnemonic(&seed).map_err(|e| format!("SEED_INVALID:{e}"))?;
 
     let (vault_path, wallet_name) = {
         let state = state.lock().map_err(|e| e.to_string())?;

@@ -272,7 +272,7 @@ export default {
   forgotTitle: "Mot de passe oublié",
   forgotDetail: "Le mot de passe ne peut pas être récupéré. Avec vos 25 mots, vous restaurez le portefeuille et choisissez un nouveau mot de passe. Le portefeuille actuel de cet ordinateur est mis de côté (dossier « archive »), vos abonnements sont conservés. Sans vos 25 mots, les fonds de ce portefeuille sont perdus.",
   forgotRestore: "Restaurer avec mes 25 mots",
-  restoreDesc: "Entrez les 25 mots de votre portefeuille Monero (AutoPay, Monero GUI, Feather… liste de mots anglaise). Le solde et les transactions sont relus depuis la blockchain.",
+  restoreDesc: "Entrez les 25 mots de votre portefeuille Monero (AutoPay, Monero GUI, Feather… mots anglais ou français). Le solde et les transactions sont relus depuis la blockchain.",
   seedGenerating: "Génération de votre seed sécurisée…",
   seedWriteDown: "⚠ Notez ces 25 mots sur papier avant de continuer.",
   verifyWordProof: "(mot n°{n} : « {word} » ✓)",
@@ -438,7 +438,7 @@ export default {
   // RPC diagnosis
   diagSeedTitle: "Seed de récupération invalide",
   diagSeedDetail: "Votre phrase secrète a été créée avec une ancienne version boguée. L'app tente de la corriger automatiquement au prochain déverrouillage.",
-  diagSeedAction: "Réinitialiser le wallet",
+  diagSeedAction: "Restaurer avec mes 25 mots",
   diagBinaryTitle: "Outil Monero introuvable",
   diagBinaryDetail: "Le moteur Monero (monero-wallet-rpc) livré avec AutoPay est introuvable : ni solde, ni paiements possibles.",
   diagBinaryAction: "Configurer dans Paramètres",

@@ -11,7 +11,7 @@
   let error = "";
   let rpcWarning = null; // non-blocking warning after unlock
   let loading = false;
-  let showForgot = false;
+  export let showForgot = false;
   let forgotBusy = false;
   let forgotError = "";
 
