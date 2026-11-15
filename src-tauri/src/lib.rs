@@ -39,6 +39,7 @@ mod log_retention;
 mod netcheck;
 mod boot_log;
 mod defender;
+mod unattended;
 use rpc_manager::{RpcConfig, RpcManager, RpcStatus, PUBLIC_NODES};
 
 // ============================================================
@@ -63,9 +64,13 @@ pub struct AppState {
     pub rpc_connected: bool,
     /// Last RPC error message (None = no error or not yet tried).
     pub rpc_last_error: Option<String>,
-    /// Wallet password stored in memory for this session (for balance refresh).
-    /// Cleared when the app is locked.
+    /// Master password, held while the interface is unlocked (vault, guard changes).
     pub session_password: Option<String>,
+    /// The Monero wallet's own password, used to open it in wallet-rpc. Random for wallets
+    /// migrated to it; the master password for older ones until their next opening.
+    pub wallet_password: Option<String>,
+    /// Payments keep running while the interface is locked (secrets are in the OS keyring).
+    pub unattended_active: bool,
     /// A deep-link URL waiting to be consumed by the frontend.
     /// Set when the app is launched/focused via a crypto-autopay: URI.
     pub pending_deep_link: Option<String>,
@@ -163,7 +168,10 @@ async fn get_pending_deep_link(state: tauri::State<'_, Mutex<AppState>>) -> Resu
 #[tauri::command]
 async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    log_retention::set_viewable(false);
+    if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
     s.unlocked = false;
+    if let Some(mut pw) = s.wallet_password.take() { pw.zeroize(); }
     // Overwrite secrets before dropping them (copies held by in-flight operations
     // are dropped when those operations end).
     if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
@@ -173,6 +181,19 @@ async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Str
     log_retention::set_viewable(false);
     drop(s);
     end_wallet_session("wallet locked");
+    Ok(())
+}
+
+/// Screen lock (padlock, idle): the master password leaves memory and logs are hidden;
+/// the payment session keeps running.
+#[tauri::command]
+fn lock_ui(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    if let Some(mut pw) = s.session_password.take() {
+        pw.zeroize();
+        log::info!("[Security] Interface locked — scheduled payments continue");
+    }
+    log_retention::set_viewable(false);
     Ok(())
 }
 
@@ -223,6 +244,7 @@ async fn create_wallet(
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     // Leftovers of a previous wallet (cache, history keyed to another password) would mix in.
     archive_wallet_files(&data_dir, &wallet_name)?;
+    tokio::task::spawn_blocking(unattended::forget).await.map_err(|e| e.to_string())?;
 
     let encrypted = SeedVault::encrypt(&seed, &password).map_err(|e| e.to_string())?;
     let vault_json = serde_json::to_string(&encrypted).map_err(|e| e.to_string())?;
@@ -261,7 +283,7 @@ fn monero_height_at(ts: i64) -> u64 {
 
 /// Files bound to one wallet and its master password. Subscriptions and settings stay.
 fn wallet_bound_files(wallet_name: &str) -> Vec<String> {
-    let mut names: Vec<String> = ["seed.vault", "history.vault", "history.salt", POLICY_VAULT_FILE, "unlock_guard.json"]
+    let mut names: Vec<String> = ["seed.vault", "history.vault", "history.salt", POLICY_VAULT_FILE, WALLET_PW_FILE, "unlock_guard.json"]
         .iter().map(|s| s.to_string()).collect();
     names.extend(["", ".keys", ".address", ".height", ".synced_height", ".restore_height"]
         .iter().map(|ext| format!("{wallet_name}{ext}")));
@@ -293,7 +315,9 @@ async fn reset_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), St
         let mut s = state.lock().map_err(|e| e.to_string())?;
         s.unlocked = false;
         if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
+        if let Some(mut pw) = s.wallet_password.take() { pw.zeroize(); }
         if let Some(mut key) = s.history_key.take() { key.zeroize(); }
+        s.unattended_active = false;
         s.wallet_address = None;
         s.balance_atomic = 0;
         s.rpc_connected = false;
@@ -303,7 +327,10 @@ async fn reset_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), St
     };
     log_retention::set_viewable(false);
     WALLET_SESSION_INVALIDATED.store(true, Ordering::SeqCst);
-    tokio::task::spawn_blocking(|| stop_wallet_session("wallet reset")).await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(|| {
+        stop_wallet_session("wallet reset");
+        unattended::forget();
+    }).await.map_err(|e| e.to_string())?;
     archive_wallet_files(&data_dir, &wallet_name)?;
     Ok(())
 }
@@ -384,10 +411,14 @@ async fn unlock_wallet(
 
     // UI lock only: the session kept running in the background, nothing to reload.
     {
-        let s = state.lock().map_err(|e| e.to_string())?;
-        if s.unlocked && s.session_password.is_some() {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if s.unlocked && s.wallet_password.is_some() {
             log::info!("[Unlock] Session resumed (background session still active)");
+            s.session_password = Some(password.clone());
+            drop(s);
+            sync_unattended(&app_handle);
             session_unlocked(&app_handle);
+            let s = state.lock().map_err(|e| e.to_string())?;
             return Ok(UnlockResult {
                 address: s.wallet_address.clone().unwrap_or_default(),
                 balance_xmr: s.balance_atomic as f64 / 1e12,
@@ -441,7 +472,9 @@ async fn unlock_wallet(
             s.unlocked = true;
             s.last_unlock_at = chrono::Utc::now().timestamp();
             s.session_password = Some(password.clone());
-            s.history_key = Some(history_key_with_migration(&password, &s.history_path));
+            let key = history_key_with_migration(&password, &s.history_path);
+            s.wallet_password = Some(read_wallet_password(&wallet_dir, &key).unwrap_or_else(|| password.clone()));
+            s.history_key = Some(key);
             apply_policy_vault(&mut s);
             s.wallet_address = Some(cached_addr.clone());
             s.wallet_file_path = wallet_file_path.clone();
@@ -450,6 +483,7 @@ async fn unlock_wallet(
             s.balance_atomic = 0;
         }
         refresh_pause_item(&app_handle);
+        sync_unattended(&app_handle);
         session_unlocked(&app_handle);
         return Ok(UnlockResult {
             address: cached_addr,
@@ -461,11 +495,17 @@ async fn unlock_wallet(
 
     // Try RPC session — non-fatal on failure
     log::debug!("[Unlock] wallet_dir={:?}, wallet_exists={}, wallet_name={}", wallet_dir, wallet_exists, wallet_name);
-    let (wn, wd, sd, pw) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
+    let history_key = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        history_key_with_migration(&password, &s.history_path)
+    };
+    let known_wallet_pw = read_wallet_password(&wallet_dir, &history_key);
+    let (wn, wd, sd, master) = (wallet_name.clone(), wallet_dir.clone(), seed_str.clone(), password.clone());
     let app_rpc = app_handle.clone();
 
     let configured_node = state.lock().map_err(|e| e.to_string())?.rpc.config.daemon_address.clone();
-    let rpc_result: Result<(String, f64), (String, bool)> = if netcheck::offline(configured_node.as_deref()) {
+    let mut final_wallet_pw = known_wallet_pw.clone().unwrap_or_else(|| password.clone());
+    let rpc_result: Result<(String, f64, String), (String, bool)> = if netcheck::offline(configured_node.as_deref()) {
         log::info!("[Network] No network connection — wallet opened without sync");
         Err((netcheck::OFFLINE.to_string(), false))
     } else { tokio::task::spawn_blocking(move || {
@@ -511,7 +551,7 @@ async fn unlock_wallet(
             .unwrap_or(0);
         let stale_scan = saved_height == 0 && cache_exists; // was scanned from genesis
 
-        let (address, balance) = if !wallet_exists || !cache_exists || stale_scan {
+        let (address, balance, wallet_pw) = if !wallet_exists || !cache_exists || stale_scan {
             // Force fresh restore: delete both files so restore_deterministic_wallet can create cleanly.
             if stale_scan {
                 log::warn!("[Unlock/RPC] Detected stale restore_height=0 — resetting wallet cache to height {}", restore_height);
@@ -523,6 +563,10 @@ async fn unlock_wallet(
             // Delete both wallet files (restore_deterministic_wallet fails if they exist)
             let _ = std::fs::remove_file(&cache_file);
             let _ = std::fs::remove_file(wd.join(format!("{}.keys", wn)));
+            let pw = match known_wallet_pw {
+                Some(pw) => pw,
+                None => new_wallet_password(&wd, &history_key).map_err(|e| (e, false))?,
+            };
             let addr = mgr.rpc_restore_wallet(&wn, &pw, &sd, restore_height).map_err(|e| {
                 let is_seed = e.contains("word list") || e.contains("Electrum") || e.contains("verification");
                 log::error!("[Unlock/RPC] restore failed (seed_invalid={}): {}", is_seed, e);
@@ -534,21 +578,14 @@ async fn unlock_wallet(
             let _ = std::fs::remove_file(&restore_marker);
             // Balance is 0 immediately after restore — sync happens via refresh_balance later.
             let bal = 0.0_f64;
-            (addr, bal)
+            (addr, bal, pw)
         } else {
             log::info!("[Unlock] Opening wallet (cache height {})", saved_height);
-            let open_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-                "jsonrpc":"2.0","id":"open","method":"open_wallet",
-                "params":{"filename":wn,"password":pw}
-            })).map_err(|e| {
-                log::error!("[Unlock/RPC] open_wallet failed: {}", e);
+            let tried = known_wallet_pw.unwrap_or_else(|| master.clone());
+            let pw = open_wallet_rpc(&mgr, &wn, &tried, Some(&master), &wd, Some(&history_key)).map_err(|e| {
+                log::error!("[Unlock/RPC] {}", e);
                 (e, false)
             })?;
-            if let Some(err) = open_resp.get("error") {
-                let msg = format!("open_wallet RPC error: {}", err);
-                log::error!("[Unlock/RPC] {}", msg);
-                return Err((msg, false));
-            }
             log::debug!("[Unlock/RPC] open_wallet OK — fetching address");
             let addr_resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
                 "jsonrpc":"2.0","id":"addr","method":"get_address",
@@ -563,11 +600,11 @@ async fn unlock_wallet(
                 log::warn!("[Unlock/RPC] get_balance failed: {}", e);
                 0.0
             });
-            (addr, bal)
+            (addr, bal, pw)
         };
         log::debug!("[Unlock/RPC] Session complete — wallet-rpc kept for the session");
         return_wallet_session(mgr);
-        Ok::<(String, f64), (String, bool)>((address, balance))
+        Ok::<(String, f64, String), (String, bool)>((address, balance, wallet_pw))
     })
     .await
     .unwrap_or_else(|e| {
@@ -576,8 +613,9 @@ async fn unlock_wallet(
     }) };
 
     let (address, balance_xmr, rpc_error, seed_invalid) = match rpc_result {
-        Ok((addr, bal)) => {
+        Ok((addr, bal, wallet_pw)) => {
             log::info!("[Unlock] Wallet opened and synced");
+            final_wallet_pw = wallet_pw;
             (addr, bal, None, false)
         }
         Err((e, is_seed)) => {
@@ -595,9 +633,10 @@ async fn unlock_wallet(
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.unlocked = true;
     s.last_unlock_at = chrono::Utc::now().timestamp();
-    s.history_key = Some(history_key_with_migration(&password, &s.history_path));
+    s.history_key = Some(history_key);
     apply_policy_vault(&mut s);
     s.session_password = Some(password);
+    s.wallet_password = Some(final_wallet_pw);
     s.wallet_address = if address.is_empty() { None } else { Some(address.clone()) };
     s.balance_atomic = (balance_xmr * 1e12) as u64;
     s.rpc_connected = rpc_error.is_none();
@@ -608,6 +647,7 @@ async fn unlock_wallet(
     drop(s);
     refresh_pause_item(&app_handle);
     refresh_alerts_and_tray(&app_handle);
+    sync_unattended(&app_handle);
     session_unlocked(&app_handle);
     Ok(UnlockResult { address, balance_xmr, rpc_error, seed_invalid })
 }
@@ -704,7 +744,7 @@ async fn sweep_all(
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-        let pw = s.session_password.clone().ok_or("No session password")?;
+        let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
         (wn, wd, pw, Arc::clone(&s.rpc_busy))
     };
     if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -783,7 +823,7 @@ async fn refresh_wallet(app_handle: &tauri::AppHandle) -> Result<BalanceResponse
         let wn = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         let wd = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-        let pw = s.session_password.clone().ok_or("No session")?;
+        let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
         let busy = Arc::clone(&s.rpc_busy);
         (wn, wd, pw, busy, need_address)
     };
@@ -2652,15 +2692,198 @@ fn take_wallet_session(
     let (mut mgr, _) = live_rpc_manager(app);
     mgr.start_for_dir(wallet_dir)?;
     mgr.wait_for_ready(std::time::Duration::from_secs(15))?;
-    let open = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
-        "jsonrpc":"2.0","id":"open","method":"open_wallet",
-        "params":{"filename":wallet_name,"password":password}
-    }))?;
-    if let Some(err) = open.get("error") {
-        return Err(format!("open_wallet error: {}", err["message"].as_str().unwrap_or("?")));
+    let (master, key) = app.try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| (s.session_password.clone(), s.history_key)))
+        .unwrap_or((None, None));
+    let pw = open_wallet_rpc(&mgr, wallet_name, password, master.as_deref(), wallet_dir, key.as_ref())?;
+    if pw != password {
+        if let Some(st) = app.try_state::<Mutex<AppState>>() {
+            if let Ok(mut s) = st.lock() { s.wallet_password = Some(pw); }
+        }
+        sync_unattended(app);
     }
     log::info!("[RPC] Wallet RPC started, wallet open (node {})", mgr.daemon_address());
     Ok(mgr)
+}
+
+const WALLET_PW_FILE: &str = "wallet_pw.vault";
+
+fn read_wallet_password(data_dir: &std::path::Path, key: &[u8; 32]) -> Option<String> {
+    let b64 = std::fs::read_to_string(data_dir.join(WALLET_PW_FILE)).ok()?;
+    String::from_utf8(aes_decrypt(key, b64.trim()).ok()?).ok()
+}
+
+/// A random wallet password, saved (encrypted with the history key) before it is used.
+fn new_wallet_password(data_dir: &std::path::Path, key: &[u8; 32]) -> Result<String, String> {
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let pw: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    raw.zeroize();
+    std::fs::write(data_dir.join(WALLET_PW_FILE), aes_encrypt(key, pw.as_bytes())?)
+        .map_err(|e| format!("Wallet password not saved: {e}"))?;
+    Ok(pw)
+}
+
+fn rpc_open_wallet(mgr: &RpcManager, wallet_name: &str, password: &str) -> Result<(), String> {
+    let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        "jsonrpc":"2.0","id":"open","method":"open_wallet",
+        "params":{"filename":wallet_name,"password":password}
+    }))?;
+    match resp.get("error") {
+        Some(err) => Err(format!("open_wallet error: {}", err["message"].as_str().unwrap_or("?"))),
+        None => Ok(()),
+    }
+}
+
+/// Open the wallet and return the password that opened it. A wallet still protected by the
+/// master password (older versions) is switched to a random password, so the OS keyring
+/// never has to hold the master password.
+fn open_wallet_rpc(
+    mgr: &RpcManager,
+    wallet_name: &str,
+    password: &str,
+    master: Option<&str>,
+    data_dir: &std::path::Path,
+    key: Option<&[u8; 32]>,
+) -> Result<String, String> {
+    let opened_with = match rpc_open_wallet(mgr, wallet_name, password) {
+        Ok(()) => password.to_string(),
+        Err(e) => match master.filter(|m| *m != password) {
+            // Interrupted migration: the saved random password was never applied.
+            Some(m) => {
+                rpc_open_wallet(mgr, wallet_name, m).map_err(|_| e)?;
+                m.to_string()
+            }
+            None => return Err(e),
+        },
+    };
+    let (Some(m), Some(key)) = (master, key) else { return Ok(opened_with) };
+    if opened_with != m {
+        return Ok(opened_with);
+    }
+    let new_pw = new_wallet_password(data_dir, key)?;
+    let resp = rpc_manager::ureq_post_json_pub(&mgr.rpc_url(), &serde_json::json!({
+        "jsonrpc":"2.0","id":"pw","method":"change_wallet_password",
+        "params":{"old_password":m,"new_password":new_pw}
+    }));
+    match resp {
+        Ok(r) if r.get("error").is_none() => {
+            log::info!("[Wallet] Wallet password replaced by a random one (master password no longer used by the wallet)");
+            Ok(new_pw)
+        }
+        other => {
+            let _ = std::fs::remove_file(data_dir.join(WALLET_PW_FILE));
+            let why = match other { Ok(r) => r["error"]["message"].as_str().unwrap_or("?").to_string(), Err(e) => e };
+            log::warn!("[Wallet] Wallet password unchanged: {}", why);
+            Ok(opened_with)
+        }
+    }
+}
+
+/// Keep the keyring entry in line with the setting, from an unlocked interface.
+fn sync_unattended(app: &tauri::AppHandle) {
+    let Some(st) = app.try_state::<Mutex<AppState>>() else { return };
+    let Ok(s) = st.lock() else { return };
+    let Some(data_dir) = s.vault_path.parent().map(|p| p.to_path_buf()) else { return };
+    let (Some(wallet_pw), Some(key)) = (s.wallet_password.clone(), s.history_key) else { return };
+    // Not migrated yet: storing it would put the master password in the keyring.
+    if s.session_password.as_deref() == Some(wallet_pw.as_str()) || !unattended::enabled(&data_dir) {
+        return;
+    }
+    drop(s);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let secrets = unattended::Secrets { wallet_password: wallet_pw, history_key: key };
+        let ok = match unattended::store(&secrets) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("[Unattended] OS keyring unavailable, payments need the unlocked app: {}", e);
+                false
+            }
+        };
+        if let Some(st) = app.try_state::<Mutex<AppState>>() {
+            if let Ok(mut s) = st.lock() {
+                if ok && !s.unattended_active { log::info!("[Unattended] Payments will continue while locked and after a restart"); }
+                s.unattended_active = ok;
+            }
+        }
+    });
+}
+
+/// At launch, with the setting on: start the payment session from the keyring, the
+/// interface staying locked.
+fn start_unattended(app: &tauri::AppHandle) {
+    let Some(st) = app.try_state::<Mutex<AppState>>() else { return };
+    let (data_dir, wallet_name, vault_exists) = match st.lock() {
+        Ok(s) => (s.vault_path.parent().map(|p| p.to_path_buf()), wallet_name_of(&s.wallet_file_path), s.vault_path.exists()),
+        Err(_) => return,
+    };
+    let Some(data_dir) = data_dir.filter(|_| vault_exists) else { return };
+    if !unattended::enabled(&data_dir) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let secrets = match unattended::load() {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("[Unattended] OS keyring unavailable, payments wait for the unlock: {}", e);
+                return;
+            }
+        };
+        if read_wallet_password(&data_dir, &secrets.history_key).as_deref() != Some(secrets.wallet_password.as_str()) {
+            log::warn!("[Unattended] Keyring entry does not match this wallet — removed");
+            unattended::forget();
+            return;
+        }
+        let address = std::fs::read_to_string(data_dir.join(format!("{wallet_name}.address"))).ok()
+            .map(|a| a.trim().to_string()).filter(|a| a.len() > 90);
+        let Some(st) = app.try_state::<Mutex<AppState>>() else { return };
+        let Ok(mut s) = st.lock() else { return };
+        if s.unlocked { return; }
+        s.unlocked = true;
+        s.unattended_active = true;
+        s.last_unlock_at = chrono::Utc::now().timestamp();
+        s.wallet_password = Some(secrets.wallet_password.clone());
+        s.history_key = Some(secrets.history_key);
+        apply_policy_vault(&mut s);
+        s.wallet_address = address;
+        drop(s);
+        log::info!("[Unattended] Payment session started — interface locked");
+        refresh_pause_item(&app);
+        refresh_alerts_and_tray(&app);
+    });
+}
+
+/// Pay while locked: setting state, for the Settings page.
+#[tauri::command]
+fn get_unattended(state: tauri::State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let dir = s.vault_path.parent().ok_or("No data folder")?;
+    Ok(serde_json::json!({ "enabled": unattended::enabled(dir), "active": s.unattended_active }))
+}
+
+#[tauri::command]
+async fn set_unattended(
+    enabled: bool,
+    state: tauri::State<'_, Mutex<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let dir = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if s.session_password.is_none() { return Err("Wallet is locked.".into()); }
+        s.vault_path.parent().ok_or("No data folder")?.to_path_buf()
+    };
+    unattended::set_enabled(&dir, enabled)?;
+    if enabled {
+        sync_unattended(&app);
+    } else {
+        tokio::task::spawn_blocking(unattended::forget).await.map_err(|e| e.to_string())?;
+        state.lock().map_err(|e| e.to_string())?.unattended_active = false;
+        log::info!("[Unattended] Turned off — payments need the unlocked app");
+    }
+    Ok(())
 }
 
 fn return_wallet_session(mut mgr: RpcManager) {
@@ -2991,7 +3214,7 @@ async fn execute_pv_payment(
         if !s.unlocked { return Err("Wallet is locked.".to_string()); }
         if !s.treasurer_mode { return Err("Treasurer mode is not enabled.".to_string()); }
         let busy = Arc::clone(&s.rpc_busy);
-        let pw = s.session_password.clone().ok_or("No session password")?;
+        let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
         let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let name = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
@@ -3098,7 +3321,7 @@ async fn execute_subscription_payment(app: &tauri::AppHandle, sub: &Subscription
         let s = st.lock().map_err(|e| e.to_string())?;
         if !s.unlocked { return Err("Wallet is locked.".into()); }
         if s.policy_extras.paused { return Err(PAUSED.into()); }
-        let pw = s.session_password.clone().ok_or("No session password")?;
+        let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
         let name = s.wallet_file_path.file_name()
             .and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string();
         (pw, app.path().app_data_dir().map_err(|e| e.to_string())?, name)
@@ -3303,7 +3526,7 @@ async fn run_payment_scheduler(app: &tauri::AppHandle) {
                 return;
             }
         }
-        if s.session_password.is_none() { return; }
+        if s.wallet_password.is_none() { return; }
         if s.policy_extras.paused {
             log::debug!("[Scheduler] All payments paused — skipping");
             return;
@@ -3589,6 +3812,8 @@ pub fn run() {
                 rpc_connected: false,
                 rpc_last_error: None,
                 session_password: None,
+                wallet_password: None,
+                unattended_active: false,
                 pending_deep_link: None,
                 last_payment_sent_at: None,
                 last_wallet_height: 0,
@@ -3794,6 +4019,7 @@ pub fn run() {
                     }
                 });
             }
+            start_unattended(app.handle());
             boot_log::write("INFO", "boot", "Setup done");
 
             Ok(())
@@ -3810,6 +4036,9 @@ pub fn run() {
             set_log_retention,
             get_log_history,
             reset_wallet,
+            lock_ui,
+            get_unattended,
+            set_unattended,
             defender_allow_rpc,
             defender_script,
             boot_log_append,

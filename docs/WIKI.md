@@ -18,7 +18,8 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 | Create / restore | Welcome: "Create a wallet" or "Restore with my 25 words". Both ask the master password first. Restore asks the approximate creation month (or "I don't know" = full scan); the chain is scanned from one month before it |
 | Master password | ≥ 12 chars; Argon2id → AES-256-GCM (`seed.vault`); unlock lockout after repeated failures |
 | Seed backup check | Reminder every 90 days; asks 3 random words, compared with the vault |
-| Lock | Manual (sidebar padlock) wipes the session password; UI auto-locks after 3 min idle (payments keep running) |
+| Lock | Sidebar padlock or 3 min idle: the master password leaves memory and technical logs are hidden; scheduled payments keep running |
+| Pay even when locked | On by default. The wallet's own random password (never the master password) and the history key go to the OS keyring (Keychain / Credential Manager / Secret Service); at launch the payment session starts from it with the interface locked. Older wallets switch from the master password to a random one at their next opening. Off = keyring entry deleted. Trade-off: malware in the user session can read the keyring and spend up to the caps |
 | Balance | Live balance, sync progress, "top up in ~N days" from the monthly spend |
 | Sweep | Send all funds to an address (Wallets page), irreversible, confirmed |
 | Forgot password | Unlock screen → restore from the 25 words with a new password. The previous wallet files move to `archive/<date>/` (never deleted); subscriptions and settings stay |
@@ -103,7 +104,7 @@ Settings toggle. Import a meeting resolution JSON (Procès-Verbal), validate, ex
 
 Language (FR/EN/DE/ES), theme, timezone, network (Monero; Bitcoin UI only), payment mode, pause,
 alerts on/off + low-balance threshold, send chime / notification, security limits, history,
-technical logs retention, RPC node / binary path / payment tolerance, start with the session (on by default).
+technical logs retention, RPC node / binary path / payment tolerance, start with the session (on by default; refused by dev builds), pay even when locked (on by default).
 
 ## Privacy & security
 
@@ -125,6 +126,9 @@ technical logs retention, RPC node / binary path / payment tolerance, start with
 | `history.vault` | payment history | yes |
 | `subscriptions.db` | subscriptions (SQLite) | **no** — edits trigger a confirmation, not a payment |
 | `autopay_wallet*` | Monero wallet files | yes (wallet password) |
+| `wallet_pw.vault` | the wallet's random password | yes (master password) |
+| `unattended.json` | "pay even when locked" setting | no |
+| `archive/<date>/` | wallet set aside by "forgot password" / a restore | as above |
 | `logs/autopay.log` | technical logs | no (nothing sensitive by design) |
 | `logs/startup.log` | startup log, deleted at unlock (macOS: `~/Library/Logs/com.libre-market.autopay/`, Windows: `%LOCALAPPDATA%\com.libre-market.autopay\logs\`) | no |
 

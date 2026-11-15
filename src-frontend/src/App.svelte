@@ -24,6 +24,7 @@
     if (autoLockTimer) clearTimeout(autoLockTimer);
     autoLockTimer = setTimeout(() => {
       if (appState !== "dashboard") return;
+      invoke("lock_ui").catch(() => {});
       appState = "unlock";
       logInfo("Security", "Auto-lock: screen locked after 3 min of inactivity (background sync continues)");
     }, AUTO_LOCK_MS);
@@ -211,7 +212,7 @@
     />
 
   {:else}
-    <Dashboard externalCode={pendingDeepLinkCode} on:lock={() => { appState = "unlock"; }} />
+    <Dashboard externalCode={pendingDeepLinkCode} on:lock={() => { invoke("lock_ui").catch(() => {}); appState = "unlock"; }} />
   {/if}
 
   <!-- Floating Logs button (always visible, bottom-right) -->

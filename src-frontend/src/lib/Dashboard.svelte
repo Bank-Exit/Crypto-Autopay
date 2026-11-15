@@ -566,6 +566,21 @@
     const v = await tauriInvoke("get_autostart");
     if (v !== null) autostartEnabled = !!v;
   }
+  let unattended = null; // { enabled, active }, null = unknown (browser dev mode)
+  async function loadUnattended() {
+    unattended = await tauriInvoke("get_unattended");
+  }
+  async function toggleUnattended(enabled) {
+    try {
+      await invokeStrict("set_unattended", { enabled });
+    } catch (e) {
+      logWarn("Dashboard", `set_unattended failed: ${e}`);
+    }
+    await loadUnattended();
+    // The keyring is written in the background.
+    if (enabled) setTimeout(loadUnattended, 1500);
+  }
+
   async function toggleAutostart(enabled) {
     try {
       await invokeStrict("set_autostart", { enabled });
@@ -1538,6 +1553,7 @@
     // Load treasurer mode
     await loadTreasurerMode();
     await loadAutostart();
+    await loadUnattended();
     await loadPaymentLimits();
 
     // Sync payment mode with Rust backend (source of truth for semi-auto enforcement)
@@ -2945,6 +2961,20 @@
             </label>
           </div>
           <p class="mode-desc" style="font-size:12px;color:var(--text-muted)">{$t.autostartDesc}</p>
+          {#if unattended}
+            <div class="setting-row">
+              <span class="setting-label">{$t.unattendedLabel}</span>
+              <label class="toggle">
+                <input type="checkbox" checked={unattended.enabled}
+                  on:change={e => toggleUnattended(e.target.checked)} />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <p class="mode-desc" style="font-size:12px;color:var(--text-muted)">{$t.unattendedDesc}</p>
+            {#if unattended.enabled && !unattended.active}
+              <p class="mode-desc" style="font-size:12px;color:var(--orange)">{$t.unattendedInactive}</p>
+            {/if}
+          {/if}
         </div>
       {/if}
 
