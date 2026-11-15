@@ -170,8 +170,7 @@
     <button class="btn-primary btn-lg" on:click={() => dispatch("start")}>
       {$t.welcomeStart}
     </button>
-    <button class="btn-ghost btn-lg-ghost" on:click={() => dispatch("restore")}
-            title="Restaurer un wallet existant depuis une seed de 25 mots">
+    <button class="btn-ghost btn-lg-ghost" on:click={() => dispatch("restore")}>
       {$t.welcomeAlreadySetup}
     </button>
   </div>

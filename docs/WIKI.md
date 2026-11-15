@@ -15,13 +15,13 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 
 | Feature | Notes |
 |---|---|
-| Create / restore | 25-word Monero seed; restore re-syncs from the blockchain |
+| Create / restore | Welcome: "Create a wallet" or "Restore with my 25 words". Both ask the master password first. Restore asks the approximate creation month (or "I don't know" = full scan); the chain is scanned from one month before it |
 | Master password | ≥ 12 chars; Argon2id → AES-256-GCM (`seed.vault`); unlock lockout after repeated failures |
 | Seed backup check | Reminder every 90 days; asks 3 random words, compared with the vault |
 | Lock | Manual (sidebar padlock) wipes the session password; UI auto-locks after 3 min idle (payments keep running) |
 | Balance | Live balance, sync progress, "top up in ~N days" from the monthly spend |
 | Sweep | Send all funds to an address (Wallets page), irreversible, confirmed |
-| Reset | "Seed lost" reset from the unlock screen |
+| Forgot password | Unlock screen → restore from the 25 words with a new password. The previous wallet files move to `archive/<date>/` (never deleted); subscriptions and settings stay |
 
 ## Subscriptions
 

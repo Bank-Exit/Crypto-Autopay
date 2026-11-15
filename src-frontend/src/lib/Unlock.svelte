@@ -11,6 +11,23 @@
   let error = "";
   let rpcWarning = null; // non-blocking warning after unlock
   let loading = false;
+  let showForgot = false;
+  let forgotBusy = false;
+  let forgotError = "";
+
+  // Archives the local wallet (kept in archive/, subscriptions stay) before restoring.
+  async function restoreFromSeed() {
+    forgotBusy = true;
+    forgotError = "";
+    try {
+      await invoke("reset_wallet");
+      logWarn("Unlock", "Local wallet archived for a restore from seed");
+      dispatch("reset");
+    } catch (e) {
+      forgotError = String(e?.message ?? e);
+      forgotBusy = false;
+    }
+  }
 
   // Progressive lockout, enforced by the backend; this only mirrors the countdown.
   let lockedSecs = 0;
@@ -175,13 +192,21 @@
       <div class="rpc-warning">
         <p>{friendlyRpcError(rpcWarning, $t)}</p>
         {#if rpcWarning.type === "seed_invalid"}
-          <button class="btn-link warn-reset" on:click={() => dispatch("reset")}>
+          <button class="btn-link warn-reset" on:click={() => { rpcWarning = null; showForgot = true; }}>
             {$t.unlockResetMine}
           </button>
         {/if}
         <button class="btn-link warn-close" on:click={() => dispatch("unlocked", { address: "", balance: 0 })}>
           {$t.unlockContinueAnyway}
         </button>
+      </div>
+    {:else if showForgot}
+      <div class="forgot-panel">
+        <strong>{$t.forgotTitle}</strong>
+        <p>{$t.forgotDetail}</p>
+        {#if forgotError}<div class="error-msg">{forgotError}</div>{/if}
+        <button class="btn-primary btn-full" disabled={forgotBusy} on:click={restoreFromSeed}>{$t.forgotRestore}</button>
+        <button class="btn-link" on:click={() => showForgot = false}>{$t.back}</button>
       </div>
     {:else}
       <button
@@ -196,8 +221,8 @@
         {/if}
       </button>
 
-      <button class="btn-link" on:click={() => dispatch("reset")}>
-        {$t.resetWallet}
+      <button class="btn-link" on:click={() => showForgot = true}>
+        {$t.forgotPassword}
       </button>
     {/if}
   </div>
@@ -279,6 +304,8 @@
     margin: 0; font-size: 12.5px; color: #92400e; line-height: 1.5;
   }
   .warn-reset { color: var(--accent); font-weight: 600; }
+  .forgot-panel { display: flex; flex-direction: column; gap: 10px; font-size: 13px; color: var(--text); }
+  .forgot-panel p { margin: 0; line-height: 1.55; color: var(--text-muted); }
   .warn-close { color: var(--text-muted); }
 
   .btn-full { width: 100%; padding: 13px; font-size: 14px; }

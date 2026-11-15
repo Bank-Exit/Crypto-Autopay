@@ -193,39 +193,118 @@ async fn check_wallet_exists(state: tauri::State<'_, Mutex<AppState>>) -> Result
 }
 
 /// Create (encrypt + save) a new wallet from a seed phrase and password.
-/// Called at the end of onboarding step 3.
+/// `restore_from`: when restoring, the approximate wallet creation date (unix seconds, 0 =
+/// unknown); the first unlock scans the chain from there instead of from today.
 #[tauri::command]
 async fn create_wallet(
     seed: String,
     password: String,
+    restore_from: Option<i64>,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<(), String> {
-    // Validate seed length
-    let words: Vec<&str> = seed.split_whitespace().collect();
-    if words.len() != 25 {
-        return Err(format!("Invalid seed: expected 25 words, got {}", words.len()));
+    if password.chars().count() < 12 {
+        return Err("PASSWORD_TOO_SHORT".into());
     }
+    let seed = seed.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    let words = seed.split(' ').count();
+    if words != 25 {
+        return Err(format!("SEED_WORD_COUNT:{words}"));
+    }
+    mnemonic_to_bytes(&seed).map_err(|e| format!("SEED_INVALID:{e}"))?;
 
-    // Validate seed words can be decoded
-    mnemonic_to_bytes(&seed).map_err(|e| e.to_string())?;
+    let (vault_path, wallet_name) = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        (state.vault_path.clone(), wallet_name_of(&state.wallet_file_path))
+    };
+    if vault_path.exists() {
+        return Err("WALLET_EXISTS".into());
+    }
+    let data_dir = vault_path.parent().ok_or("No data folder")?.to_path_buf();
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    // Leftovers of a previous wallet (cache, history keyed to another password) would mix in.
+    archive_wallet_files(&data_dir, &wallet_name)?;
 
-    // Encrypt seed
     let encrypted = SeedVault::encrypt(&seed, &password).map_err(|e| e.to_string())?;
     let vault_json = serde_json::to_string(&encrypted).map_err(|e| e.to_string())?;
-
-    // Save vault file
-    let vault_path = {
-        let state = state.lock().map_err(|e| e.to_string())?;
-        state.vault_path.clone()
-    };
-
-    if let Some(parent) = vault_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     std::fs::write(&vault_path, vault_json).map_err(|e| e.to_string())?;
+    if let Some(ts) = restore_from {
+        let height = if ts > 0 { monero_height_at(ts) } else { 1 };
+        std::fs::write(data_dir.join(format!("{wallet_name}.restore_height")), height.to_string())
+            .map_err(|e| e.to_string())?;
+        log::info!("[Wallet] Restored from seed, chain scan from height {}", height);
+    } else {
+        log::info!("[Wallet] New wallet created");
+    }
 
     let mut state = state.lock().map_err(|e| e.to_string())?;
     state.unlocked = false; // Will be unlocked on next unlock call
+    Ok(())
+}
+
+fn wallet_name_of(wallet_file_path: &std::path::Path) -> String {
+    wallet_file_path.file_name().and_then(|n| n.to_str()).unwrap_or("autopay_wallet").to_string()
+}
+
+/// Approximate chain height at `ts`, one month early so no deposit is missed.
+fn monero_height_at(ts: i64) -> u64 {
+    // v0.18 fork: block 2,688,888 on 2022-08-13. Blocks have been 2 minutes since the
+    // v2 fork (2016-03-23); before it they were 1 minute, so older dates scan from the start.
+    const REF_HEIGHT: i64 = 2_688_888;
+    const REF_TS: i64 = 1_660_348_800;
+    const V2_FORK_TS: i64 = 1_458_691_200;
+    const MARGIN_BLOCKS: i64 = 30 * 720;
+    if ts < V2_FORK_TS {
+        return 1;
+    }
+    (REF_HEIGHT + (ts - REF_TS) / 120 - MARGIN_BLOCKS).max(1) as u64
+}
+
+/// Files bound to one wallet and its master password. Subscriptions and settings stay.
+fn wallet_bound_files(wallet_name: &str) -> Vec<String> {
+    let mut names: Vec<String> = ["seed.vault", "history.vault", "history.salt", POLICY_VAULT_FILE, "unlock_guard.json"]
+        .iter().map(|s| s.to_string()).collect();
+    names.extend(["", ".keys", ".address", ".height", ".synced_height", ".restore_height"]
+        .iter().map(|ext| format!("{wallet_name}{ext}")));
+    names
+}
+
+/// Move the current wallet aside to `archive/<date>/` rather than deleting it: a wrong
+/// "forgot password" click must stay recoverable.
+fn archive_wallet_files(data_dir: &std::path::Path, wallet_name: &str) -> Result<usize, String> {
+    let present: Vec<String> = wallet_bound_files(wallet_name).into_iter()
+        .filter(|n| data_dir.join(n).exists()).collect();
+    if present.is_empty() {
+        return Ok(0);
+    }
+    let dest = data_dir.join("archive").join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    for n in &present {
+        std::fs::rename(data_dir.join(n), dest.join(n)).map_err(|e| format!("{n}: {e}"))?;
+    }
+    log::warn!("[Wallet] Previous wallet moved to archive/ ({} files)", present.len());
+    Ok(present.len())
+}
+
+/// "Forgot password": end the session and archive the local wallet so it can be restored
+/// from its 25 words. Subscriptions are kept.
+#[tauri::command]
+async fn reset_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let (data_dir, wallet_name) = {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.unlocked = false;
+        if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
+        if let Some(mut key) = s.history_key.take() { key.zeroize(); }
+        s.wallet_address = None;
+        s.balance_atomic = 0;
+        s.rpc_connected = false;
+        s.rpc_last_error = None;
+        let dir = s.vault_path.parent().ok_or("No data folder")?.to_path_buf();
+        (dir, wallet_name_of(&s.wallet_file_path))
+    };
+    log_retention::set_viewable(false);
+    WALLET_SESSION_INVALIDATED.store(true, Ordering::SeqCst);
+    tokio::task::spawn_blocking(|| stop_wallet_session("wallet reset")).await.map_err(|e| e.to_string())?;
+    archive_wallet_files(&data_dir, &wallet_name)?;
     Ok(())
 }
 
@@ -411,9 +490,13 @@ async fn unlock_wallet(
         // Compute a safe restore_height: current daemon height minus 24h buffer.
         // 720 blocks ≈ 24 hours. Avoids scan-from-genesis (millions of blocks).
         // Sufficient for recent deposits; users who had older funds will need a manual rescan.
-        let daemon_height = rpc_manager::get_daemon_block_height(&mgr.daemon_address());
-        let restore_height: u64 = daemon_height.saturating_sub(720);
-        log::debug!("[Unlock/RPC] daemon_height={}, restore_height={}", daemon_height, restore_height);
+        let restore_marker = wd.join(format!("{}.restore_height", wn));
+        let requested_height: Option<u64> = std::fs::read_to_string(&restore_marker).ok()
+            .and_then(|s| s.trim().parse().ok());
+        let restore_height: u64 = requested_height.unwrap_or_else(|| {
+            rpc_manager::get_daemon_block_height(&mgr.daemon_address()).saturating_sub(720)
+        });
+        log::debug!("[Unlock/RPC] restore_height={} (requested: {})", restore_height, requested_height.is_some());
 
         // Cache file (no extension) and height-marker file paths.
         let cache_file = wd.join(&wn);
@@ -447,7 +530,8 @@ async fn unlock_wallet(
             })?;
             log::info!("[Unlock/RPC] Restore OK");
             // Save height marker so we know this wallet was created with a good restore_height
-            let _ = std::fs::write(&height_marker, restore_height.to_string());
+            let _ = std::fs::write(&height_marker, restore_height.max(1).to_string());
+            let _ = std::fs::remove_file(&restore_marker);
             // Balance is 0 immediately after restore — sync happens via refresh_balance later.
             let bal = 0.0_f64;
             (addr, bal)
@@ -3725,6 +3809,7 @@ pub fn run() {
             get_log_retention,
             set_log_retention,
             get_log_history,
+            reset_wallet,
             defender_allow_rpc,
             defender_script,
             boot_log_append,
@@ -3810,5 +3895,29 @@ mod tests {
     async fn tor_price_route() {
         let data = super::fetch_json_via_tor("https://libremonero.com/api/v1/price").await.unwrap();
         assert!(data["xmr"]["eur"].as_f64().is_some_and(|p| p > 0.0));
+    }
+
+    #[test]
+    fn restore_height_from_date() {
+        use super::monero_height_at;
+        // v2 fork (block 1,009,827) and 2024-01-01 (block ~3,054,000), minus the 1-month margin.
+        assert!((monero_height_at(1_458_691_200) as i64 - (1_009_827 - 21_600)).abs() < 3_000);
+        assert!((monero_height_at(1_704_067_200) as i64 - (3_054_000 - 21_600)).abs() < 5_000);
+        assert_eq!(monero_height_at(1_400_000_000), 1);
+    }
+
+    #[test]
+    fn archive_moves_only_wallet_files() {
+        let dir = std::env::temp_dir().join(format!("autopay-archive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["seed.vault", "autopay_wallet.keys", "history.vault", "subscriptions.db", "rpc_config.json"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        assert_eq!(super::archive_wallet_files(&dir, "autopay_wallet").unwrap(), 3);
+        assert!(!dir.join("seed.vault").exists() && !dir.join("autopay_wallet.keys").exists());
+        assert!(dir.join("subscriptions.db").exists() && dir.join("rpc_config.json").exists());
+        assert_eq!(std::fs::read_dir(dir.join("archive")).unwrap().count(), 1);
+        assert_eq!(super::archive_wallet_files(&dir, "autopay_wallet").unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

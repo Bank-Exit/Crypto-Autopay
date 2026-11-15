@@ -154,13 +154,6 @@
     document.documentElement.setAttribute("data-network", v);
   });
 
-  function onReset() {
-    // TODO: show confirmation dialog before deleting vault
-    if (confirm($t.resetConfirm)) {
-      invoke("reset_wallet").catch(() => {});
-      appState = "welcome";
-    }
-  }
 </script>
 
 <!-- Reset auto-lock on any user activity -->
@@ -189,7 +182,6 @@
     <Welcome
       on:start={() => { appState = "onboarding"; }}
       on:restore={() => { appState = "restore"; }}
-      on:skip={() => { appState = "dashboard"; }}
     />
 
   {:else if appState === "onboarding"}
@@ -215,7 +207,7 @@
         onSessionUnlocked();
         await checkPendingDeepLink();
       }}
-      on:reset={onReset}
+      on:reset={() => { appState = "restore"; }}
     />
 
   {:else}
