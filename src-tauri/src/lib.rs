@@ -243,6 +243,9 @@ fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
+    if enabled && cfg!(debug_assertions) {
+        return Err("Dev build: autostart would launch a binary that needs the Vite dev server".into());
+    }
     let launcher = app.autolaunch();
     let res = if enabled { launcher.enable() } else { launcher.disable() };
     res.map_err(|e| e.to_string())?;
@@ -3697,6 +3700,9 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(BOOT_UI_TIMEOUT_SECS)).await;
                     if boot_log::frontend_ready() || !boot_log::active() { return; }
                     log::error!("[Boot] Interface not displayed after {} s (blank window?)", BOOT_UI_TIMEOUT_SECS);
+                    if cfg!(debug_assertions) {
+                        log::error!("[Boot] Dev build: the interface comes from the Vite dev server (npm run dev), is it running?");
+                    }
                     if let Some(win) = handle.get_webview_window("main") {
                         if let Err(e) = win.eval(boot_log::fallback_page_script()) {
                             log::error!("[Boot] Fallback page failed: {}", e);
