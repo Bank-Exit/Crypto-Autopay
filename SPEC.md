@@ -465,6 +465,7 @@ Decodes to:
 - **Signature verification**: unsigned codes are allowed but wallets SHOULD display a warning ("Unverified merchant").
 - **URL security**: `canary_url` and `occurrence_note_url` MUST use HTTPS. Tor onion addresses are allowed and encouraged for censorship resistance.
 - **Address reuse**: Merchants SHOULD use subaddresses (one per subscriber) to preserve payer privacy.
+- **Unattended payments (wallet side)**: recurring payments must run when nobody is at the screen. Wallets SHOULD NOT keep the user's master password for that. Reference implementation: the Monero wallet file has its own random password, stored encrypted under a key derived from the master password; for payments after a reboot this random password (never the master password) is kept in the OS keyring, can be turned off by the user, and is deleted on wallet reset. Locking the screen hides sensitive data (seed, history, statement, limits) but does not stop scheduled payments; per-payment and per-period limits still apply.
 
 ---
 
@@ -588,6 +589,7 @@ For very short subscriptions (no canary, no signature), payload fits in V8.
 - [ ] Support pause / resume / cancel / skip
 - [ ] Display next payment date (hidden if suspended)
 - [ ] Balance cap: warn ≥1.5 XMR, block ≥2.0 XMR
+- [ ] Pay while the screen is locked without storing the user's master password (see §11)
 
 ### Merchant (creator side)
 - [ ] Generate subscription codes (webapp or CLI tool)

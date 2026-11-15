@@ -65,6 +65,10 @@ Le trait `PaymentAdapter` est **réseau-agnostique** : V3 = ajouter `BitcoinAdap
 - Monero wallet-rpc spawné **localement** par Tauri
 - Seed chiffrée Argon2id + AES-256-GCM **sur disque**
 - En mémoire : `Zeroizing<String>` (wiped à la désallocation)
+- **Deux mots de passe** (2026-11) : le mot de passe maître déchiffre la seed et dérive la clé d'historique ; le wallet Monero a son propre mot de passe aléatoire (32 octets), chiffré par cette clé dans `wallet_pw.vault`. Le mot de passe maître n'ouvre jamais le wallet et n'est jamais stocké.
+- **Paiements sans surveillance** (activés par défaut, désactivables) : mot de passe du wallet + clé d'historique dans le trousseau de l'OS, pour payer après un redémarrage et écran verrouillé. Compromis assumé : un malware dans la session peut les lire et vider le hot wallet, borné par les plafonds de paiement et le plafond de 2 XMR. Alternative écartée : demander le mot de passe à chaque ouverture de session (paiements manqués).
+- **Verrouiller ≠ arrêter** : le cadenas et l'auto-lock masquent l'interface et effacent le mot de passe maître ; seul l'arrêt complet stoppe les paiements.
+- **Restauration non destructive** : « Mot de passe oublié » archive les anciens fichiers dans `archive/<date>/` au lieu de les supprimer. Seeds anglaises et françaises acceptées.
 - Multi-wallets : chacun max **2 XMR** (hot wallet cap)
 - Warning orange à 1.5 XMR, rouge bloquant à 2 XMR
 

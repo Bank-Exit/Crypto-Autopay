@@ -168,13 +168,11 @@ async fn get_pending_deep_link(state: tauri::State<'_, Mutex<AppState>>) -> Resu
 #[tauri::command]
 async fn lock_wallet(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
-    log_retention::set_viewable(false);
-    if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
     s.unlocked = false;
-    if let Some(mut pw) = s.wallet_password.take() { pw.zeroize(); }
     // Overwrite secrets before dropping them (copies held by in-flight operations
     // are dropped when those operations end).
     if let Some(mut pw) = s.session_password.take() { pw.zeroize(); }
+    if let Some(mut pw) = s.wallet_password.take() { pw.zeroize(); }
     if let Some(mut key) = s.history_key.take() { key.zeroize(); }
     // Keep wallet_address cached (it's in the .address file anyway)
     log::info!("[Security] Wallet locked — session ended");
@@ -2296,8 +2294,8 @@ async fn get_payment_history(
         return Ok(serde_json::json!({ "enabled": false, "entries": [] }));
     }
     let key = match &s.history_key {
-        Some(k) => k,
-        None => return Ok(serde_json::json!({ "enabled": true, "entries": [], "locked": true })),
+        Some(k) if s.session_password.is_some() => k,
+        _ => return Ok(serde_json::json!({ "enabled": true, "entries": [], "locked": true })),
     };
     let entries = load_history(key, &s.history_path);
     Ok(serde_json::json!({ "enabled": true, "entries": entries }))

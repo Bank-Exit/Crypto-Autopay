@@ -1,7 +1,7 @@
 # Crypto AutoPay — Synthèse technique pour Claude
 
 > Document de contexte pour reprendre le projet rapidement.
-> Mis à jour : 2026-10-24
+> Mis à jour : 2026-11-15
 
 ---
 
@@ -29,6 +29,9 @@
 │   │   └── src/schema.sql        # Tables subscriptions + payments
 │   ├── autopay-crypto/           # Crypto : seed vault, signatures, standard
 │   │   ├── src/seed_vault.rs     # Argon2id + AES-256-GCM
+│   │   ├── src/seed_gen.rs       # Seed 25 mots : génération (EN), décodage EN + FR
+│   │   ├── src/wordlist_en.rs    # Liste officielle Monero anglaise (préfixe 3)
+│   │   ├── src/wordlist_fr.rs    # Liste officielle Monero française (préfixe 4)
 │   │   ├── src/signatures.rs     # Ed25519 (ed25519-dalek)
 │   │   └── src/standard.rs       # AutoPayCodeV1 parse/encode, BLAKE3 checksum
 │   └── autopay-rpc/              # Réseau : PaymentAdapter trait + Monero + Canary
@@ -36,21 +39,27 @@
 │       ├── src/monero.rs         # MoneroAdapter (wallet-rpc JSON-RPC)
 │       └── src/canary.rs         # CanaryChecker : fetch + verify signed JSON
 ├── src-tauri/
-│   ├── src/lib.rs                # Tauri app setup (commandes à ajouter ici)
+│   ├── src/lib.rs                # Commandes Tauri, AppState, scheduler, session wallet-rpc
+│   ├── src/rpc_manager.rs        # Sidecar autopay-wallet-rpc (spawn, JSON-RPC)
+│   ├── src/unattended.rs         # Paiements écran verrouillé : trousseau de l'OS
+│   ├── src/boot_log.rs           # startup.log + page de secours si l'UI ne s'affiche pas
+│   ├── src/unlock_guard.rs       # Délais après mots de passe faux
+│   ├── src/payment_policy.rs     # Plafonds de paiement (policy.vault)
 │   ├── src/main.rs               # Entry point
 │   └── tauri.conf.json           # 1050×550px, title "Crypto AutoPay"
 └── src-frontend/
     ├── src/
     │   ├── main.ts               # Entry, theme init
-    │   ├── App.svelte            # Router : welcome / onboarding / restore / dashboard
+    │   ├── App.svelte            # Router : welcome / onboarding / restore / unlock / dashboard
     │   ├── app.css               # Variables CSS thème light/dark + data-network bitcoin
     │   └── lib/
     │       ├── i18n.js           # Store derived, 4 langues FR/EN/DE/ES
     │       ├── theme.js          # Store writable light/dark, localStorage
     │       ├── network.js        # Store selectedNetwork (monero/bitcoin), NETWORKS[]
     │       ├── Welcome.svelte    # Écran 0 : logo, animation, 3 steps, CTA, lang+theme
-    │       ├── Onboarding.svelte # Étapes 1-3 : password / seed (25 mots) / backup+verify
-    │       ├── Dashboard.svelte  # Layout sidebar + pages : subs, wallets, history, find, settings, howto
+    │       ├── Onboarding.svelte # Création (mot de passe / seed / vérif) et restauration (mot de passe / 25 mots + date)
+    │       ├── Unlock.svelte     # Déverrouillage + panneau « Mot de passe oublié » (restaurer avec 25 mots)
+    │       ├── Dashboard.svelte  # Sidebar + pages : Compte (wallets + relevé), abonnements, find, settings, howto
     │       ├── SubscriptionList.svelte # Cartes : statut, NEXT (masqué si suspendu), badge wallet
     │       └── PaymentAnimation.svelte # SVG animé 7s : dot A→B, ring J-3/J-2/J-1, cycle 2 sujets
     └── package.json              # Svelte 4, Vite 5, svelte-preprocess
@@ -73,10 +82,27 @@
 - Si invalide → suspension du paiement + alerte utilisateur
 - Statuts : Ok, NotConfigured, Unreachable, SignatureInvalid, AddressMismatch, Expired, InactiveByCreator
 
-### Seed vault
-- Argon2id (m=128MB, t=3, p=1) pour dériver la clé depuis le mot de passe maître
-- AES-256-GCM pour chiffrer la seed
-- `Zeroizing<String>` pour effacer la seed de la mémoire
+### Clés et mots de passe (principe central)
+
+Deux mots de passe distincts :
+
+- **Mot de passe maître** (tapé par l'utilisateur, ≥ 12 caractères) : déchiffre `seed.vault` (Argon2id m=128MB t=3 p=1 + AES-256-GCM) et dérive `history_key` (Argon2id + `history.salt`), qui chiffre `history.vault`, `policy.vault` et `wallet_pw.vault`. **Il n'ouvre jamais le wallet Monero.**
+- **Mot de passe du wallet** : 32 octets aléatoires en hex, générés par l'app, stockés chiffrés dans `wallet_pw.vault`. C'est lui qui ouvre le fichier wallet dans wallet-rpc. Les anciens wallets (ouverts avec le mot de passe maître) sont migrés à la prochaine ouverture via `change_wallet_password` : le fichier est écrit d'abord, supprimé si le changement échoue ; si le mot de passe aléatoire n'ouvre pas le wallet, le mot de passe maître est essayé (migration interrompue).
+
+En mémoire (`AppState`) : `session_password` (maître, seulement interface déverrouillée), `wallet_password`, `history_key`, tous effacés via `zeroize`.
+
+**Paiements sans surveillance** (Paramètres > Démarrage, activé par défaut) : `{wallet_password, history_key}` est rangé dans le trousseau de l'OS (`keyring` : Secret Service / Keychain / Credential Manager ; service `com.libre-market.autopay`, compte `unattended-payments`). Au lancement (session ouverte, autostart), `start_unattended` le relit, vérifie qu'il déchiffre bien `wallet_pw.vault`, et démarre les paiements sans afficher l'interface. Le mot de passe maître n'y est jamais stocké. Désactiver le réglage, restaurer ou réinitialiser le wallet supprime l'entrée.
+
+**Verrouillage** :
+- `lock_ui` (cadenas, auto-lock 3 min) : efface `session_password`, les paiements continuent. Seed, historique, relevé, plafonds et réglages sensibles redemandent le mot de passe.
+- `lock_wallet` : arrêt complet (tous les secrets effacés, wallet-rpc stoppé). Utilisé par « Réessayer » de la fenêtre binaire manquant.
+
+### Flux wallet (état actuel)
+
+- **Créer** : Welcome → mot de passe → seed générée (EN) → vérification de mots → `create_wallet(seed, password, restoreFrom: null)` → Unlock.
+- **Restaurer** : Welcome « Restaurer avec mes 25 mots », Unlock « Mot de passe oublié » ou le diagnostic « Seed invalide » du Dashboard (qui verrouille l'écran et ouvre ce même panneau) → mot de passe → 25 mots (EN ou FR, casse indifférente, préfixes acceptés) + mois/année de création ou « je ne sais pas » → `create_wallet(seed, password, restoreFrom)`. Le backend normalise la seed (mots complets), écrit `<wallet>.restore_height` (`monero_height_at`, marge ~30 jours ; 1 si date inconnue) ; le premier déverrouillage restaure depuis cette hauteur. Depuis Unlock, `reset_wallet` archive d'abord les fichiers liés au wallet dans `archive/<YYYYmmdd-HHMMSS>/` (rien n'est supprimé).
+- **Codes d'erreur** `create_wallet` : `PASSWORD_TOO_SHORT`, `SEED_WORD_COUNT:n`, `SEED_INVALID:…`, `WALLET_EXISTS`.
+- **Compte** (1er menu) : wallets + relevé bancaire (`get_account_statement` : entrées, sorties, en attente, échecs via `get_transfers`, libellés par abonnement depuis l'historique).
 
 ### PaymentAdapter trait (network-agnostic)
 ```rust
@@ -121,66 +147,25 @@ import { theme, toggleTheme } from "./lib/theme.js";
 // data-theme sur <html> → CSS variables light/dark
 ```
 
-### Appels Tauri (à venir)
+### Appels Tauri
 ```js
 import { invoke } from "@tauri-apps/api/core";
-const seed = await invoke("generate_seed");
-await invoke("create_wallet", { seed, password });
-const balance = await invoke("get_balance");
+await invoke("create_wallet", { seed, password, restoreFrom }); // restoreFrom: null (création) | ts | 0 (date inconnue)
+await invoke("unlock_wallet", { password });
+await invoke("lock_ui");      // écran verrouillé, paiements actifs
+await invoke("reset_wallet"); // archive les fichiers du wallet avant restauration
 ```
-
----
-
-## Backend — prochaines commandes Tauri à implémenter
-
-```rust
-// Dans src-tauri/src/lib.rs
-
-#[tauri::command]
-async fn generate_seed() -> Result<String, String> {
-    // 25 mots Monero via wordlist intégrée + getrandom
-}
-
-#[tauri::command]
-async fn create_wallet(seed: String, password: String) -> Result<(), String> {
-    // SeedVault::encrypt(seed, password) → fichier dans app_data_dir()
-}
-
-#[tauri::command]
-async fn unlock_wallet(password: String) -> Result<(), String> {
-    // SeedVault::decrypt(password) → spawn monero-wallet-rpc
-}
-
-#[tauri::command]
-async fn get_balance() -> Result<f64, String> {
-    // MoneroAdapter::balance() → XMR
-}
-
-#[tauri::command]
-async fn check_wallet_exists() -> bool {
-    // Vérifie si seed.vault existe dans app_data_dir()
-}
-
-#[tauri::command]
-async fn get_subscriptions() -> Result<Vec<Subscription>, String> {
-    // DB::get_all_subscriptions()
-}
-
-#[tauri::command]
-async fn add_subscription(code: String) -> Result<Subscription, String> {
-    // parse_code(&code) → insert DB
-}
-```
+`tauriInvoke` (Dashboard) avale les erreurs ; utiliser `invokeStrict` quand l'erreur doit remonter.
 
 ---
 
 ## Wordlist Monero (25 mots)
 
-La seed Monero utilise l'algorithme Electrum :
-- 32 bytes aléatoires → 24 indices dans la wordlist (1626 mots anglais)
-- 25ème mot = checksum (3 premiers chars de chaque mot → crc32)
-- Wordlist officielle EN : https://github.com/monero-project/monero/blob/master/src/mnemonics/english.h
-- À intégrer dans autopay-crypto/src/wordlist_en.rs (array de 1626 &str)
+Algorithme Electrum de Monero (`crates/autopay-crypto/src/seed_gen.rs`) :
+- 32 octets → 24 mots (3 mots par bloc de 4 octets, base 1626) + 25e mot = checksum (`crc32` des préfixes des 24 mots, modulo 24 → mot répété).
+- Préfixe unique : 3 lettres en anglais, 4 en français. Les mots sont reconnus par leur préfixe.
+- Génération : anglais uniquement. Restauration : anglais ou français, langue détectée (un mot français peut aussi matcher un préfixe anglais : la langue n'est retenue que si le checksum passe). Décodage FR validé contre `monero-wallet-rpc` (clé de dépense identique).
+- wallet-rpc détecte lui-même la langue au `restore_deterministic_wallet`.
 
 ---
 
@@ -217,6 +202,9 @@ cd src-frontend && npm run build
 - `protocol-asset` feature Tauri 2 → ne pas inclure (cause build error)
 - `hex = "1"` n'existe pas sur crates.io → utiliser `hex = "0.4"`
 - Port 5173 déjà utilisé → `lsof -ti:5173 | xargs kill -9`
+- `cargo tauri dev` affiche une vieille fenêtre / un vieux `startup.log` → une autre instance tourne déjà (plugin single-instance : la nouvelle se contente de la mettre au premier plan). `pkill -f target/debug/monero-autopay` (ou l'app installée) avant de relancer. Les builds debug n'enregistrent pas l'autostart, mais une ancienne entrée `~/.config/autostart/Crypto AutoPay.desktop` peut rester.
+- `/tmp` est un tmpfs de 100 Mo presque plein : faire les essais dans `~/.cache`.
+- Tests navigateur sans Tauri : mock `__TAURI_INTERNALS__` ; `get_payment_history` doit renvoyer `{entries: []}` sinon le Dashboard se fige.
 - `Zeroizing<[u8;32]>` → utiliser `.as_ref()` pour obtenir `&[u8]`
 
 ---
@@ -293,3 +281,4 @@ Utiliser `openExternal(url)` dans Dashboard.svelte qui tente `@tauri-apps/plugin
 ## Fix deep link même URL (réactivité Svelte)
 
 Dans `App.svelte` : avant de set `pendingDeepLinkCode = url`, reset à `null` + `await tick()` pour forcer Svelte à détecter le changement même si l'URL est identique.
+Un lien reçu sur Welcome (pas encore de wallet) reste en attente : il s'ouvre une fois le wallet créé et déverrouillé (pas de saut vers Unlock sans vault).

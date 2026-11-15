@@ -11,8 +11,10 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 │ App (Tauri/Rust)                                        │
 │                                                         │
 │  AppState                                               │
-│  ├── unlocked: bool          ← session password in mem  │
-│  ├── session_password: Option │                          │
+│  ├── unlocked: bool          ← wallet usable (payments) │
+│  ├── session_password: Option ← master pw, UI unlocked   │
+│  ├── wallet_password: Option ← random wallet-rpc pw      │
+│  ├── history_key: Option     ← encrypts history/policy  │
 │  ├── rpc_busy: AtomicBool    ← exclusive RPC lock       │
 │  ├── rpc_connected: bool     ← last refresh result      │
 │  └── rpc_last_error: Option                             │
@@ -30,6 +32,8 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 │       └── TCP → daemon node (opennode.xmr-tw.org:18089) │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Two passwords.** The master password (typed by the user) never opens the Monero wallet. The wallet file has its own random password (`wallet_password`, 32 random bytes as hex) stored in `wallet_pw.vault`, encrypted with `history_key` (Argon2id of the master password + `history.salt`). Older wallets (opened with the master password) are migrated at the next opening with the `change_wallet_password` RPC: the new vault file is written first and removed if the change fails; if the random password does not open the wallet, the master password is tried (interrupted migration). This is what lets payments run while the interface is locked (section 3.1).
 
 **Key architectural choice**: one `monero-wallet-rpc` per unlocked session (`WALLET_SESSION`), bound to `127.0.0.1:18083` with random digest credentials, wallet kept open between operations (`take_wallet_session` / `return_wallet_session`, serialised by `rpc_busy`). It is stopped by `end_wallet_session` on lock, node switch (slow, unreachable or stalled node) or when an operation fails and drops it; the next operation starts a fresh one.
 
@@ -137,12 +141,25 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 | Value | Meaning |
 |---|---|
-| `false` | Wallet locked. `session_password = None`. All RPC commands return `Err("Locked")`. |
-| `true` | Wallet unlocked. `session_password = Some(pw)`. RPC commands may proceed. |
+| `false` | Wallet stopped. No secret in memory. All RPC commands return `Err("Locked")`. |
+| `true` | `wallet_password` and `history_key` in memory: balance refresh and scheduled payments run. |
+
+`session_password` (the master password) is only present while the **interface** is unlocked. Commands that show or change sensitive data require it: seed backup check, payment history, account statement, payment limits and master-password checks, `set_unattended`.
+
+| Interface | `unlocked` | `session_password` | Payments |
+|---|---|---|---|
+| Unlocked | `true` | ✓ | run |
+| Locked by padlock / 3-min auto-lock (`lock_ui`) | `true` | ✗ | run |
+| Started at login with unattended payments (`start_unattended`) | `true` | ✗ | run |
+| Fully stopped (`lock_wallet`, quit, keyring entry missing) | `false` | ✗ | stopped |
 
 **Transitions**:
-- `false → true` : `unlock_wallet()` command with correct password
-- `true → false` : `lock_wallet()` command (manual or auto-lock after 2 min inactivity)
+- `false → true`: `unlock_wallet()` with the correct master password, or `start_unattended()` at app start (reads `{wallet_password, history_key}` from the OS keyring and checks it against `wallet_pw.vault`).
+- `lock_ui()`: padlock and auto-lock after 3 min of inactivity. Drops `session_password` only.
+- `true → false`: `lock_wallet()` (used by the "Retry" of the missing-binary dialog): drops every secret and stops wallet-rpc.
+- Unlocking again while `unlocked && wallet_password` is set only checks the master password and sets `session_password`; the running wallet session is reused.
+
+**Unattended payments** (Settings > Startup, on by default): after each unlock, `sync_unattended()` stores `{wallet_password, history_key}` in the OS keyring (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows; service `com.libre-market.autopay`, account `unattended-payments`). The master password is never stored there, and nothing is stored while the wallet still uses the master password (legacy, not migrated). Turning the setting off deletes the entry; restoring or resetting the wallet deletes it too.
 
 ### 3.2 AppState.rpc_busy (AtomicBool)
 
@@ -229,13 +246,13 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 ### Case E — open_wallet fails (wrong password / corrupted wallet file)
 
-**Trigger**: `session_password` is set but wallet file was created with a different password, or file is corrupted.
+**Trigger**: neither the random wallet password nor the master password opens the wallet file, or the file is corrupted.
 
 **Rust**: `open_wallet` JSON-RPC returns `{"error": …}`.
 
-**Frontend**: `rpcDiagnosis()` matches `"word list"` / `"Electrum"` / `"checksum"` → shows "Seed de récupération invalide" with reset option.
+**Frontend**: `rpcDiagnosis()` matches `"word list"` / `"Electrum"` / `"checksum"` → shows "Seed de récupération invalide" with a "Restore with my 25 words" button. It locks the interface and opens the restore panel of the unlock screen.
 
-**Recovery**: Either restore from seed (re-onboarding) or let the app auto-fix the seed checksum and retry unlock.
+**Recovery**: Either restore from seed (`reset_wallet` archives the wallet files, then the restore flow) or let the app auto-fix the seed checksum and retry unlock.
 
 ---
 
@@ -277,7 +294,7 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 ### Case H — Wallet locked during refresh
 
-**Trigger**: Auto-lock fires (2-min timer) while a refresh is queued, OR user manually locks while refresh is running.
+**Trigger**: the wallet was fully stopped (`lock_wallet`) while a refresh is queued. Locking the interface (`lock_ui`) does not stop refreshes.
 
 **Rust**: `refresh_balance()` first checks `s.unlocked` → if `false`, returns `Err("Locked")` immediately, before spawning any process.
 
@@ -289,7 +306,7 @@ This document maps every possible state of the RPC subsystem, their causes, impl
 
 ### Case H2 — Zombie Dashboard instances (frontend lifecycle)
 
-**Context**: `App.svelte` destroys and recreates `Dashboard` on every lock/unlock (padlock button or 2-min auto-lock).
+**Context**: `App.svelte` destroys and recreates `Dashboard` on every lock/unlock (padlock button or 3-min auto-lock).
 
 **Pitfall**: in Svelte 4, the function returned by an `async` `onMount` is never called (the callback returns a Promise). Timers and event listeners registered there leaked on every cycle; destroyed instances kept calling `refresh_balance` every 2 min, grabbing `rpc_busy`, so the visible instance got "RPC busy" and never displayed the balance.
 
@@ -394,7 +411,7 @@ Tokio timer fires (every 60s)
   │
   ▼
 run_payment_scheduler() {
-  check unlocked → true
+  check unlocked && wallet_password → true   (interface may be locked)
   skip if < 45s since unlock (initial balance sync first)
   check rpc_busy → false
   load due subscriptions from DB
@@ -433,4 +450,6 @@ run_payment_scheduler() {
 | "balance = 0 means wallet is empty" | 0 could mean locked/RPC down — only meaningful when `rpc_connected = true` |
 | "semi-auto blocks all payments" | It blocks automatic sends; approved payments go through on next 60s tick |
 | "rpc_busy prevents payment AND refresh simultaneously" | Correct — this is intentional. One operation at a time. |
-| "the 2-min auto-lock runs in Rust" | No — it runs on the frontend (Svelte timer). It calls `lock_wallet` which clears `session_password` in Rust. |
+| "the 3-min auto-lock runs in Rust" | No — it runs on the frontend (Svelte timer). It calls `lock_ui`, which only clears `session_password`: payments continue. |
+| "locking the screen stops payments" | Only `lock_wallet` (or quitting) stops them. The padlock hides the interface and sensitive data. |
+| "the master password opens the Monero wallet" | No — the wallet has its own random password, stored encrypted in `wallet_pw.vault` (and in the OS keyring when unattended payments are on). |

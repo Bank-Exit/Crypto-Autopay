@@ -15,7 +15,7 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 
 | Feature | Notes |
 |---|---|
-| Create / restore | Welcome: "Create a wallet" or "Restore with my 25 words". Both ask the master password first. Restore asks the approximate creation month (or "I don't know" = full scan); the chain is scanned from one month before it |
+| Create / restore | Welcome: "Create a wallet" or "Restore with my 25 words". Both ask the master password first. Restore accepts English or French seeds (any case; the first 3 letters, 4 in French, are enough) and asks the approximate creation month (or "I don't know" = full scan); the chain is scanned from one month before it |
 | Master password | ≥ 12 chars; Argon2id → AES-256-GCM (`seed.vault`); unlock lockout after repeated failures |
 | Seed backup check | Reminder every 90 days; asks 3 random words, compared with the vault |
 | Lock | Sidebar padlock or 3 min idle: the master password leaves memory and technical logs are hidden; scheduled payments keep running |
@@ -88,7 +88,7 @@ Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs
 
 - "Account" is the first menu entry: balance, top-up, limits, and a bank-style statement read from the wallet itself (money in, sends, pending, failed, fees), labelled with the subscription when the history knows the transaction. Needs the unlocked interface and a connected engine.
 - "Reports & export" (from the Account page) opens the encrypted subscription-payment history below.
-- Encrypted payment history (`history.vault`), retention in days, can be turned off (privacy mode).
+- Encrypted payment history (`history.vault`), retention in days, can be turned off (privacy mode). Like the statement, it needs the unlocked interface.
 - Grouped by period with relative dates, CSV export, clear.
 - Monthly report card (this month, last month, balance) + a one-time summary at each new month.
 
