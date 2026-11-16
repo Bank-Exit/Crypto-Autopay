@@ -117,6 +117,7 @@
 
   // ---- Global pause (also toggled from the tray) ----
   let allPaused = false;
+  let pauseInfoOpen = false;
   async function setAllPaused(v) {
     await tauriInvoke("set_paused", { paused: v });
     allPaused = v;
@@ -584,6 +585,36 @@
     }
   }
   $: if (page === "wallets") loadStatement();
+
+  let clearStatementOpen = false;
+  async function clearStatement() {
+    try {
+      await invokeStrict("clear_account_statement");
+      clearStatementOpen = false;
+      statement = [];
+    } catch (e) {
+      clearStatementOpen = false;
+      logWarn("Account", `Statement not cleared: ${e}`);
+    }
+  }
+
+  // ---- Restart a completed subscription ----
+  let restartModal = null; // { sub, extra, unlimited }
+  async function confirmRestart() {
+    const m = restartModal;
+    const extra = m.unlimited ? 0 : Math.floor(Number(m.extra));
+    if (!m.unlimited && !(extra >= 1)) return;
+    restartModal = null;
+    const res = await persistNewSubscription("restart_subscription", { id: m.sub.id, extraPayments: extra });
+    if (res) logInfo("Subscription", `Restarted (id=${m.sub.id})`);
+    await reloadSubscriptions();
+  }
+
+  // ---- Settings > About ----
+  const REPO_URL = "https://github.com/Bank-Exit/Crypto-Autopay";
+  let about = null;
+  let aboutInfoOpen = false;
+  $: if (page === "settings" && !about) tauriInvoke("get_about").then(a => { if (a) about = a; });
 
   let unattended = null; // { enabled, active }, null = unknown (browser dev mode)
   async function loadUnattended() {
@@ -2011,6 +2042,44 @@
 {/if}
 
 <!-- Password check before unlocking a payment limit -->
+{#if restartModal}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
+      <h2 style="margin:0 0 6px;font-size:17px">{$t.subRestartTitle}</h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:12px">
+        <strong>{restartModal.sub.label}</strong> — {fmt($t.subRestartDesc, { amount: `${restartModal.sub.amount} ${restartModal.sub.currency}`, schedule: restartModal.sub.schedule })}
+      </p>
+      <form on:submit|preventDefault={confirmRestart}>
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px">
+          <span style="flex:1">{$t.subRestartCount}</span>
+          <input type="number" min="1" step="1" bind:value={restartModal.extra} style="width:90px" disabled={restartModal.unlimited} />
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px">
+          <input type="checkbox" bind:checked={restartModal.unlimited} /> {$t.subRestartUnlimited}
+        </label>
+        <div style="display:flex;gap:10px">
+          <button type="button" class="btn-ghost" style="flex:1;padding:10px" on:click={() => restartModal = null}>{$t.commonCancel}</button>
+          <button type="submit" class="btn-primary" style="flex:1;padding:10px"
+            disabled={!restartModal.unlimited && !(Number(restartModal.extra) >= 1)}>{$t.subRestartConfirm}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
+{#if clearStatementOpen}
+  <div class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
+      <h2 style="margin:0 0 6px;font-size:17px">{$t.statementClearTitle}</h2>
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:14px">{$t.statementClearDesc}</p>
+      <div style="display:flex;gap:10px">
+        <button class="btn-ghost" style="flex:1;padding:10px" on:click={() => clearStatementOpen = false}>{$t.commonCancel}</button>
+        <button class="btn-danger" style="flex:1;padding:10px" on:click={clearStatement}>{$t.statementClearConfirm}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if subCapModal}
   <div class="modal-backdrop" role="dialog" aria-modal="true">
     <div class="modal-panel" role="document" style="max-width:400px;padding:20px">
@@ -2493,6 +2562,7 @@
         {subCaps}
         on:open-url={e => openExternal(e.detail.url)}
         on:cap-sub={e => openSubCap(e.detail.sub)}
+        on:restart-sub={e => restartModal = { sub: e.detail.sub, extra: e.detail.sub.number_of_payments || 1, unlimited: false }}
         on:details-sub={e => subDetails = e.detail.sub}
         on:delete-sub={async e => {
           const sub = subscriptions.find(s => s.id === e.detail.id);
@@ -2569,6 +2639,21 @@
       <div class="page-header">
         <h1>{$t.navAccount}</h1>
         <div class="page-actions">
+          <span class="autopay-switch-wrap">
+            <button class="autopay-switch" class:paused={allPaused} aria-pressed={!allPaused}
+              aria-describedby="autopay-switch-tip" on:click={() => setAllPaused(!allPaused)}>
+              <span class="autopay-icon" aria-hidden="true">
+                <svg class="icon-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M10 8.5v7l6-3.5z" /></svg>
+                <svg class="icon-pause" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M9.5 8.5v7M14.5 8.5v7" /></svg>
+              </span>
+              {#key allPaused}
+                <span class="autopay-label">{allPaused ? $t.autopayPaused : $t.autopayActive}</span>
+              {/key}
+            </button>
+            <button class="autopay-info" aria-label={$t.pauseDesc} aria-expanded={pauseInfoOpen}
+              on:click={() => pauseInfoOpen = !pauseInfoOpen}>i</button>
+            <span id="autopay-switch-tip" role="tooltip" class="autopay-tip" class:open={pauseInfoOpen}>{$t.pauseDesc}</span>
+          </span>
           <button class="btn-ghost" on:click={() => page = "history"}>{$t.accountReports}</button>
         </div>
       </div>
@@ -2717,7 +2802,12 @@
         <div class="statement">
           <div class="statement-head">
             <h2 class="section-title">{$t.statementTitle}</h2>
-            <button class="btn-ghost btn-sm" disabled={statementLoading} on:click={loadStatement} aria-label={$t.statementRefresh}>↻</button>
+            <span class="statement-tools">
+              {#if statement?.length}
+                <button class="statement-clear" on:click={() => clearStatementOpen = true}>{$t.statementClear}</button>
+              {/if}
+              <button class="btn-ghost btn-sm" disabled={statementLoading} on:click={loadStatement} aria-label={$t.statementRefresh}>↻</button>
+            </span>
           </div>
           {#if statementError}
             <p class="text-muted statement-note">{$t.statementUnavailable}</p>
@@ -2973,12 +3063,6 @@
         <p class="mode-desc">
           {$paymentMode === "semi-auto" ? $t.paymentModeSemiAutoDesc : $t.paymentModeAutoDesc}
         </p>
-        <div class="setting-row">
-          <span class="setting-label">{$t.pauseTitle}<br><span class="text-muted" style="font-size:11px">{$t.pauseDesc}</span></span>
-          <button class="btn-ghost btn-sm" on:click={() => setAllPaused(!allPaused)}>
-            {allPaused ? `▶ ${$t.pauseResume}` : `⏸ ${$t.pauseAll}`}
-          </button>
-        </div>
       </div>
 
       <!-- Treasurer mode section -->
@@ -3224,6 +3308,26 @@
             {/each}
           </div>
         {/if}
+      </div>
+
+      <h2 class="section-title">{$t.aboutTitle}</h2>
+      <div class="settings-section card about">
+        <p>{$t.aboutOpenSource}</p>
+        <p>{$t.aboutBounty}
+          <a class="rpc-link" href={REPO_URL} on:click|preventDefault={() => openExternal(REPO_URL)}>{REPO_URL.replace("https://", "")} ↗</a>
+        </p>
+        <p class="text-muted">{$t.aboutDisclaimer}</p>
+        <dl class="about-facts">
+          <dt>{$t.aboutVersion}</dt><dd>{about?.version ?? "…"}</dd>
+          <dt>{$t.aboutYear}</dt><dd>{about?.year ?? "…"}</dd>
+          <dt>
+            {$t.aboutFingerprint}
+            <button class="autopay-info" aria-label={$t.aboutFingerprintInfo} aria-expanded={aboutInfoOpen}
+              on:click={() => aboutInfoOpen = !aboutInfoOpen}>i</button>
+          </dt>
+          <dd><code class="about-hash">{about?.sha256 ?? "…"}</code></dd>
+        </dl>
+        {#if aboutInfoOpen}<p class="text-muted about-info">{$t.aboutFingerprintInfo}</p>{/if}
       </div>
 
     <!-- ====== CREATE CODE (full page, merchant / influencer) ====== -->
@@ -4207,6 +4311,64 @@
   .rpc-missing-body ol { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
   .rpc-missing-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
   .rpc-missing-actions a { text-decoration:none; }
+  .statement-tools { display: flex; align-items: center; gap: 6px; }
+  .statement-clear {
+    background: none; border: none; padding: 4px 6px; font: inherit; font-size: 12px;
+    color: var(--text-muted); cursor: pointer; border-radius: 6px;
+  }
+  .statement-clear:hover { color: #ef4444; background: var(--bg-hover); }
+
+  .autopay-switch-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+  .autopay-switch {
+    display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px 6px 8px;
+    border-radius: 999px; border: 1px solid rgba(34,197,94,.45); background: rgba(34,197,94,.10);
+    color: var(--text); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: background .35s ease, border-color .35s ease;
+  }
+  .autopay-switch.paused { border-color: rgba(245,158,11,.5); background: rgba(245,158,11,.10); }
+  .autopay-icon { position: relative; width: 20px; height: 20px; display: inline-block; }
+  .autopay-icon svg {
+    position: absolute; inset: 0; width: 20px; height: 20px; fill: none; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round;
+    transition: opacity .35s ease, transform .35s cubic-bezier(.2,.8,.2,1);
+  }
+  .icon-play { stroke: #22c55e; }
+  .icon-play path { fill: #22c55e; }
+  .icon-pause { stroke: #f59e0b; opacity: 0; transform: rotate(-90deg) scale(.6); }
+  .autopay-switch.paused .icon-play { opacity: 0; transform: rotate(90deg) scale(.6); }
+  .autopay-switch.paused .icon-pause { opacity: 1; transform: none; animation: pause-breathe 2.4s ease-in-out .4s infinite; }
+  @keyframes pause-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .autopay-label { animation: label-in .3s ease; }
+  @keyframes label-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+  .autopay-info {
+    width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); background: none;
+    color: var(--text-muted); font: italic 600 11px/1 Georgia, serif; cursor: pointer; padding: 0;
+    display: none; align-items: center; justify-content: center; vertical-align: middle;
+  }
+  .about .autopay-info { display: inline-flex; margin-left: 4px; }
+  .autopay-tip {
+    display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; width: 260px;
+    padding: 8px 10px; border-radius: 8px; background: var(--bg-card, #fff); color: var(--text);
+    border: 1px solid var(--border); box-shadow: 0 6px 20px rgba(0,0,0,.15); font-size: 12px; font-weight: 400; line-height: 1.45;
+  }
+  .autopay-switch:hover ~ .autopay-tip, .autopay-switch:focus-visible ~ .autopay-tip, .autopay-tip.open { display: block; }
+  @media (hover: none) {
+    .autopay-info { display: inline-flex; }
+    .autopay-switch:hover ~ .autopay-tip { display: none; }
+    .autopay-tip.open { display: block; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .autopay-icon svg, .autopay-switch { transition: none; }
+    .autopay-switch.paused .icon-pause, .autopay-label { animation: none; }
+  }
+
+  .about p { font-size: 13px; line-height: 1.55; margin: 0 0 10px; }
+  .about-facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; font-size: 12.5px; margin: 12px 0 0; }
+  .about-facts dt { color: var(--text-muted); display: flex; align-items: center; }
+  .about-facts dd { margin: 0; min-width: 0; }
+  .about-hash { font-size: 11px; word-break: break-all; user-select: all; }
+  .about-info { font-size: 12px !important; margin-top: 8px !important; }
+
   .statement { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
   .statement-head { display: flex; align-items: center; justify-content: space-between; }
   .statement-note { font-size: 13px; }

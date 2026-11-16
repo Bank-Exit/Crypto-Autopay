@@ -312,6 +312,9 @@
               <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
               <div class="kebab-menu" on:click|stopPropagation>
                 {#if sub.status === "Completed"}
+                  <button class="kebab-item kebab-trigger" on:click={e => { dispatch("restart-sub", { sub }); openMenuId = null; e.stopPropagation(); }}>
+                    ↻ {$t.subRestart}
+                  </button>
                   <button class="kebab-item" on:click={e => editSub(sub, e)} title={$t.subExtendHint}>
                     ✏ {$t.subEdit}
                   </button>

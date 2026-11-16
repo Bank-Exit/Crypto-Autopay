@@ -33,7 +33,7 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 | Options | Start date, number of payments, description, website URL (shown and clickable next to the description), canary URL |
 | Duplicate check | Exact (same address + schedule) or soft (same name, amount, currency) before import |
 | Actions | Pause / resume, pay now, edit, details, archive, delete, per-subscription cap (⋯ menu) |
-| Completion | Once all planned payments are sent the subscription becomes "Completed" (greyed, no next date); raising the number of payments in Edit resumes it |
+| Completion | Once all planned payments are sent the subscription becomes "Completed" (greyed, no next date). "Restart" (⋯ menu) reopens it for N more payments (or no end), same terms, same limit checks as a new subscription; the next payment follows the schedule, nothing is sent at once. In Edit, the number of payments is a total including those already sent (the form says how many) |
 | Timestamps | Creation and last modification (edit, pause / resume, archive), shown in Edit and Details; payments do not count as modifications |
 | Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |
 
@@ -66,7 +66,7 @@ All sealed in `policy.vault` (encrypted with the master password). **Tightening 
 
 - **Semi-auto** (default): every due payment waits for Confirm / Postpone 1 h / Skip.
 - **Auto**: due payments leave without asking (except the confirmations above).
-- **Global pause**: tray menu or Settings; banner with Resume; nothing leaves while paused.
+- **Global pause**: "AutoPay active / paused" switch at the top of the Account page, or the tray menu; banner with Resume; nothing leaves while paused.
 - Mode and pause persist across restarts (vault).
 
 ## Alerts
@@ -87,6 +87,7 @@ Sidebar panel + overlay, tray icon colour (red > orange > ok). Full table: `docs
 ## Account & history
 
 - "Account" is the first menu entry: balance, top-up, limits, and a bank-style statement read from the wallet itself (money in, sends, pending, failed, fees), labelled with the subscription when the history knows the transaction. Needs the unlocked interface and a connected engine.
+- "Clear" (discreet, above the statement) hides every current line for good after a confirmation. The transactions stay on the chain: a restore from the 25 words shows them again.
 - "Reports & export" (from the Account page) opens the encrypted subscription-payment history below.
 - Encrypted payment history (`history.vault`), retention in days, can be turned off (privacy mode). Like the statement, it needs the unlocked interface.
 - Grouped by period with relative dates, CSV export, clear.
@@ -104,9 +105,9 @@ Settings toggle. Import a meeting resolution JSON (Procès-Verbal), validate, ex
 
 ## Settings
 
-Language (FR/EN/DE/ES), theme, timezone, network (Monero; Bitcoin UI only), payment mode, pause,
+Language (FR/EN/DE/ES), theme, timezone, network (Monero; Bitcoin UI only), payment mode,
 alerts on/off + low-balance threshold, send chime / notification, security limits, history,
-technical logs retention, RPC node / binary path / payment tolerance, start with the session (on by default; refused by dev builds), pay even when locked (on by default).
+technical logs retention, RPC node / binary path / payment tolerance, start with the session (on by default; refused by dev builds), pay even when locked (on by default). About at the bottom: disclaimer, open source, bug bounty, version, year and SHA-256 of the running program (compare with the `program-sha256-<platform>.txt` of the release).
 
 ## Privacy & security
 

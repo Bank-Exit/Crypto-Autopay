@@ -1574,6 +1574,8 @@ pub struct PolicyExtras {
     pub sound_on_send: bool,
     /// Last successful seed backup check.
     pub seed_checked_at: Option<i64>,
+    /// Account statement lines up to this Unix time are hidden ("clear statement").
+    pub statement_cleared_at: Option<i64>,
 }
 
 impl Default for PolicyExtras {
@@ -1585,6 +1587,7 @@ impl Default for PolicyExtras {
             notify_on_send: true,
             sound_on_send: true,
             seed_checked_at: None,
+            statement_cleared_at: None,
         }
     }
 }
@@ -2308,11 +2311,12 @@ async fn get_account_statement(
     state: tauri::State<'_, Mutex<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let (wallet_name, wallet_dir, password, rpc_busy, labels) = {
+    let (wallet_name, wallet_dir, password, rpc_busy, labels, cleared_at) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         if s.session_password.is_none() {
             return Err("Wallet is locked.".into());
         }
+        let cleared_at = s.policy_extras.statement_cleared_at.unwrap_or(0);
         let pw = s.wallet_password.clone().ok_or("Wallet is locked.")?;
         let labels: std::collections::HashMap<String, String> = match (&s.history_key, s.history_enabled) {
             (Some(key), true) => load_history(key, &s.history_path).into_iter()
@@ -2321,7 +2325,7 @@ async fn get_account_statement(
             _ => Default::default(),
         };
         let wd = app.path().app_data_dir().map_err(|e| e.to_string())?;
-        (wallet_name_of(&s.wallet_file_path), wd, pw, Arc::clone(&s.rpc_busy), labels)
+        (wallet_name_of(&s.wallet_file_path), wd, pw, Arc::clone(&s.rpc_busy), labels, cleared_at)
     };
     if rpc_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return Err("RPC busy".into());
@@ -2345,6 +2349,9 @@ async fn get_account_statement(
     let mut lines = Vec::new();
     for kind in ["in", "pool", "out", "pending", "failed"] {
         for t in r["result"][kind].as_array().into_iter().flatten() {
+            if t["timestamp"].as_i64().unwrap_or(0) <= cleared_at {
+                continue;
+            }
             let txid = t["txid"].as_str().unwrap_or("");
             let prefix: String = txid.chars().take(12).collect();
             lines.push(serde_json::json!({
@@ -2360,6 +2367,46 @@ async fn get_account_statement(
     }
     lines.sort_by_key(|l| std::cmp::Reverse(l["timestamp"].as_i64().unwrap_or(0)));
     Ok(lines)
+}
+
+/// Version, build year and SHA-256 of the running program (Settings > About). The release
+/// publishes the same fingerprint per platform, so a modified binary can be spotted.
+#[tauri::command]
+async fn get_about(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    static SHA256: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let sha256 = match SHA256.get() {
+        Some(h) => h.clone(),
+        None => {
+            let h = tokio::task::spawn_blocking(|| -> Result<String, String> {
+                use sha2::Digest;
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let mut file = std::fs::File::open(exe).map_err(|e| e.to_string())?;
+                let mut hasher = sha2::Sha256::new();
+                std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
+                Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+            }).await.map_err(|e| e.to_string())??;
+            SHA256.get_or_init(|| h).clone()
+        }
+    };
+    Ok(serde_json::json!({
+        "version": app.package_info().version.to_string(),
+        "year": env!("BUILD_YEAR"),
+        "sha256": sha256,
+    }))
+}
+
+/// Hide every current account statement line for good. The wallet keeps them (they are
+/// on the chain): a restore from the seed shows them again.
+#[tauri::command]
+async fn clear_account_statement(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    if s.session_password.is_none() {
+        return Err("Wallet is locked.".into());
+    }
+    s.policy_extras.statement_cleared_at = Some(chrono::Utc::now().timestamp());
+    save_policy_vault(&s)?;
+    log::info!("[Account] Statement cleared");
+    Ok(())
 }
 
 /// Write the payment history as CSV into the Downloads folder (owner-only file).
@@ -2646,6 +2693,45 @@ async fn update_subscription(
         s.approved_payments.remove(&id);
     }
     log::info!("Subscription updated (id={})", id);
+    serde_json::to_value(&sub).map_err(|e| e.to_string())
+}
+
+/// Reopen a completed subscription for `extra_payments` more payments (0 = no end), same
+/// terms. The next payment follows the schedule from now: nothing is sent at once.
+#[tauri::command]
+async fn restart_subscription(
+    id: String,
+    extra_payments: u64,
+    confirm_monthly: Option<bool>,
+    db_state: tauri::State<'_, Mutex<Database>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let now = chrono::Utc::now();
+    let (mut sub, others) = {
+        let db = db_state.lock().map_err(|e| e.to_string())?;
+        let (this, others): (Vec<_>, Vec<_>) = db.list_subscriptions().map_err(|e| e.to_string())?
+            .into_iter().partition(|s| s.id == id);
+        (this.into_iter().next().ok_or("Subscription not found")?, others)
+    };
+    if sub.status != SubscriptionStatus::Completed {
+        return Err("Only a completed subscription can be restarted.".into());
+    }
+    {
+        let limits = app_state.lock().map_err(|e| e.to_string())?.payment_limits.clone();
+        check_new_subscription(&sub.destination_address, &sub.currency, &sub.amount, &sub.schedule,
+            &limits, &others, confirm_monthly.unwrap_or(false))?;
+    }
+    sub.number_of_payments = if extra_payments == 0 { 0 } else { sub.payments_sent + extra_payments };
+    sub.status = SubscriptionStatus::Active;
+    sub.next_payment_at = Some(next_occurrence(&sub.schedule, now));
+    sub.updated_at = now;
+    db_state.lock().map_err(|e| e.to_string())?.update_subscription_terms(&sub).map_err(|e| e.to_string())?;
+    {
+        let mut s = app_state.lock().map_err(|e| e.to_string())?;
+        s.pending_approvals.remove(&id);
+        s.approved_payments.remove(&id);
+    }
+    log::info!("Subscription restarted (id={})", id);
     serde_json::to_value(&sub).map_err(|e| e.to_string())
 }
 
@@ -4153,6 +4239,9 @@ pub fn run() {
             next_occurrence_of,
             fetch_price_onion,
             update_subscription,
+            restart_subscription,
+            clear_account_statement,
+            get_about,
             get_subscriptions,
             add_subscription,
             delete_subscription,

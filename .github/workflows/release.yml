@@ -144,3 +144,23 @@ jobs:
           prerelease: false
           projectPath: '.'
           args: ${{ matrix.args }}
+
+      # ── Fingerprint of the installed program (shown in Settings > About) ──
+      # macOS signs the binary while bundling: hash the copy inside the .app.
+      - name: Publish program fingerprint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          dir="target/${{ matrix.target }}/release"
+          case "${{ matrix.target }}" in
+            *windows*) bin="$dir/monero-autopay.exe" ;;
+            *apple*)   bin=$(ls "$dir"/bundle/macos/*.app/Contents/MacOS/monero-autopay) ;;
+            *)         bin="$dir/monero-autopay" ;;
+          esac
+          sum=$( (sha256sum "$bin" 2>/dev/null || shasum -a 256 "$bin") | cut -d' ' -f1)
+          out="program-sha256-${{ matrix.label }}.txt"
+          echo "$sum  monero-autopay (${{ matrix.label }})" > "$out"
+          cat "$out"
+          gh release upload "$TAG" "$out" --clobber

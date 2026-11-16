@@ -94,6 +94,8 @@
     } : {}),
   };
 
+  const alreadySent = editData?.payments_sent || 0;
+
   let schedulePresetId = "monthly";
   let multiYearN = 2;
   {
@@ -636,6 +638,12 @@
         <label class="field field-sm">
           <span>{l("Nombre de paiements", "Number of payments")} <span class="hint">0 = {l("illimité","unlimited")}</span></span>
           <input type="number" bind:value={payload.number_of_payments} min="0" step="1" />
+          {#if alreadySent > 0}
+            <span class="hint">{l(`Total, dont ${alreadySent} déjà envoyés`, `Total, including ${alreadySent} already sent`)}</span>
+            {#if payload.number_of_payments > 0 && payload.number_of_payments <= alreadySent}
+              <span class="hint hint-warn">{l(`Mettez au moins ${alreadySent + 1} pour que les paiements reprennent.`, `Enter at least ${alreadySent + 1} for payments to resume.`)}</span>
+            {/if}
+          {/if}
         </label>
         {#if startMode === 'wait'}
         <label class="field field-sm">
@@ -990,6 +998,7 @@
   .required { color: var(--accent, #e8601a); }
   .sce-stamps { margin: 0 0 4px; font-size: 11.5px; color: var(--text-muted, #aaa); }
   .hint { font-size: 10.5px; color: var(--text-muted, #aaa); font-weight: 400; }
+  .hint-warn { color: #d97706; }
 
   input, select, textarea {
     padding: 8px 10px; border: 1px solid var(--border, #ddd);

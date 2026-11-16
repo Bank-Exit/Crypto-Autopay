@@ -52,6 +52,11 @@
     try { seedHistory(await invoke("get_log_history")); } catch { /* browser dev mode */ }
   }
   let liveLogs = [];
+  // Errors are "seen" once the Logs button has been clicked (or while the drawer is open).
+  let seenErrorId = 0;
+  const maxErrorId = (logs) => logs.reduce((m, l) => (l.level === "error" && l.id > m ? l.id : m), 0);
+  $: if (showLogs) seenErrorId = Math.max(seenErrorId, maxErrorId(liveLogs));
+  $: unseenErrors = liveLogs.filter(l => l.level === "error" && l.id > seenErrorId).length;
   let logFilter = "all"; // "all" | "warn" | "error"
   let showDebugLogs = localStorage.getItem("_autopay_logs_debug") === "1";
   $: localStorage.setItem("_autopay_logs_debug", showDebugLogs ? "1" : "0");
@@ -220,7 +225,7 @@
 
   <!-- Floating Logs button (always visible, bottom-right) -->
   {#if appState !== "checking"}
-    <button class="logs-fab" on:click={() => showLogs = !showLogs} title="Logs techniques">
+    <button class="logs-fab" on:click={() => { seenErrorId = Math.max(seenErrorId, maxErrorId(liveLogs)); showLogs = !showLogs; }} title="Logs techniques">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
         <polyline points="14 2 14 8 20 8"/>
@@ -229,8 +234,8 @@
         <polyline points="10 9 9 9 8 9"/>
       </svg>
       Logs
-      {#if logsUnlocked && liveLogs.filter(l => l.level === "error").length > 0}
-        <span class="logs-badge">{liveLogs.filter(l => l.level === "error").length}</span>
+      {#if logsUnlocked && unseenErrors > 0}
+        <span class="logs-badge">{unseenErrors}</span>
       {/if}
     </button>
   {/if}

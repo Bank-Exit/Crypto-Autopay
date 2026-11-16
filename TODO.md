@@ -6,6 +6,7 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 ## Critical / UX (grand public)
 
+- [ ] **Settings > About**: shows the SHA-256 of the running program; the release workflow now uploads `program-sha256-<platform>.txt` (step "Publish program fingerprint", untested until the next release: check that `gh release upload` finds the draft and that the macOS hash matches the installed .app). The About text announces a bug bounty: `SECURITY.md` below must be online first.
 - [ ] **PRIORITY — Vulnerability disclosure policy**: publish a `SECURITY.md` (scope, safe harbour, response delay) with a dedicated security contact email, a bug bounty (amounts in XMR per severity), and the link to the GitLab repository / confidential issues. Must be online before the alpha with real funds.
 - [ ] **RPC error UX**: All 10 error cases from `docs/RPC_states.md` must have friendly, actionable messages for non-technical users. Currently some show raw error strings. See Case A–J in RPC_states.md.
 - [ ] **Tray zombie on crash**: If the app is force-killed (`kill -9`), the tray icon may remain. Add a PID lockfile or use the single-instance plugin's cleanup hook to remove the tray on startup if a stale one exists.
