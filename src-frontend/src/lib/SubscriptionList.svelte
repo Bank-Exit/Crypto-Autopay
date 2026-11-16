@@ -137,6 +137,7 @@
   export let retrySubIds = new Set();
   // Per-subscription caps (XMR over 30 days), keyed by sub id.
   export let subCaps = {};
+  export let allPaused = false; // global pause: nothing leaves, so no countdown
 
   /** Host of an http(s) website URL, or null (nothing else is ever opened). */
   function siteHost(url) {
@@ -276,6 +277,8 @@
             <!-- NEXT date only if not suspended -->
             {#if sub.status === "Completed"}
               <!-- nothing scheduled any more -->
+            {:else if !isSuspended(sub) && sub.next_payment_at && (allPaused || sub.status === "Paused")}
+              <span class="paused-chip">⏸ {allPaused ? $t.globalPausedNoSend : $t.subPausedNoSend}</span>
             {:else if !isSuspended(sub) && sub.next_payment_at}
               <span class="next-date" class:retry-date={retrySubIds.has(sub.id)}>
                 <span class="text-muted">{retrySubIds.has(sub.id) ? $t.retryNext : $t.next}</span>
@@ -448,6 +451,7 @@
     opacity: 0.75;
   }
 
+  .paused-chip { font-size: 11.5px; color: var(--text-muted); border: 1px dashed var(--border); border-radius: 999px; padding: 2px 9px; }
   .next-date {
     display: flex; align-items: center; gap: 5px; font-size: 12px;
     background: var(--accent-light); padding: 2px 8px;

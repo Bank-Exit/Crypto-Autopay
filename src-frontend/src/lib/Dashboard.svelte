@@ -8,6 +8,7 @@
   import { selectedNetwork, currentNetwork, NETWORKS } from "./network.js";
   import { paymentMode } from "./paymentMode.js";
   import SubscriptionList from "./SubscriptionList.svelte";
+  import SpendingForecast from "./SpendingForecast.svelte";
   import PaymentAnimation from "./PaymentAnimation.svelte";
   import SubscriptionCodeEditor from "./SubscriptionCodeEditor.svelte";
   import { scheduleToHuman } from "./autopay-encode.js";
@@ -1653,6 +1654,7 @@
 
     // Fast ticker every 10s — forces reactive nextPayment banner to update
     everyWhileMounted(() => { nowTick = Date.now(); }, 10 * 1000);
+    everyWhileMounted(loadForecast, 60 * 1000);
     everyWhileMounted(() => { if (balanceLoading) nowMs = Date.now(); }, 1000);
 
     // Listen for Rust background scheduler events
@@ -1749,42 +1751,12 @@
   // Mock wallets with monthly spend estimates
   let wallets = [
     // Single real wallet — balance starts null (unknown), updated after first RPC refresh
-    { id: 1, name: "", desc: "", balance: null, color: "#f26822", monthlyOut: 0 },
+    { id: 1, name: "", desc: "", balance: null, color: "#f26822" },
   ];
 
-  // Derive totalBalance from live balanceXmr — pure read, no loop
   // The Wallets page shows the live balance, so every balance update (refresh, payment, sweep) applies at once.
   $: displayWallets = wallets.map((w, i) => i === 0 && balanceXmr !== null ? { ...w, balance: balanceXmr.toFixed(4) } : w);
 
-  $: totalBalance = balanceXmr !== null ? balanceXmr.toFixed(3) : (wallets[0]?.balance ?? "0.000");
-
-  // Keep wallets[0].monthlyOut in sync using a guard to break the reactive loop
-  let _lastMonthlyOut = -1;
-  $: if (totalMonthlyOut !== _lastMonthlyOut) {
-    _lastMonthlyOut = totalMonthlyOut;
-    if (wallets.length > 0) {
-      wallets[0] = { ...wallets[0], monthlyOut: totalMonthlyOut };
-      wallets = [...wallets];
-    }
-  }
-
-  // Compute monthly spending from REAL active subscriptions (not mock wallet data)
-  $: totalMonthlyOut = (() => {
-    const MINS_PER_MONTH = 43200;
-    return subscriptions
-      .filter(s => ["Active", "Actif"].includes(s.status))
-      .reduce((sum, s) => {
-        const amt = parseFloat(s.amount) || 0;
-        const raw = s._raw_schedule || s.schedule || "";
-        const parts = raw.trim().split(/\s+/);
-        const minField = parts.length >= 6 ? parts[1] : parts[0];
-        let periodMin = MINS_PER_MONTH; // default monthly
-        if (minField?.startsWith("*/")) periodMin = parseInt(minField.slice(2)) || MINS_PER_MONTH;
-        else if (minField === "0" && parts.length >= 3) periodMin = 60; // hourly
-        const sendsPerMonth = MINS_PER_MONTH / Math.max(1, periodMin);
-        return sum + amt * sendsPerMonth;
-      }, 0);
-  })();
 
   // Ticker updated every 10s by setInterval — forces nextPayment label to recompute
   let nowTick = Date.now();
@@ -1860,29 +1832,30 @@
     return `${tz} (UTC${sign}${h}:${m})`;
   }
 
-  // Refill estimate: total balance / total monthly spend → human readable
-  function refillEstimate(balanceStr, monthlyOut, t) {
-    const bal = parseFloat(balanceStr);
-    if (!monthlyOut || monthlyOut <= 0) return "—";
-    const months = bal / monthlyOut;
-    if (months >= 18) return `~${Math.round(months/12)} ${t.refillYears}`;
-    if (months >= 4)  return `~${Math.round(months)} ${t.refillMonths}`;
-    const weeks = months * 4.33;
-    if (weeks >= 2)   return `~${Math.round(weeks)} ${t.refillWeeks}`;
-    const days = months * 30;
-    if (days >= 1)    return `~${Math.round(days)} ${t.refillDays}`;
-    return t.refillLessThanOneDay;
+  // ---- Spending forecast: planned payments (remaining counts, schedule, fees) vs balance ----
+  let forecast = null;
+  let forecastDays = 180;
+  let forecastTimer = null;
+  async function loadForecast() {
+    const f = await tauriInvoke("get_spending_forecast", { days: forecastDays });
+    if (f) forecast = f;
   }
+  // Reload shortly after any change of subscriptions or balance (and every minute: due dates move).
+  $: { void subscriptions; void balanceXmr; clearTimeout(forecastTimer); forecastTimer = setTimeout(loadForecast, 400); }
+  onDestroy(() => clearTimeout(forecastTimer));
 
-  // Total refill estimate
-  $: totalRefillText = (tStr) => refillEstimate(totalBalance, totalMonthlyOut, tStr);
-  // Is refill urgent? (< 7 days remaining)
-  $: refillUrgent = (() => {
-    const bal = parseFloat(totalBalance);
-    if (!totalMonthlyOut || totalMonthlyOut <= 0) return false;
-    const daysLeft = (bal / totalMonthlyOut) * 30;
-    return daysLeft < 7;
-  })();
+  function refillText(f, tr) {
+    if (!f || f.balance_xmr == null) return "—";
+    if (!f.empty_at) return fmt(tr.refillNone, { n: f.days });
+    const days = (new Date(f.empty_at) - Date.now()) / 86400000;
+    if (days >= 540) return `${tr.refillIn} ${Math.round(days / 365)} ${tr.refillYears}`;
+    if (days >= 120) return `${tr.refillIn} ${Math.round(days / 30)} ${tr.refillMonths}`;
+    if (days >= 14)  return `${tr.refillIn} ${Math.round(days / 7)} ${tr.refillWeeks}`;
+    if (days >= 1)   return `${tr.refillIn} ${Math.round(days)} ${tr.refillDays}`;
+    return `${tr.refillIn} ${tr.refillLessThanOneDay}`;
+  }
+  $: refillUrgent = !!forecast?.empty_at && (new Date(forecast.empty_at) - Date.now()) < 7 * 86400000;
+  $: next30 = forecast?.next_30_days_xmr ?? 0;
 
   // Animation subjects (network-aware via PaymentAnimation internals)
   const animSubjects = [
@@ -2529,15 +2502,15 @@
         <span class="text-muted">{$t.nextPayment}</span>
         <strong>{nextPayment.label}</strong>
         <span>{nextPayment.amount} {$currentNetwork.symbol}</span>
-        <span class="text-muted">{nextPayment.label_time}</span>
+        <span class="text-muted">{allPaused ? `⏸ ${$t.globalPausedNoSend}` : nextPayment.label_time}</span>
       </div>
       {/if}
 
       <!-- Refill estimate banner -->
       <div class="refill-banner card" class:refill-urgent={refillUrgent}>
         <span class="text-muted">{$t.nextRefillLabel}{colon}</span>
-        <strong class:refill-urgent-text={refillUrgent}>{$t.refillIn} {totalRefillText($t)}</strong>
-        <span class="text-muted refill-hint">({totalMonthlyOut.toFixed(3)} {$currentNetwork.symbol} {$t.walletMonthlyOut}{#if $fiatOptIn && xmrEurRate}{` ≈ ${(totalMonthlyOut * xmrEurRate).toFixed(2)} ${FIAT_SYMBOLS.EUR}`}{/if})</span>
+        <strong class:refill-urgent-text={refillUrgent}>{refillText(forecast, $t)}</strong>
+        <span class="text-muted refill-hint">({next30.toFixed(4)} {$currentNetwork.symbol} {$t.walletMonthlyOut}{#if $fiatOptIn && xmrEurRate}{` ≈ ${(next30 * xmrEurRate).toFixed(2)} ${FIAT_SYMBOLS.EUR}`}{/if})</span>
         {#if !$fiatOptIn}
           <button class="btn-ghost btn-xs refill-fiat-btn" type="button" on:click={() => showFiatPopup = true}>{$t.fiatShowButton}</button>
         {:else if fiatRateError}
@@ -2559,6 +2532,7 @@
         {wallets}
         {subscriptions}
         {retrySubIds}
+        {allPaused}
         {subCaps}
         on:open-url={e => openExternal(e.detail.url)}
         on:cap-sub={e => openSubCap(e.detail.sub)}
@@ -2591,6 +2565,9 @@
           await reloadSubscriptions();
         }}
       />
+      <SpendingForecast {forecast} symbol={$currentNetwork.symbol} paused={allPaused}
+        on:range={e => { forecastDays = e.detail; loadForecast(); }} />
+
       <!-- Footer marketing + bottom spacer -->
       <div class="sub-footer">
         <div class="sub-footer-grid">
@@ -2708,9 +2685,9 @@
                 </div>
                 <div class="wallet-limit-row">
                   <span class="text-muted" style="font-size:10px">{w.balance} / 2 {$currentNetwork.symbol} max</span>
-                  {#if w.monthlyOut}
+                  {#if forecast?.empty_at && w.id === 1}
                     <span class="refill-chip" style="color:{w.color}">
-                      {$t.walletRefillIn} {refillEstimate(w.balance, w.monthlyOut, $t)}
+                      {$t.walletRefillIn} {refillText(forecast, $t)}
                     </span>
                   {/if}
                 </div>

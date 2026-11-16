@@ -17,7 +17,8 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [x] **Account page**: first menu entry, wallets + bank-style statement (in/out/pending/failed from `get_transfers`, labelled by subscription). The History page is reached from "Reports and export".
 - [x] **French seeds**: restore accepts English and French 25-word seeds (French list, 4-letter prefixes), checked against monero-wallet-rpc.
 - [ ] **Other seed languages** for restore: Spanish, German, Italian, Portuguese, Dutch, Russian, Japanese, Chinese, Esperanto, Lojban (add the official lists to `autopay-crypto`; non-Latin lists need Unicode prefix handling and NFKC normalisation).
-- [ ] **"PayPal 3.0 souverain" strategy**: reorientation points pending (author's notes not transcribed yet).
+- [x] **Spending forecast**: the refill banner, the `BALANCE_LOW` alert and the cash-flow chart (bottom of "My subscriptions", 30/90/180/365 days) all come from `get_spending_forecast`: real cron dates, remaining number of payments, paused subscriptions excluded, ~0.00005 XMR fee per payment.
+- [x] **Dev password bypass removed** (Unlock "▶" button and `Ctrl+Shift+D`) for the production beta.
 - [x] Persist subscription edits (`update_subscription`, same checks as a new subscription; changed terms ask for a new confirmation).
 - [x] **Duplicated log lines**: several Rust log listeners attached in the same page (async `onMount` race). One listener per page now, forwarding to the current sink.
 - [ ] **Replace wallet-rpc with an in-process Rust wallet**: removes the sidecar process, its port, its RPC credentials and the cold-start mempool download. Evaluate maturity (monero-rs / monero-serai / monero-wallet) for scanning, transfer and fee estimation on mainnet before switching.
@@ -59,6 +60,12 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 - [ ] **Merchant tooling** (the adoption bottleneck of a two-sided market): one subaddress per subscriber, payment notifications (webhooks), plugins (BTCPay Server, WooCommerce, Ghost).
 - [ ] **LibreMonero integration**: non-custodial subaddress creation and payment detection in under 5 seconds, embeddable with a single tag. Natural partner for the merchant side.
 - [ ] **Mobile**: Android, then iOS.
+- [ ] **x402 (HTTP 402 Payment Required)** — complementary to the `crypto-autopay:` URI, not a competitor: one HTTPS endpoint returns the merchant's signed terms as JSON, opened by humans through `autopay:https://shop/pay/123` (QR / deep link, LNURL-style) and answered with a 402 for AI agents. Relevant for stablecoins (USDC, the agents' currency), weak for XMR (no signed transfer authorisations). Open standard (x402 Foundation, Linux Foundation, 2026); compare with AP2 (Google). Source: author's synthesis "AutoPay, x402 et paiement crypto décentralisé" (Nov 2026).
+- [ ] **Handshake app ↔ merchant site**: the app fetches the terms from the merchant's domain (TLS + merchant signature checked before display), never a pushed amount; one-way signed webhooks detector → site (HMAC, idempotent, anti-replay); merchant-side grace period of 5 to 7 days and a reminder for recurring payments.
+- [ ] **Buyer-side trust layer** ("PayPal" gap): optional escrow with arbitration (protocol statuses), optional refund address, proof of payment, automatic pre-accounting plugin, optional crypto discount (~2 %).
+- [ ] **Price increases**: manual approval by popup, with a small automatic adjustment threshold (inflation). Today any change of terms asks for a new confirmation.
+- [ ] **Stablecoins**: merchant-side detection + signature delegated to the user's wallet through WalletConnect, one chain only at first (order: Monero core, then one stablecoin chain, then Bitcoin through BTCPay). Mind MiCA / AMLR (July 2027) for European users.
+- [ ] **Optional proof of humanity**, multi-provider (ZK passport, EUDI wallet, social graph), only to limit per-person perks (trials, referral, discount, reputation).
 
 ## Reputation / Operations
 
@@ -81,7 +88,6 @@ Items ordered by priority. Check `docs/` for detailed specs on implemented featu
 
 ## Known bugs / Regressions to verify
 
-- [ ] **DEV bypass mode**: After `Ctrl+Shift+D` (dev bypass), `refresh_balance` fails with "Locked" because the wallet is not unlocked in Rust. This is expected in dev mode but confusing. Consider adding a dev-only mock balance.
 - [ ] **Offline banner false positive**: Fixed in `5479a26` (now requires 3 consecutive `daemon_height=0` readings). Verify no regression after scheduler kills wallet-rpc.
 - [ ] **Balance 0.0000 after lock/re-unlock**: Fixed in `04e1ebf`. Verify displayed as `-.----` until first successful refresh.
 - [ ] **New logo**: `public/logo.png` and `icons/icon.png` have an opaque white background; make a transparent logo (SVG or 1024 px PNG), regenerate the icons (`cargo tauri icon`) and the tray icons (`tray-ok/warn/alert.png`).

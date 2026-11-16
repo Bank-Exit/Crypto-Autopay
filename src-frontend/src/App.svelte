@@ -69,11 +69,9 @@
   // otherwise every hot reload in dev stacks one more Rust log listener.
   let unsubLogs = null;
   let unlistenDeepLink = null;
-  let devKeyHandler = null;
   onDestroy(() => {
     unsubLogs?.(); unlistenDeepLink?.();
     if (window.__autopayRustLogSink === forwardRustLog) window.__autopayRustLogSink = null;
-    if (devKeyHandler) document.removeEventListener("keydown", devKeyHandler);
   });
 
   function forwardRustLog({ level, message, location }) {
@@ -136,14 +134,6 @@
 
     document.documentElement.setAttribute("data-theme", $theme);
     document.documentElement.setAttribute("data-network", $selectedNetwork);
-
-    // Dev shortcut: Ctrl+Shift+D → jump to dashboard (browser-only, no Tauri)
-    if (import.meta.env.DEV) {
-      devKeyHandler = (e) => {
-        if (e.ctrlKey && e.shiftKey && e.key === "D") { appState = "dashboard"; e.preventDefault(); }
-      };
-      document.addEventListener("keydown", devKeyHandler);
-    }
 
     try {
       const exists = await invoke("check_wallet_exists");

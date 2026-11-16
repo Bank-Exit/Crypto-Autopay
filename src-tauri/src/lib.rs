@@ -1237,11 +1237,6 @@ fn recompute_alerts(
         });
     }
 
-    // Estimate monthly spending (XMR/month) from active subs
-    let monthly_xmr: f64 = subs.iter().filter(|s| s.status == SubscriptionStatus::Active)
-        .map(|s| payment_policy::monthly_projection(&s.amount, &s.schedule))
-        .sum();
-
     // ORANGE: payments due within 48h that the current balance cannot cover.
     // One grouped alert rather than one per subscription.
     if has_synced && balance_xmr >= 0.000001 {
@@ -1262,11 +1257,15 @@ fn recompute_alerts(
         }
     }
 
-    // ORANGE: balance will run out before threshold (default 7 days)
+    // ORANGE: the planned payments empty the wallet before the threshold (default 7 days).
+    // Subscriptions with a set number of payments stop counting once it is reached.
     let threshold_days = state.balance_low_threshold_days.max(1.0);
-    if balance_xmr > 0.0 && monthly_xmr > 0.0 {
-        let days_left = (balance_xmr / monthly_xmr) * 30.0;
-        if days_left < threshold_days && days_left >= 0.0 {
+    if balance_xmr > 0.0 {
+        let now = chrono::Utc::now();
+        let horizon = now + chrono::Duration::seconds((threshold_days * 86400.0) as i64);
+        let events = spending_forecast(subs, now, horizon);
+        if let Some(empty_at) = depletion_at(&events, balance_xmr) {
+            let days_left = (empty_at - now).num_seconds().max(0) as f64 / 86400.0;
             alerts.push(AppAlert {
                 level: AlertLevel::Orange,
                 kind: "BALANCE_LOW".into(),
@@ -3259,6 +3258,86 @@ fn cron_period_minutes(cron: &str) -> i64 {
 
 /// Next due date strictly after `after`, following the calendar (a monthly "1st at 9:00"
 /// stays on the 1st). Falls back to one month if the expression cannot be evaluated.
+/// Usual network fee of one payment, counted in forecasts (the real fee is known at send time).
+const TYPICAL_FEE_XMR: f64 = 0.00005;
+/// Forecast safety cap: a 25-min subscription makes ~21 000 payments a year.
+const FORECAST_MAX_EVENTS_PER_SUB: usize = 25_000;
+
+/// Planned payments of the active subscriptions until `until`, oldest first, in XMR fee
+/// included. A subscription with a set number of payments stops once it is reached; an
+/// overdue payment counts now.
+fn spending_forecast(
+    subs: &[Subscription],
+    now: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Vec<(chrono::DateTime<chrono::Utc>, f64, usize)> {
+    let mut events = Vec::new();
+    for (i, sub) in subs.iter().enumerate() {
+        if sub.status != SubscriptionStatus::Active { continue; }
+        let (Some(amount), Some(first)) = (payment_policy::parse_amount(&sub.amount), sub.next_payment_at) else { continue };
+        let remaining = sub.payments_remaining().map_or(FORECAST_MAX_EVENTS_PER_SUB, |r| (r as usize).min(FORECAST_MAX_EVENTS_PER_SUB));
+        let mut at = first.max(now);
+        for _ in 0..remaining {
+            if at > until { break; }
+            events.push((at, amount + TYPICAL_FEE_XMR, i));
+            match payment_policy::next_after(&sub.schedule, at) {
+                Some(next) if next > at => at = next,
+                _ => break,
+            }
+        }
+    }
+    events.sort_by_key(|e| e.0);
+    events
+}
+
+/// When the planned payments exceed the balance, if they do.
+fn depletion_at(events: &[(chrono::DateTime<chrono::Utc>, f64, usize)], balance_xmr: f64) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut spent = 0.0;
+    events.iter().find(|(_, xmr, _)| { spent += xmr; spent > balance_xmr }).map(|e| e.0)
+}
+
+/// Spending forecast for the subscriptions page: per-day totals over `days` days (local
+/// dates), per-subscription totals, the next 30 days and when the balance runs out.
+#[tauri::command]
+async fn get_spending_forecast(
+    days: Option<u32>,
+    db_state: tauri::State<'_, Mutex<Database>>,
+    app_state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let days = days.unwrap_or(180).clamp(7, 730) as i64;
+    let subs = db_state.lock().map_err(|e| e.to_string())?.list_subscriptions().map_err(|e| e.to_string())?;
+    let (balance_xmr, synced) = {
+        let s = app_state.lock().map_err(|e| e.to_string())?;
+        (s.balance_atomic as f64 / 1e12, s.last_wallet_height > 0)
+    };
+    tokio::task::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        let until = now + chrono::Duration::days(days);
+        let events = spending_forecast(&subs, now, until);
+        let mut per_day: std::collections::BTreeMap<String, f64> = Default::default();
+        let mut per_sub = vec![(0.0f64, 0u64); subs.len()];
+        let mut next_30 = 0.0;
+        for (at, xmr, i) in &events {
+            *per_day.entry(at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()).or_default() += xmr;
+            per_sub[*i].0 += xmr;
+            per_sub[*i].1 += 1;
+            if *at <= now + chrono::Duration::days(30) { next_30 += xmr; }
+        }
+        let empty_at = if synced { depletion_at(&events, balance_xmr) } else { None };
+        Ok(serde_json::json!({
+            "days": days,
+            "balance_xmr": if synced { Some(balance_xmr) } else { None },
+            "next_30_days_xmr": next_30,
+            "total_xmr": events.iter().map(|e| e.1).sum::<f64>(),
+            "empty_at": empty_at.map(|t| t.to_rfc3339()),
+            "per_day": per_day.into_iter().map(|(d, x)| serde_json::json!({ "date": d, "xmr": x })).collect::<Vec<_>>(),
+            "per_sub": subs.iter().zip(per_sub).filter(|(_, (_, n))| *n > 0)
+                .map(|(s, (x, n))| serde_json::json!({ "id": s.id, "label": s.label, "xmr": x, "payments": n }))
+                .collect::<Vec<_>>(),
+        }))
+    }).await.map_err(|e| e.to_string())?
+}
+
 fn next_occurrence(schedule: &str, after: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     payment_policy::next_after(schedule, after).unwrap_or_else(|| {
         log::warn!("[Scheduler] Unsupported schedule expression, falling back to +30 days");
@@ -4242,6 +4321,7 @@ pub fn run() {
             restart_subscription,
             clear_account_statement,
             get_about,
+            get_spending_forecast,
             get_subscriptions,
             add_subscription,
             delete_subscription,
@@ -4273,6 +4353,29 @@ mod tests {
     async fn tor_price_route() {
         let data = super::fetch_json_via_tor("https://libremonero.com/api/v1/price").await.unwrap();
         assert!(data["xmr"]["eur"].as_f64().is_some_and(|p| p > 0.0));
+    }
+
+    #[test]
+    fn forecast_stops_at_the_planned_number_of_payments() {
+        use autopay_core::models::{Subscription, SubscriptionStatus};
+        let now = chrono::Utc::now();
+        let sub = |id: &str, planned: u64, sent: u64| Subscription {
+            id: id.into(), wallet_id: "default".into(), label: "t".into(), description: None,
+            website_url: None, destination_address: "4x".into(), payment_network: "monero".into(),
+            amount: "0.0004".into(), currency: "XMR".into(), schedule: "0 */25 * * * *".into(),
+            number_of_payments: planned, payments_sent: sent, next_payment_at: Some(now),
+            status: SubscriptionStatus::Active, grace_period_hours: 24, canary_url: None,
+            merchant_pubkey: None, last_canary_status: None, canary_last_ok: None, webhook_url: None,
+            created_at: now, updated_at: now, raw_code: None, notes: None,
+        };
+        let week = now + chrono::Duration::days(7);
+        let two_left = super::spending_forecast(&[sub("a", 22, 20)], now, week);
+        assert_eq!(two_left.len(), 2);
+        assert!(super::depletion_at(&two_left, 0.01).is_none());
+        let unlimited = super::spending_forecast(&[sub("b", 0, 20)], now, week);
+        assert!(unlimited.len() > 300);
+        let empty = super::depletion_at(&unlimited, 0.01).unwrap();
+        assert!(empty < now + chrono::Duration::days(1));
     }
 
     #[test]

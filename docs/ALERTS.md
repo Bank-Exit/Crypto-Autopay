@@ -27,7 +27,7 @@ Alerts are displayed in two places:
 
 | Kind | Trigger | Displayed message |
 |---|---|---|
-| `BALANCE_LOW` | Balance runway < threshold (default 7 days) at current spending rate | "Portefeuille vide dans ~{N} j (seuil : {T}j)" |
+| `BALANCE_LOW` | The planned payments (real schedule, remaining number of payments, ~0.00005 XMR fee each) exceed the balance within the threshold (default 7 days) | "Portefeuille vide dans ~{N} j (seuil : {T}j)" |
 | `CANARY_UNREACHABLE` | Canary URL returns HTTP 4xx/5xx or connection error | "Canary inaccessible — {label}" |
 | `PAYMENT_OVERDUE_SOFT` | `next_payment_at` + 1h has passed (within 24h tolerance) | "Paiement en retard : {label} (dans la tolérance)" |
 | `PAYMENT_FAILED` | `transfer` RPC call returned an error (e.g. "not enough money") | "Échec de paiement — {label}" |

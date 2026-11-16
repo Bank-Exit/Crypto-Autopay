@@ -1,7 +1,7 @@
 # Crypto AutoPay — Synthèse technique pour Claude
 
 > Document de contexte pour reprendre le projet rapidement.
-> Mis à jour : 2026-11-15
+> Mis à jour : 2026-11-16
 
 ---
 
@@ -61,6 +61,7 @@
     │       ├── Unlock.svelte     # Déverrouillage + panneau « Mot de passe oublié » (restaurer avec 25 mots)
     │       ├── Dashboard.svelte  # Sidebar + pages : Compte (wallets + relevé), abonnements, find, settings, howto
     │       ├── SubscriptionList.svelte # Cartes : statut, NEXT (masqué si suspendu), badge wallet
+    │       ├── SpendingForecast.svelte # Trésorerie prévisionnelle (graphique SVG, get_spending_forecast)
     │       └── PaymentAnimation.svelte # SVG animé 7s : dot A→B, ring J-3/J-2/J-1, cycle 2 sujets
     └── package.json              # Svelte 4, Vite 5, svelte-preprocess
 ```
@@ -204,7 +205,8 @@ cd src-frontend && npm run build
 - Port 5173 déjà utilisé → `lsof -ti:5173 | xargs kill -9`
 - `cargo tauri dev` affiche une vieille fenêtre / un vieux `startup.log` → une autre instance tourne déjà (plugin single-instance : la nouvelle se contente de la mettre au premier plan). `pkill -f target/debug/monero-autopay` (ou l'app installée) avant de relancer. Les builds debug n'enregistrent pas l'autostart, mais une ancienne entrée `~/.config/autostart/Crypto AutoPay.desktop` peut rester.
 - `/tmp` est un tmpfs de 100 Mo presque plein : faire les essais dans `~/.cache`.
-- Tests navigateur sans Tauri : mock `__TAURI_INTERNALS__` ; `get_payment_history` doit renvoyer `{entries: []}` sinon le Dashboard se fige.
+- Tests navigateur sans Tauri : mock `__TAURI_INTERNALS__` (page temporaire chargeant un `zz-mock.js` à la place de `boot-guard.js`, Vite sur un autre port) ; `unlock_wallet` doit renvoyer `{address, balance_xmr}` (plus de contournement dev du mot de passe), `get_payment_history` `{entries: []}` sinon le Dashboard se fige. Supprimer les fichiers mock ensuite.
+- Prévisions de dépenses : une seule source, `spending_forecast` (Rust) — bannière de rechargement, alerte `BALANCE_LOW`, graphique `SpendingForecast.svelte`. Ne pas refaire d'extrapolation « montant × fréquence » côté frontend.
 - `Zeroizing<[u8;32]>` → utiliser `.as_ref()` pour obtenir `&[u8]`
 
 ---

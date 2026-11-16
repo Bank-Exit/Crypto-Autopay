@@ -35,7 +35,9 @@ modes), `docs/RPC_states.md` (wallet-rpc lifecycle), `SPEC.md` (code format).
 | Actions | Pause / resume, pay now, edit, details, archive, delete, per-subscription cap (⋯ menu) |
 | Completion | Once all planned payments are sent the subscription becomes "Completed" (greyed, no next date). "Restart" (⋯ menu) reopens it for N more payments (or no end), same terms, same limit checks as a new subscription; the next payment follows the schedule, nothing is sent at once. In Edit, the number of payments is a total including those already sent (the form says how many) |
 | Timestamps | Creation and last modification (edit, pause / resume, archive), shown in Edit and Details; payments do not count as modifications |
-| Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip |
+| Card | Status, payments sent, next date, pie countdown (`+N min` = overdue), cap chip. While the global pause is on (or the subscription is paused) the countdown is replaced by "Paused: nothing is sent"; at resume an overdue payment leaves once, then the schedule continues from that send |
+| Refill banner | When the planned payments empty the wallet, from the real schedule and the remaining number of payments (a subscription with 2 payments left counts 2), fees included; amount planned over the next 30 days |
+| Cash-flow forecast | Bottom of "My subscriptions": projected balance over 30/90/180/365 days, date the wallet runs out, spending per subscription. Cumulative spending only while the balance is not synced |
 
 ## Payment engine
 
